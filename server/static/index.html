@@ -1,0 +1,922 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RoomCast</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Inter", system-ui, -apple-system, sans-serif;
+      background: #0b1020;
+      color: #e2e8f0;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 0; background: radial-gradient(circle at 20% 20%, rgba(34,197,94,0.08), transparent 30%), radial-gradient(circle at 80% 0%, rgba(59,130,246,0.08), transparent 25%), #0b1020; }
+    .shell { max-width: 960px; margin: 0 auto; padding: 16px 16px 64px; }
+    header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
+    h1 { margin: 0; font-size: 22px; letter-spacing: -0.4px; }
+    .icon-btn { background: rgba(255,255,255,0.07); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.12); padding: 8px 10px; border-radius: 12px; cursor: pointer; font-weight: 700; min-width: 44px; }
+    .panel { background: rgba(255, 255, 255, 0.04); border: 1px solid rgba(255, 255, 255, 0.08); border-radius: 16px; padding: 16px; margin-bottom: 16px; box-shadow: 0 14px 36px rgba(0,0,0,0.3); }
+    .section-title { font-size: 14px; text-transform: uppercase; letter-spacing: 1px; color: #94a3b8; margin: 0 0 10px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+    label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }
+    input, select, textarea { width: 100%; border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #e2e8f0; padding: 10px 12px; font-size: 14px; }
+    textarea { min-height: 64px; }
+    .muted { opacity: 0.7; }
+    .label { font-size: 13px; color: #cbd5e1; margin-top: 6px; }
+    .error { background: #fecdd3; color: #7f1d1d; padding: 12px; border-radius: 12px; margin-top: 12px; }
+    .success { background: rgba(34,197,94,0.14); color: #bbf7d0; padding: 12px; border-radius: 12px; margin-top: 12px; }
+    input[type=range] { accent-color: #22c55e; }
+    button { background: linear-gradient(135deg, #22c55e, #16a34a); color: #0b1020; border: none; padding: 10px 14px; border-radius: 12px; cursor: pointer; font-weight: 700; width: 100%; transition: transform 0.08s ease, filter 0.12s ease; }
+    button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95); }
+    .small-btn { width: auto; padding: 8px 12px; }
+    .node-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .node-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    .eq-block { margin-top: 10px; }
+    .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 24px 12px; }
+    .settings-card { background: #0f172a; border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 16px; width: min(960px, 95vw); box-shadow: 0 18px 40px rgba(0,0,0,0.35); }
+    .settings-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+    .spinner { width: 18px; height: 18px; border: 3px solid rgba(255,255,255,0.2); border-top-color: #22c55e; border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; vertical-align: middle; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    @media (max-width: 640px) {
+      header { flex-direction: row; }
+      .node-actions { flex-wrap: wrap; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <header>
+      <h1>RoomCast</h1>
+      <div style="display:flex; gap:8px;">
+        <button id="refresh" class="icon-btn">⟳</button>
+        <button id="open-settings" class="icon-btn">⚙︎</button>
+      </div>
+    </header>
+
+    <div id="error" class="error" style="display:none;"></div>
+    <div id="success" class="success" style="display:none;"></div>
+
+    <div class="panel" id="master-panel">
+      <div class="section-title">Master volume</div>
+      <input type="range" id="master-volume" min="0" max="100" value="75">
+    </div>
+
+    <div class="panel" id="player-panel">
+      <div class="section-title">Now playing</div>
+      <div style="display:flex; gap:12px; align-items:center; flex-wrap:wrap;">
+        <img id="player-art" src="" alt="" style="width:64px; height:64px; border-radius:10px; object-fit:cover; background:#111; display:none;">
+        <div style="flex:1; min-width:200px;">
+          <div id="player-title" style="font-weight:700;">—</div>
+          <div id="player-artist" class="muted">—</div>
+        </div>
+        <button class="small-btn" id="player-prev">⏮︎</button>
+        <button class="small-btn" id="player-play">⏯</button>
+        <button class="small-btn" id="player-next">⏭︎</button>
+      </div>
+      <div style="margin-top:10px;">
+        <input type="range" id="player-seek" min="0" max="100" value="0">
+        <div class="muted" id="player-time" style="font-size:12px; margin-top:4px;">0:00 / 0:00</div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="section-title">Nodes</div>
+      <div class="node-actions">
+        <button id="discover-nodes" class="small-btn">Discover nodes</button>
+        <button id="refresh-nodes" class="small-btn">Refresh nodes</button>
+      </div>
+      <div id="nodes" style="margin-top:12px;"></div>
+    </div>
+
+  </div>
+
+  <div id="settings-overlay" class="settings-overlay">
+    <div class="settings-card">
+      <div class="settings-header">
+        <div class="section-title" style="margin:0;">Settings</div>
+        <button id="close-settings" class="icon-btn">✕</button>
+      </div>
+      <div class="panel">
+        <div class="section-title">Spotify setup</div>
+        <div class="muted" id="librespot-status" style="margin-bottom:8px;">Status: unknown</div>
+        <div class="grid">
+          <div>
+            <label>Username</label>
+            <input id="sp-username" placeholder="user@example.com" autocomplete="off">
+          </div>
+          <div>
+            <label>Password</label>
+            <input id="sp-password" type="password" placeholder="••••••••">
+          </div>
+          <div>
+            <label>Spotify client ID</label>
+            <input id="sp-client-id" placeholder="client id">
+          </div>
+          <div>
+            <label>Spotify client secret</label>
+            <input id="sp-client-secret" type="password" placeholder="client secret">
+          </div>
+          <div>
+            <label>Redirect URI</label>
+            <input id="sp-redirect" placeholder="http://localhost:8000/api/spotify/callback">
+          </div>
+          <div>
+            <label>Device name</label>
+            <input id="sp-name" placeholder="RoomCast">
+          </div>
+          <div>
+            <label>Bitrate</label>
+            <select id="sp-bitrate">
+              <option value="96">96 kbps</option>
+              <option value="160">160 kbps</option>
+              <option value="320" selected>320 kbps</option>
+            </select>
+          </div>
+          <div>
+            <label>Initial volume</label>
+            <input id="sp-initvol" type="range" min="0" max="100" value="75">
+          </div>
+          <div style="display:flex; align-items:center; gap:6px;">
+            <label style="margin:0;">Volume normalisation</label>
+            <input id="sp-normalise" type="checkbox" style="width:auto;">
+          </div>
+      </div>
+        <div style="margin-top:12px;">
+          <button id="save-spotify">Save Spotify config</button>
+          <div id="spotify-spinner" style="display:none; margin-top:8px;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
+          <div style="margin-top:8px;">
+          <button class="small-btn" id="spotify-auth">Link Spotify account</button>
+          <button class="small-btn" id="spotify-dashboard">Open Spotify developer dashboard</button>
+          <div class="muted" style="font-size:12px;">Use dashboard to create Client ID/Secret, then Save and Link.</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="section-title">Snapcast clients (view)</div>
+        <div id="clients-settings"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="discover-overlay" class="settings-overlay">
+    <div class="settings-card">
+      <div class="settings-header">
+        <div class="section-title" style="margin:0;">Discover nodes</div>
+        <button id="close-discover" class="icon-btn">✕</button>
+      </div>
+      <div class="grid" style="margin-bottom:8px;">
+        <div>
+          <label>CIDR to scan</label>
+          <input id="discover-cidr" value="172.20.0.0/24" placeholder="192.168.1.0/24">
+        </div>
+        <div style="display:flex; align-items:flex-end;">
+          <button id="start-discover" class="small-btn">Scan</button>
+        </div>
+      </div>
+      <div id="discover-spinner" style="margin-bottom:8px; display:none;"><span class="spinner"></span> <span class="muted">Scanning...</span></div>
+      <div id="discover-list" class="muted">Not started.</div>
+    </div>
+  </div>
+
+  <script>
+    const nodesEl = document.getElementById('nodes');
+    const clientsSettingsEl = document.getElementById('clients-settings');
+    const errorEl = document.getElementById('error');
+    const successEl = document.getElementById('success');
+    const refreshBtn = document.getElementById('refresh');
+    const refreshNodesBtn = document.getElementById('refresh-nodes');
+    const discoverBtn = document.getElementById('discover-nodes');
+    const saveSpotifyBtn = document.getElementById('save-spotify');
+    const spUsername = document.getElementById('sp-username');
+    const spPassword = document.getElementById('sp-password');
+    const spClientId = document.getElementById('sp-client-id');
+    const spClientSecret = document.getElementById('sp-client-secret');
+    const spRedirect = document.getElementById('sp-redirect');
+    const spName = document.getElementById('sp-name');
+    const spBitrate = document.getElementById('sp-bitrate');
+    const spInitVol = document.getElementById('sp-initvol');
+    const spNormalise = document.getElementById('sp-normalise');
+    const nodeName = document.getElementById('node-name');
+    const nodeUrl = document.getElementById('node-url');
+    const librespotStatus = document.getElementById('librespot-status');
+    const settingsOverlay = document.getElementById('settings-overlay');
+    const openSettingsBtn = document.getElementById('open-settings');
+    const closeSettingsBtn = document.getElementById('close-settings');
+    const spotifySpinner = document.getElementById('spotify-spinner');
+    const discoverOverlay = document.getElementById('discover-overlay');
+    const closeDiscoverBtn = document.getElementById('close-discover');
+    const discoverSpinner = document.getElementById('discover-spinner');
+    const discoverList = document.getElementById('discover-list');
+    const discoverCidr = document.getElementById('discover-cidr');
+    const startDiscoverBtn = document.getElementById('start-discover');
+    const masterVolume = document.getElementById('master-volume');
+    const playerPanel = document.getElementById('player-panel');
+    const playerPrev = document.getElementById('player-prev');
+    const playerPlay = document.getElementById('player-play');
+    const playerNext = document.getElementById('player-next');
+    const playerSeek = document.getElementById('player-seek');
+    const playerTime = document.getElementById('player-time');
+    const playerArt = document.getElementById('player-art');
+    const playerTitle = document.getElementById('player-title');
+    const playerArtist = document.getElementById('player-artist');
+    let playerStatus = null;
+    let playerTick = null;
+    const eqOverlay = document.createElement('div');
+
+    function clearMessages() {
+      errorEl.style.display = 'none';
+      successEl.style.display = 'none';
+    }
+
+    function showError(msg) {
+      errorEl.innerText = msg;
+      errorEl.style.display = 'block';
+    }
+
+    function showSuccess(msg) {
+      successEl.innerText = msg;
+      successEl.style.display = 'block';
+    }
+
+    let nodesCache = [];
+    const eqState = {};
+    let dragging = null;
+    let eqModal = null;
+    const spotifyAuthBtn = document.getElementById('spotify-auth');
+    const spotifyDashboardBtn = document.getElementById('spotify-dashboard');
+
+    function renderNodes(nodes) {
+      nodesCache = nodes;
+      nodesEl.innerHTML = '';
+      if (!nodes.length) {
+        nodesEl.innerHTML = '<div class="muted">No nodes registered yet.</div>';
+        return;
+      }
+      nodes.forEach(n => {
+        const wrapper = document.createElement('div');
+        wrapper.className = 'panel';
+        const header = document.createElement('div');
+        header.className = 'node-header';
+        header.innerHTML = `<div><strong>${n.name}</strong><div class="muted" style="font-size:12px;">${n.url}</div></div>`;
+        wrapper.appendChild(header);
+
+        const volLabel = document.createElement('div');
+        volLabel.className = 'label';
+        volLabel.innerText = 'Volume';
+        wrapper.appendChild(volLabel);
+        const volInput = document.createElement('input');
+        volInput.type = 'range';
+        volInput.min = 0;
+        volInput.max = 100;
+        volInput.value = 75;
+        volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
+        wrapper.appendChild(volInput);
+
+        const actions = document.createElement('div');
+        actions.className = 'node-actions';
+        const muteBtn = document.createElement('button');
+        muteBtn.className = 'small-btn';
+        muteBtn.textContent = 'Mute';
+        muteBtn.addEventListener('click', () => toggleMute(n.id, muteBtn));
+        const eqBtn = document.createElement('button');
+        eqBtn.className = 'small-btn';
+        eqBtn.textContent = 'EQ';
+        eqBtn.addEventListener('click', () => openEqModal(n.id, n.name));
+        const removeBtn = document.createElement('button');
+        removeBtn.className = 'small-btn';
+        removeBtn.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
+        removeBtn.textContent = 'Unregister';
+        removeBtn.addEventListener('click', () => unregisterNode(n.id));
+        actions.appendChild(muteBtn);
+        actions.appendChild(eqBtn);
+        actions.appendChild(removeBtn);
+        wrapper.appendChild(actions);
+
+        nodesEl.appendChild(wrapper);
+      });
+    }
+
+    function renderClients(groups, target) {
+      target.innerHTML = '';
+      groups.forEach(group => {
+        group.clients.forEach(c => {
+          const panel = document.createElement('div');
+          panel.style.marginBottom = '10px';
+          const row = document.createElement('div');
+          row.style.display = 'grid';
+          row.style.gridTemplateColumns = '1fr 120px';
+          row.style.gap = '12px';
+          row.style.alignItems = 'center';
+          const label = document.createElement('div');
+          label.innerHTML = `<div>${c.friendlyName || c.id}</div><div class="label">${group.stream?.name || 'Spotify'}</div>`;
+          const input = document.createElement('input');
+          input.type = 'range';
+          input.min = 0;
+          input.max = 100;
+          input.value = c.config?.volume?.percent ?? 50;
+          input.addEventListener('change', () => setVolume(c.id, input.value));
+          row.appendChild(label);
+          row.appendChild(input);
+          panel.appendChild(row);
+          target.appendChild(panel);
+        });
+      });
+      if (!groups.length) {
+        target.innerHTML = '<div class="muted">No clients connected yet.</div>';
+      }
+    }
+
+    function renderDiscovered(list) {
+      if (!list || !list.length) {
+        discoverList.innerHTML = 'No agents found yet. Ensure they run on the same subnet and respond on port 9700.';
+        return;
+      }
+      discoverList.innerHTML = '';
+      list.forEach(item => {
+        const row = document.createElement('div');
+        row.className = 'panel';
+        row.style.marginBottom = '8px';
+        const title = document.createElement('div');
+        title.innerHTML = `<strong>${item.host}</strong> <span class="muted">${item.url}</span>`;
+        const nameInput = document.createElement('input');
+        nameInput.value = `Node ${item.host}`;
+        nameInput.style.marginTop = '6px';
+        const btn = document.createElement('button');
+        btn.className = 'small-btn';
+        btn.textContent = 'Register';
+        btn.style.marginTop = '6px';
+        btn.addEventListener('click', () => registerNodeWithName(nameInput.value, item.url, btn));
+        row.appendChild(title);
+        row.appendChild(nameInput);
+        row.appendChild(btn);
+        discoverList.appendChild(row);
+      });
+    }
+
+    async function fetchStatus() {
+      try {
+        clearMessages();
+        const res = await fetch('/api/snapcast/status');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderClients(data.server?.groups || [], clientsSettingsEl);
+      } catch (err) {
+        showError(`Failed to fetch snapcast status: ${err.message}`);
+      }
+    }
+
+    async function fetchNodes() {
+      try {
+        const res = await fetch('/api/nodes');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderNodes(data.nodes || []);
+      } catch (err) {
+        showError(`Failed to load nodes: ${err.message}`);
+      }
+    }
+
+    async function fetchSpotifyConfig() {
+      try {
+        const res = await fetch('/api/config/spotify');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const cfg = await res.json();
+        spUsername.value = cfg.username || '';
+        spName.value = cfg.device_name || 'RoomCast';
+        spBitrate.value = cfg.bitrate || 320;
+        spInitVol.value = cfg.initial_volume ?? 75;
+        spNormalise.checked = cfg.normalisation ?? true;
+        spClientId.value = cfg.client_id || '';
+        spRedirect.value = cfg.redirect_uri || '';
+        if (cfg.has_password) spPassword.placeholder = 'stored';
+        if (cfg.has_client_secret) spClientSecret.placeholder = 'stored';
+      } catch (err) {
+        showError(`Failed to load Spotify config: ${err.message}`);
+      }
+    }
+
+    async function fetchLibrespotStatus() {
+      try {
+        const res = await fetch('/api/librespot/status');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        librespotStatus.innerText = `Status: ${data.state || 'unknown'}${data.message ? ' – ' + data.message : ''}`;
+      } catch (err) {
+        librespotStatus.innerText = `Failed to load status: ${err.message}`;
+      }
+    }
+
+    async function discoverNodes() {
+      discoverSpinner.style.display = 'block';
+      discoverList.innerHTML = 'Scanning...';
+      try {
+        const cidr = encodeURIComponent(discoverCidr.value || '');
+        const res = await fetch(`/api/nodes/discover?cidr=${cidr}`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        renderDiscovered(data.discovered || []);
+      } catch (err) {
+        discoverList.innerHTML = `Failed to discover: ${err.message}`;
+      } finally {
+        discoverSpinner.style.display = 'none';
+      }
+    }
+
+    async function setVolume(clientId, percent) {
+      try {
+        const res = await fetch(`/api/snapcast/clients/${clientId}/volume`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ percent: Number(percent) }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch (err) {
+        showError(`Failed to set volume: ${err.message}`);
+      }
+    }
+
+    async function setNodeVolume(nodeId, percent) {
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/volume`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ percent: Number(percent) }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Node volume updated');
+      } catch (err) {
+        showError(`Failed to set node volume: ${err.message}`);
+      }
+    }
+
+    async function toggleMute(nodeId, btn) {
+      const currentlyMuted = btn.dataset.muted === 'true';
+      btn.disabled = true;
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/mute`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ muted: !currentlyMuted }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        const muted = data?.result?.muted ?? !currentlyMuted;
+        btn.dataset.muted = muted ? 'true' : 'false';
+        btn.textContent = muted ? 'Unmute' : 'Mute';
+        if (muted) {
+          btn.style.background = 'linear-gradient(135deg, #f59e0b, #d97706)';
+        } else {
+          btn.style.background = '';
+        }
+      } catch (err) {
+        showError(`Failed to toggle mute: ${err.message}`);
+      } finally {
+        btn.disabled = false;
+      }
+    }
+
+    async function unregisterNode(nodeId) {
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Node unregistered');
+        await fetchNodes();
+      } catch (err) {
+        showError(`Failed to unregister node: ${err.message}`);
+      }
+    }
+
+    function ensureEq(nodeId) {
+      if (!eqState[nodeId] || !eqState[nodeId].length) {
+        eqState[nodeId] = [{ freq: 1000, gain: 0, q: 1 }];
+      }
+    }
+
+    function addBand(nodeId) {
+      ensureEq(nodeId);
+      const bands = eqState[nodeId];
+      const newFreq = bands.length ? Math.min(20000, bands[bands.length - 1].freq * 1.5) : 1000;
+      bands.push({ freq: newFreq, gain: 0, q: 1 });
+    }
+
+    function drawEq(canvas, bands) {
+      const ctx = canvas.getContext('2d');
+      const w = canvas.width;
+      const h = canvas.height;
+      ctx.clearRect(0, 0, w, h);
+      ctx.fillStyle = 'rgba(255,255,255,0.02)';
+      ctx.fillRect(0, 0, w, h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
+      ctx.lineWidth = 1;
+      for (let i = 1; i <= 4; i++) {
+        const y = (h / 5) * i;
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }
+      const freqs = bands.map(b => b.freq);
+      ctx.beginPath();
+      ctx.strokeStyle = 'rgba(34,197,94,0.6)';
+      ctx.lineWidth = 2;
+      bands.forEach((b, idx) => {
+        const { x, y } = bandToPos(b, w, h);
+        if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+      bands.forEach((b, idx) => {
+        const { x, y } = bandToPos(b, w, h);
+        ctx.fillStyle = '#22c55e';
+        ctx.beginPath();
+        ctx.arc(x, y, 8, 0, Math.PI * 2);
+        ctx.fill();
+      });
+    }
+
+    function bandToPos(band, w, h) {
+      const minF = 20, maxF = 20000;
+      const logMin = Math.log10(minF), logMax = Math.log10(maxF);
+      const lx = (Math.log10(band.freq) - logMin) / (logMax - logMin);
+      const x = lx * (w - 20) + 10;
+      const y = ((-band.gain + 24) / 48) * (h - 20) + 10;
+      return { x, y };
+    }
+
+    function posToBand(x, y, w, h, band) {
+      const minF = 20, maxF = 20000;
+      const logMin = Math.log10(minF), logMax = Math.log10(maxF);
+      const lx = (x - 10) / (w - 20);
+      const freq = Math.pow(10, lx * (logMax - logMin) + logMin);
+      const gain = -( (y - 10) / (h - 20) * 48 - 24 );
+      band.freq = Math.min(maxF, Math.max(minF, freq));
+      band.gain = Math.min(24, Math.max(-24, gain));
+    }
+
+    function attachCanvasEvents(canvas) {
+      canvas.addEventListener('mousedown', (e) => {
+        const nodeId = canvas.dataset.nodeId;
+        const bands = eqState[nodeId];
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        let found = -1;
+        bands.forEach((b, idx) => {
+          const p = bandToPos(b, canvas.width, canvas.height);
+          const dx = p.x - x, dy = p.y - y;
+          if (Math.sqrt(dx*dx + dy*dy) < 12) found = idx;
+        });
+        if (e.detail === 2) {
+          bands.push({ freq: 1000, gain: 0, q: 1 });
+          drawEq(canvas, bands);
+          return;
+        }
+        if (found >= 0) {
+          dragging = { nodeId, idx: found, canvas };
+        }
+      });
+      window.addEventListener('mousemove', (e) => {
+        if (!dragging) return;
+        const { nodeId, idx, canvas } = dragging;
+        const bands = eqState[nodeId];
+        const rect = canvas.getBoundingClientRect();
+        const x = e.clientX - rect.left;
+        const y = e.clientY - rect.top;
+        posToBand(x, y, canvas.width, canvas.height, bands[idx]);
+        drawEq(canvas, bands);
+      });
+      window.addEventListener('mouseup', () => { dragging = null; });
+    }
+
+    async function setNodeEq(nodeId) {
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/eq`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ bands: eqState[nodeId] || [] }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Node EQ updated');
+      } catch (err) {
+        showError(`Failed to set node EQ: ${err.message}`);
+      }
+    }
+
+    async function setMasterVolume(percent) {
+      try {
+        const res = await fetch('/api/snapcast/master-volume', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ percent: Number(percent) }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      } catch (err) {
+        showError(`Failed to set master volume: ${err.message}`);
+      }
+    }
+
+    function msToTime(ms) {
+      const total = Math.floor(ms / 1000);
+      const m = Math.floor(total / 60);
+      const s = String(total % 60).padStart(2, '0');
+      return `${m}:${s}`;
+    }
+
+    async function fetchPlayerStatus() {
+      try {
+        const res = await fetch('/api/spotify/player/status');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        playerStatus = await res.json();
+        renderPlayer(playerStatus);
+      } catch (err) {
+        playerPanel.style.display = 'block';
+        playerTitle.textContent = 'Player unavailable';
+        playerArtist.textContent = '';
+        playerSeek.disabled = true;
+      }
+    }
+
+    function renderPlayer(status) {
+      const item = status?.item || {};
+      const active = status?.active;
+      playerPanel.style.display = 'block';
+      playerTitle.textContent = active ? (item.name || '—') : 'No active playback';
+      const artists = (item.artists || []).map(a => a.name).join(', ');
+      playerArtist.textContent = active ? (artists || '—') : '';
+      const art = active ? (item.album?.images?.[1]?.url || item.album?.images?.[0]?.url) : null;
+      if (art) {
+        playerArt.src = art;
+        playerArt.style.display = 'block';
+      } else {
+        playerArt.style.display = 'none';
+      }
+      const duration = item.duration_ms || 0;
+      const progress = status?.progress_ms || 0;
+      playerSeek.max = duration || 1;
+      playerSeek.value = progress;
+      playerTime.textContent = `${msToTime(progress)} / ${msToTime(duration)}`;
+      const playing = !!status?.is_playing;
+      playerPlay.textContent = playing ? '⏸' : '▶';
+      playerPrev.disabled = !active;
+      playerPlay.disabled = !active;
+      playerNext.disabled = !active;
+      playerSeek.disabled = !active;
+
+      if (playerTick) clearInterval(playerTick);
+      if (active) {
+        playerTick = setInterval(() => {
+          if (!playerStatus || !playerStatus.is_playing) return;
+          playerStatus.progress_ms = (playerStatus.progress_ms || 0) + 1000;
+          if (playerStatus.progress_ms > (playerStatus.item?.duration_ms || 0)) {
+            playerStatus.progress_ms = playerStatus.item?.duration_ms || 0;
+          }
+          const prog = playerStatus.progress_ms || 0;
+          const dur = playerStatus.item?.duration_ms || 0;
+          playerSeek.value = prog;
+          playerTime.textContent = `${msToTime(prog)} / ${msToTime(dur)}`;
+        }, 1000);
+      }
+    }
+
+    async function playerAction(path, body) {
+      try {
+        const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        setTimeout(fetchPlayerStatus, 500);
+      } catch (err) {
+        showError(`Player action failed: ${err.message}`);
+      }
+    }
+
+    async function startSpotifyAuth() {
+      try {
+        const res = await fetch('/api/spotify/auth-url');
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        if (data.url) window.open(data.url, '_blank');
+      } catch (err) {
+        showError(`Failed to start Spotify auth: ${err.message}`);
+      }
+    }
+
+    function openEqModal(nodeId, nodeName) {
+      ensureEq(nodeId);
+      if (eqModal) eqModal.remove();
+      eqModal = document.createElement('div');
+      eqModal.className = 'settings-overlay';
+      eqModal.style.display = 'flex';
+      const card = document.createElement('div');
+      card.className = 'settings-card';
+      const header = document.createElement('div');
+      header.className = 'settings-header';
+      header.innerHTML = `<div class="section-title" style="margin:0;">EQ – ${nodeName}</div>`;
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'icon-btn';
+      closeBtn.textContent = '✕';
+      closeBtn.addEventListener('click', () => eqModal.remove());
+      header.appendChild(closeBtn);
+      card.appendChild(header);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = 840;
+      canvas.height = 260;
+      canvas.style.width = '100%';
+      canvas.style.borderRadius = '12px';
+      canvas.style.background = 'rgba(255,255,255,0.03)';
+      canvas.style.border = '1px solid rgba(255,255,255,0.06)';
+      canvas.dataset.nodeId = nodeId;
+      attachCanvasEvents(canvas);
+      card.appendChild(canvas);
+      drawEq(canvas, eqState[nodeId]);
+
+      const eqButtons = document.createElement('div');
+      eqButtons.className = 'node-actions';
+      const addBandBtn = document.createElement('button');
+      addBandBtn.className = 'small-btn';
+      addBandBtn.textContent = 'Add band';
+      addBandBtn.addEventListener('click', () => { addBand(nodeId); drawEq(canvas, eqState[nodeId]); });
+      const applyBtn = document.createElement('button');
+      applyBtn.className = 'small-btn';
+      applyBtn.textContent = 'Apply EQ';
+      applyBtn.addEventListener('click', () => setNodeEq(nodeId));
+      const savePresetBtn = document.createElement('button');
+      savePresetBtn.className = 'small-btn';
+      savePresetBtn.textContent = 'Save preset';
+      savePresetBtn.addEventListener('click', () => savePreset(nodeId));
+      eqButtons.appendChild(addBandBtn);
+      eqButtons.appendChild(applyBtn);
+      eqButtons.appendChild(savePresetBtn);
+      card.appendChild(eqButtons);
+
+      const presetWrap = document.createElement('div');
+      presetWrap.className = 'panel';
+      presetWrap.style.marginTop = '12px';
+      const presetTitle = document.createElement('div');
+      presetTitle.className = 'section-title';
+      presetTitle.innerText = 'Presets';
+      presetWrap.appendChild(presetTitle);
+      const presetList = document.createElement('div');
+      presetList.id = 'preset-list';
+      presetList.className = 'muted';
+      presetWrap.appendChild(presetList);
+      card.appendChild(presetWrap);
+
+      eqModal.appendChild(card);
+      document.body.appendChild(eqModal);
+      renderPresets(nodeId, presetList, canvas);
+    }
+
+    function savePreset(nodeId) {
+      const name = prompt('Preset name?');
+      if (!name) return;
+      const presets = JSON.parse(localStorage.getItem('eq-presets') || '{}');
+      presets[name] = eqState[nodeId] || [];
+      localStorage.setItem('eq-presets', JSON.stringify(presets));
+      const list = document.getElementById('preset-list');
+      if (list) renderPresets(nodeId, list, document.querySelector('canvas[data-node-id="'+nodeId+'"]'));
+      showSuccess('Preset saved');
+    }
+
+    function renderPresets(nodeId, container, canvas) {
+      const presets = JSON.parse(localStorage.getItem('eq-presets') || '{}');
+      if (!Object.keys(presets).length) {
+        container.innerHTML = 'No presets saved yet.';
+        return;
+      }
+      container.innerHTML = '';
+      Object.entries(presets).forEach(([name, bands]) => {
+        const row = document.createElement('div');
+        row.className = 'node-actions';
+        const label = document.createElement('div');
+        label.textContent = name;
+        const apply = document.createElement('button');
+        apply.className = 'small-btn';
+        apply.textContent = 'Apply';
+        apply.addEventListener('click', () => {
+          eqState[nodeId] = bands.map(b => ({...b}));
+          drawEq(canvas, eqState[nodeId]);
+        });
+        row.appendChild(label);
+        row.appendChild(apply);
+        container.appendChild(row);
+      });
+    }
+
+    async function registerNode() {
+      try {
+        await registerNodeWithName(nodeName.value || 'Node', nodeUrl.value);
+        nodeName.value = '';
+        nodeUrl.value = '';
+      } catch (err) {
+        showError(`Failed to register node: ${err.message}`);
+      }
+    }
+
+    async function registerNodeWithName(name, url, btn) {
+      const normalizedUrl = (url || '').replace(/\/+$/, '');
+      if (!normalizedUrl) {
+        showError('Agent URL is required');
+        return;
+      }
+      if (nodesCache.some(n => n.url === normalizedUrl)) {
+        showSuccess('Node already registered');
+        return;
+      }
+      if (btn) btn.disabled = true;
+      const payload = { name, url: normalizedUrl };
+      try {
+        const res = await fetch('/api/nodes/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Node registered');
+        await fetchNodes();
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function saveSpotify() {
+      try {
+        spotifySpinner.style.display = 'block';
+        saveSpotifyBtn.disabled = true;
+        const payload = {
+          username: spUsername.value,
+          password: spPassword.value,
+          device_name: spName.value || 'RoomCast',
+          bitrate: Number(spBitrate.value),
+          initial_volume: Number(spInitVol.value),
+          normalisation: spNormalise.checked,
+          client_id: spClientId.value,
+          client_secret: spClientSecret.value,
+          redirect_uri: spRedirect.value || 'http://localhost:8000/api/spotify/callback',
+        };
+        if (!payload.password) delete payload.password;
+        if (!payload.client_secret) delete payload.client_secret;
+        const res = await fetch('/api/config/spotify', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        spPassword.value = '';
+        showSuccess('Spotify config saved. Librespot will reload and connect.');
+        await pollLibrespotStatus();
+      } catch (err) {
+        showError(`Failed to save Spotify config: ${err.message}`);
+      } finally {
+        saveSpotifyBtn.disabled = false;
+        spotifySpinner.style.display = 'none';
+      }
+    }
+
+    async function pollLibrespotStatus() {
+      for (let i = 0; i < 8; i++) {
+        await new Promise(r => setTimeout(r, 1200));
+        await fetchLibrespotStatus();
+        const text = librespotStatus.innerText || '';
+        if (!text.includes('starting') && !text.includes('waiting') && !text.includes('unknown')) break;
+      }
+    }
+
+    function openSettings() {
+      settingsOverlay.style.display = 'flex';
+      fetchSpotifyConfig();
+      fetchLibrespotStatus();
+      fetchStatus();
+    }
+    function closeSettings() { settingsOverlay.style.display = 'none'; }
+
+    function openDiscover() {
+      discoverOverlay.style.display = 'flex';
+      discoverList.innerHTML = 'Not started.';
+    }
+    function closeDiscover() { discoverOverlay.style.display = 'none'; }
+
+    refreshBtn.addEventListener('click', () => { fetchNodes(); fetchStatus(); });
+    refreshNodesBtn.addEventListener('click', fetchNodes);
+    discoverBtn.addEventListener('click', openDiscover);
+    startDiscoverBtn.addEventListener('click', discoverNodes);
+    saveSpotifyBtn.addEventListener('click', saveSpotify);
+    openSettingsBtn.addEventListener('click', openSettings);
+    closeSettingsBtn.addEventListener('click', closeSettings);
+    closeDiscoverBtn.addEventListener('click', closeDiscover);
+    masterVolume.addEventListener('change', () => setMasterVolume(masterVolume.value));
+    playerPrev.addEventListener('click', () => playerAction('/api/spotify/player/previous'));
+    playerPlay.addEventListener('click', () => {
+      if (playerStatus?.is_playing) playerAction('/api/spotify/player/pause');
+      else playerAction('/api/spotify/player/play');
+    });
+    playerNext.addEventListener('click', () => playerAction('/api/spotify/player/next'));
+    playerSeek.addEventListener('change', () => playerAction('/api/spotify/player/seek', { position_ms: Number(playerSeek.value) }));
+    spotifyAuthBtn.addEventListener('click', startSpotifyAuth);
+    spotifyDashboardBtn.addEventListener('click', () => window.open('https://developer.spotify.com/dashboard', '_blank'));
+
+    fetchNodes();
+    fetchStatus();
+    fetchPlayerStatus();
+    setInterval(fetchPlayerStatus, 4000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,48 @@
+services:
+  controller:
+    build: ./server
+    environment:
+      SNAPSERVER_HOST: snapserver
+      SNAPSERVER_PORT: 1780
+      AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-changeme}
+      CONFIG_PATH: /config/spotify.json
+      DISCOVERY_CIDR: ${DISCOVERY_CIDR:-192.168.1.0/24}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:8000/api/spotify/callback}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - snapserver
+      - librespot
+    volumes:
+      - ./server/static:/app/static:ro
+      - config:/config
+
+  snapserver:
+    image: saiyato/snapserver:latest
+    environment:
+      SNAPSERVER_OPTS: ""
+    ports:
+      - "1704:1704/tcp"   # snapcast control
+      - "1705:1705/udp"   # snapcast discovery
+      - "1780:1780/tcp"   # json-rpc / websocket
+    volumes:
+      - snapfifo:/tmp
+      - ./snapserver.json:/root/.config/snapserver/server.json
+
+  librespot:
+    build: ./librespot
+    entrypoint: []
+    depends_on:
+      - snapserver
+    volumes:
+      - snapfifo:/tmp
+      - config:/config
+    environment:
+      LIBRESPOT_FALLBACK_NAME: ${LIBRESPOT_NAME:-RoomCast}
+    command: ["/app/run.sh"]
+
+volumes:
+  snapfifo:
+  config:

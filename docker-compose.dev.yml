@@ -1,0 +1,24 @@
+services:
+  controller:
+    command: >
+      uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers
+    volumes:
+      - ./server:/app
+      - config:/config
+    environment:
+      DISCOVERY_CIDR: 172.20.0.0/24
+
+  node-agent-dev:
+    build: ./node-agent
+    environment:
+      AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-changeme}
+      AGENT_DRY_RUN: "true"
+    ports:
+      - "9700:9700"
+    command: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "9700"]
+
+  snapclient-dev:
+    image: saiyato/snapclient:latest
+    depends_on:
+      - snapserver
+    command: ["-h", "snapserver", "--player", "pipe", "--pipe", "/dev/null"]

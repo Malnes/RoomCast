@@ -1,0 +1,13 @@
+[Unit]
+Description=Snapclient (RoomCast)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/bin/snapclient -h CONTROLLER_HOSTNAME_OR_IP
+Restart=always
+RestartSec=3
+User=pi
+
+[Install]
+WantedBy=multi-user.target
