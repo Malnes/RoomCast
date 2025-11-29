@@ -51,6 +51,7 @@
       <h1>RoomCast</h1>
       <div style="display:flex; gap:8px;">
         <button id="refresh" class="icon-btn">⟳</button>
+        <button id="new-web-node" class="icon-btn">New web node</button>
         <button id="open-settings" class="icon-btn">⚙︎</button>
       </div>
     </header>
@@ -204,6 +205,7 @@
     const librespotStatus = document.getElementById('librespot-status');
     const settingsOverlay = document.getElementById('settings-overlay');
     const openSettingsBtn = document.getElementById('open-settings');
+    const newWebNodeBtn = document.getElementById('new-web-node');
     const closeSettingsBtn = document.getElementById('close-settings');
     const spotifySpinner = document.getElementById('spotify-spinner');
     const discoverOverlay = document.getElementById('discover-overlay');
@@ -912,6 +914,7 @@
     playerSeek.addEventListener('change', () => playerAction('/api/spotify/player/seek', { position_ms: Number(playerSeek.value) }));
     spotifyAuthBtn.addEventListener('click', startSpotifyAuth);
     spotifyDashboardBtn.addEventListener('click', () => window.open('https://developer.spotify.com/dashboard', '_blank'));
+    newWebNodeBtn.addEventListener('click', () => window.location.href = '/web-node');
 
     fetchNodes();
     fetchStatus();

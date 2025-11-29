@@ -1,1 +1,21 @@
-{"ConfigVersion":2,"Groups":[]}
+{
+  "ConfigVersion": 2,
+  "http": {
+    "enabled": true,
+    "bind_to_address": "0.0.0.0",
+    "cross_origin": "*"
+  },
+  "stream": {
+    "streams": [
+      {
+        "name": "Spotify",
+        "type": "pipe",
+        "location": "/tmp/snapfifo",
+        "chunk_ms": 20,
+        "codec": "flac",
+        "sampleformat": "48000:16:2",
+        "mode": "create"
+      }
+    ]
+  }
+}

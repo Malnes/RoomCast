@@ -10,11 +10,11 @@ from typing import Dict, Optional
 
 import httpx
 import websockets
-from fastapi import Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi import Body, FastAPI, HTTPException, WebSocket, Request
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -40,7 +40,7 @@ NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 class NodeRegistration(BaseModel):
     id: Optional[str] = None
     name: str
-    url: HttpUrl
+    url: str = Field(min_length=1)
 
 
 class VolumePayload(BaseModel):
@@ -108,6 +108,7 @@ app = FastAPI(title="RoomCast Controller", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 nodes: Dict[str, dict] = {}
+browser_ws: Dict[str, WebSocket] = {}
 
 
 def load_nodes() -> None:
@@ -255,11 +256,13 @@ async def register_node(reg: NodeRegistration) -> dict:
         if existing["url"].rstrip("/") == str(reg.url).rstrip("/"):
             return existing
     node_id = reg.id or str(uuid.uuid4())
+    node_type = "browser" if str(reg.url).startswith("browser:") else "agent"
     nodes[node_id] = {
         "id": node_id,
         "name": reg.name,
         "url": str(reg.url).rstrip("/"),
         "last_seen": time.time(),
+        "type": node_type,
     }
     save_nodes()
     return nodes[node_id]
@@ -280,7 +283,14 @@ async def set_node_volume(node_id: str, payload: VolumePayload) -> dict:
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
-    result = await _call_agent(node, "/volume", payload.model_dump())
+    if node.get("type") == "browser":
+        ws = browser_ws.get(node_id)
+        if not ws:
+            raise HTTPException(status_code=503, detail="Browser node not connected")
+        await ws.send_json({"type": "volume", "percent": payload.percent})
+        result = {"sent": True}
+    else:
+        result = await _call_agent(node, "/volume", payload.model_dump())
     return {"ok": True, "result": result}
 
 
@@ -292,7 +302,14 @@ async def set_node_mute(node_id: str, payload: dict = Body(...)) -> dict:
     muted = payload.get("muted") if payload else None
     if muted is None:
         raise HTTPException(status_code=400, detail="Missing muted")
-    result = await _call_agent(node, "/mute", {"muted": bool(muted)})
+    if node.get("type") == "browser":
+        ws = browser_ws.get(node_id)
+        if not ws:
+            raise HTTPException(status_code=503, detail="Browser node not connected")
+        await ws.send_json({"type": "mute", "muted": bool(muted)})
+        result = {"sent": True}
+    else:
+        result = await _call_agent(node, "/mute", {"muted": bool(muted)})
     return {"ok": True, "result": result}
 
 
@@ -315,7 +332,14 @@ async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
-    result = await _call_agent(node, "/eq", payload.model_dump())
+    if node.get("type") == "browser":
+        ws = browser_ws.get(node_id)
+        if not ws:
+            raise HTTPException(status_code=503, detail="Browser node not connected")
+        await ws.send_json({"type": "eq", "bands": payload.model_dump()["bands"]})
+        result = {"sent": True}
+    else:
+        result = await _call_agent(node, "/eq", payload.model_dump())
     return {"ok": True, "result": result}
 
 
@@ -331,6 +355,23 @@ async def unregister_node(node_id: str) -> dict:
 @app.get("/api/nodes")
 async def list_nodes() -> dict:
     return {"nodes": list(nodes.values())}
+
+
+@app.websocket("/ws/web-node")
+async def web_node_ws(ws: WebSocket):
+    await ws.accept()
+    node_id = ws.query_params.get("node_id")
+    if not node_id or node_id not in nodes:
+        await ws.close(code=1008)
+        return
+    browser_ws[node_id] = ws
+    try:
+        while True:
+            await ws.receive_text()
+    except Exception:
+        pass
+    finally:
+        browser_ws.pop(node_id, None)
 
 
 async def _probe_host(host: str) -> Optional[dict]:
@@ -458,8 +499,8 @@ async def spotify_callback(code: str, state: str):
 @app.get("/api/spotify/player/status")
 async def spotify_player_status() -> dict:
     token = load_token()
-    if not token:
-        return {"active": False}
+    if not token or not token.get("access_token"):
+        raise HTTPException(status_code=401, detail="Spotify not authorized")
     resp = await spotify_request("GET", "/me/player/currently-playing", token)
     if resp.status_code == 204:
         return {"active": False}
@@ -535,3 +576,42 @@ async def serve_index():
 async def favicon():
     # No asset yet; avoid 404 noise
     return Response(status_code=204)
+
+
+@app.get("/web-node", include_in_schema=False)
+async def serve_web_node():
+    path = STATIC_DIR / "web-node.html"
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="UI not found")
+    return FileResponse(path)
+
+
+@app.api_route("/stream/spotify", methods=["GET"])
+async def proxy_spotify_stream(request: Request):
+    stream_paths = [
+        f"http://{SNAPSERVER_HOST}:{SNAPSERVER_PORT}/stream/Spotify",
+        f"http://{SNAPSERVER_HOST}:{SNAPSERVER_PORT}/stream/default",
+    ]
+    last_exc = None
+    for upstream in stream_paths:
+        try:
+            async with httpx.AsyncClient(timeout=None, follow_redirects=True) as client:
+                upstream_req = client.build_request(
+                    request.method, upstream, headers={"Accept": "*/*"}
+                )
+                upstream_resp = await client.send(upstream_req, stream=True)
+                ct = upstream_resp.headers.get("content-type", "")
+                if upstream_resp.status_code >= 400 or ct.startswith("text/html"):
+                    continue
+                headers = dict(upstream_resp.headers)
+                headers["Access-Control-Allow-Origin"] = "*"
+                return StreamingResponse(
+                    upstream_resp.aiter_raw(),
+                    status_code=upstream_resp.status_code,
+                    headers=headers,
+                    media_type=ct or "audio/flac",
+                )
+        except Exception as exc:
+            last_exc = exc
+            continue
+    raise HTTPException(status_code=502, detail=str(last_exc or "Stream unavailable"))

@@ -22,7 +22,7 @@ services:
   snapserver:
     image: saiyato/snapserver:latest
     environment:
-      SNAPSERVER_OPTS: ""
+      SNAPSERVER_OPTS: "--stream pipe:///tmp/snapfifo?name=Spotify --http-cors *"
     ports:
       - "1704:1704/tcp"   # snapcast control
       - "1705:1705/udp"   # snapcast discovery

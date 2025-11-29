@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RoomCast Web Node</title>
+  <style>
+    body { background:#0b1020; color:#e2e8f0; font-family: system-ui, -apple-system, sans-serif; padding:24px; }
+    .panel { background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; max-width:640px; margin:auto; box-shadow:0 14px 36px rgba(0,0,0,0.3); }
+    label { display:block; margin-bottom:6px; color:#cbd5e1; }
+    input { width:100%; padding:10px 12px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.06); color:#e2e8f0; }
+    button { margin-top:10px; padding:10px 14px; border:none; border-radius:12px; background:linear-gradient(135deg,#22c55e,#16a34a); color:#0b1020; font-weight:700; cursor:pointer; width:100%; }
+    .muted { color:#94a3b8; font-size:14px; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <div style="display:flex; justify-content: space-between; align-items:center;">
+      <h2 style="margin:0;">Web Node</h2>
+      <button onclick="window.location.href='/'" style="width:auto;">Back to Home</button>
+    </div>
+    <p class="muted">This is experimental. It plays the Snapserver stream in your browser and registers as a node.</p>
+    <div id="register-block">
+      <label>Node name</label>
+      <input id="node-name" placeholder="Browser node">
+      <button id="register">Register & Play</button>
+    </div>
+    <div id="status" class="muted" style="margin-top:8px;">Idle</div>
+    <div style="margin-top:8px;">
+      <label>Node volume</label>
+      <input id="node-volume" type="range" min="0" max="100" value="75" disabled>
+    </div>
+    <audio id="player" controls style="margin-top:12px; width:100%;" crossorigin="anonymous"></audio>
+  </div>
+  <script>
+    const nameInput = document.getElementById('node-name');
+    const btn = document.getElementById('register');
+    const statusEl = document.getElementById('status');
+    const audio = document.getElementById('player');
+    const nodeVol = document.getElementById('node-volume');
+    const registerBlock = document.getElementById('register-block');
+    let nodeId = null;
+    let ws = null;
+
+    async function register() {
+      try {
+        const payload = { name: nameInput.value || 'Browser node', url: 'browser:' + crypto.randomUUID() };
+        const res = await fetch('/api/nodes/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const data = await res.json();
+        nodeId = data.id;
+        statusEl.textContent = `Registered as ${data.name}`;
+        registerBlock.style.display = 'none';
+        startAudio();
+        connectWs();
+      } catch (err) {
+        statusEl.textContent = 'Register failed: ' + err.message;
+      }
+    }
+
+    function startAudio() {
+      const streamUrl = `/stream/spotify`;
+      audio.src = streamUrl;
+      audio.play().catch(() => { /* user gesture may be needed */ });
+      nodeVol.disabled = false;
+    }
+
+    function connectWs() {
+      if (!nodeId) return;
+      ws = new WebSocket(`ws://${location.host}/ws/web-node?node_id=${encodeURIComponent(nodeId)}`);
+      ws.onmessage = (evt) => {
+        try {
+          const msg = JSON.parse(evt.data);
+          if (msg.type === 'volume') {
+            audio.volume = Math.max(0, Math.min(1, (msg.percent || 0) / 100));
+            nodeVol.value = msg.percent ?? 0;
+          }
+          if (msg.type === 'mute') {
+            audio.muted = !!msg.muted;
+            statusEl.textContent = msg.muted ? 'Muted' : 'Playing';
+          }
+        } catch (e) {}
+      };
+      ws.onclose = () => {
+        statusEl.textContent = 'Disconnected; reconnecting…';
+        setTimeout(connectWs, 2000);
+      };
+    }
+
+    btn.addEventListener('click', register);
+
+    nodeVol.addEventListener('input', () => { audio.volume = nodeVol.value / 100; });
+
+  </script>
+</body>
+</html>

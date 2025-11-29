@@ -21,4 +21,4 @@ services:
     image: saiyato/snapclient:latest
     depends_on:
       - snapserver
-    command: ["-h", "snapserver", "--player", "pipe", "--pipe", "/dev/null"]
+    command: ["-h", "snapserver", "--player", "null"]
