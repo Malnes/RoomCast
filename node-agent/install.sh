@@ -1,0 +1,228 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SERVICE_USER="pi"
+INSTALL_DIR="/opt/roomcast"
+REPO_URL="https://github.com/Malnes/RoomCast.git"
+SNAP_PORT="1704"
+MIXER_CONTROL="Master"
+PLAYBACK_DEVICE="plughw:0,0"
+CAMILLA_VERSION="2.1.0"
+CAMILLA_PORT="1234"
+CAMILLA_ARCHIVE="camilladsp-linux-armv7.tar.gz"
+STATE_DIR="/var/lib/roomcast"
+AGENT_SECRET_PATH="${STATE_DIR}/agent-secret"
+AGENT_CONFIG_PATH="${STATE_DIR}/agent-config.json"
+
+usage() {
+  cat <<'EOF'
+Usage: install.sh [options]
+
+Options:
+  --user <value>          System user that should own and run the agent (default: pi)
+  --install-dir <path>    Directory to place the RoomCast repo (default: /opt/roomcast)
+  --repo <url>            Git URL for the RoomCast repo (default: official GitHub)
+  --snap-port <port>      Snapserver port (default: 1704)
+  --mixer <name>          ALSA mixer control to adjust (default: Master)
+  --playback-device <d>   ALSA playback device for CamillaDSP output (default: plughw:0,0)
+  --camilla-port <port>   CamillaDSP control port (default: 1234)
+  -h, --help              Show this help message
+
+Example:
+  curl -fsSL https://raw.githubusercontent.com/Malnes/RoomCast/main/node-agent/install.sh \
+    | sudo bash
+EOF
+}
+
+log() {
+  echo "[roomcast-install] $*"
+}
+
+require_root() {
+  if [[ ${EUID} -ne 0 ]]; then
+    echo "This script must be run as root (try: sudo bash install.sh ...)" >&2
+    exit 1
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --user)
+        SERVICE_USER="$2"; shift 2 ;;
+      --install-dir)
+        INSTALL_DIR="$2"; shift 2 ;;
+      --repo)
+        REPO_URL="$2"; shift 2 ;;
+      --snap-port)
+        SNAP_PORT="$2"; shift 2 ;;
+      --mixer)
+        MIXER_CONTROL="$2"; shift 2 ;;
+      --playback-device)
+        PLAYBACK_DEVICE="$2"; shift 2 ;;
+      --camilla-port)
+        CAMILLA_PORT="$2"; shift 2 ;;
+      -h|--help)
+        usage; exit 0 ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage; exit 1 ;;
+    esac
+  done
+
+}
+
+ensure_user_exists() {
+  if ! id "$SERVICE_USER" &>/dev/null; then
+    log "User $SERVICE_USER does not exist. Creating..."
+    useradd -m "$SERVICE_USER"
+  fi
+  usermod -a -G audio "$SERVICE_USER" || true
+}
+
+prepare_state_dir() {
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$STATE_DIR"
+  if [[ -f "$AGENT_SECRET_PATH" ]]; then
+    chown "$SERVICE_USER":"$SERVICE_USER" "$AGENT_SECRET_PATH"
+    chmod 600 "$AGENT_SECRET_PATH"
+  fi
+}
+
+seed_agent_config() {
+  rm -f "$AGENT_CONFIG_PATH"
+}
+
+install_packages() {
+  log "Installing required apt packages"
+  apt-get update -y
+  apt-get install -y snapclient git python3 python3-venv python3-pip alsa-utils curl
+}
+
+sync_repo() {
+  install -d -o "$SERVICE_USER" -g "$SERVICE_USER" "$INSTALL_DIR"
+  if [[ ! -d "$INSTALL_DIR/.git" ]]; then
+    log "Cloning RoomCast repo into $INSTALL_DIR"
+    sudo -u "$SERVICE_USER" git clone "$REPO_URL" "$INSTALL_DIR"
+  else
+    log "Updating existing repo"
+    sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" fetch --all --prune
+    sudo -u "$SERVICE_USER" git -C "$INSTALL_DIR" reset --hard origin/main
+  fi
+}
+
+setup_venv() {
+  log "Setting up Python environment"
+  python3 -m venv "$INSTALL_DIR/.venv"
+  "$INSTALL_DIR/.venv/bin/pip" install --upgrade pip
+  "$INSTALL_DIR/.venv/bin/pip" install -r "$INSTALL_DIR/node-agent/requirements.txt"
+  chown -R "$SERVICE_USER":"$SERVICE_USER" "$INSTALL_DIR"
+}
+
+configure_loopback() {
+  log "Configuring ALSA loopback device"
+  modprobe snd-aloop || true
+  cat <<EOF >/etc/modules-load.d/roomcast-loopback.conf
+snd-aloop
+EOF
+}
+
+install_camilladsp() {
+  if command -v camilladsp >/dev/null 2>&1; then
+    log "CamillaDSP already installed"
+    return
+  fi
+  log "Installing CamillaDSP v${CAMILLA_VERSION}"
+  tmpdir=$(mktemp -d)
+  archive="${tmpdir}/${CAMILLA_ARCHIVE}"
+  curl -L -o "$archive" "https://github.com/HEnquist/camilla-dsp/releases/download/v${CAMILLA_VERSION}/${CAMILLA_ARCHIVE}"
+  tar -xzf "$archive" -C "$tmpdir"
+  if [[ ! -f ${tmpdir}/camilladsp ]]; then
+    echo "Failed to find camilladsp binary in archive" >&2
+    exit 1
+  fi
+  install -m 0755 "${tmpdir}/camilladsp" /usr/local/bin/camilladsp
+  rm -rf "$tmpdir"
+}
+
+write_camilla_config() {
+  log "Generating CamillaDSP config"
+  install -d /etc/roomcast
+  sed -e "s#__PLAYBACK_DEVICE__#${PLAYBACK_DEVICE}#g" \
+      -e "s#__CAMILLA_PORT__#${CAMILLA_PORT}#g" \
+    "$INSTALL_DIR/node-agent/camilladsp-config.yml" > /etc/roomcast/camilladsp.yml
+  chown "$SERVICE_USER":"$SERVICE_USER" /etc/roomcast/camilladsp.yml || true
+}
+
+write_camilla_unit() {
+  cat <<EOF >/etc/systemd/system/roomcast-camilla.service
+[Unit]
+Description=CamillaDSP (RoomCast)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/camilladsp -c /etc/roomcast/camilladsp.yml
+Restart=always
+RestartSec=3
+User=${SERVICE_USER}
+WorkingDirectory=${INSTALL_DIR}/node-agent
+Environment=CAMILLA_LOG_LEVEL=info
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_agent_unit() {
+  cat <<EOF >/etc/systemd/system/roomcast-agent.service
+[Unit]
+Description=RoomCast Node Agent
+After=network-online.target roomcast-camilla.service
+Requires=roomcast-camilla.service
+
+[Service]
+Environment=MIXER_CONTROL=${MIXER_CONTROL}
+Environment=PLAYBACK_DEVICE=${PLAYBACK_DEVICE}
+Environment=SNAPCLIENT_PORT=${SNAP_PORT}
+Environment=CAMILLA_HOST=127.0.0.1
+Environment=CAMILLA_PORT=${CAMILLA_PORT}
+Environment=CAMILLA_FILTER_PATH=filters.peq_stack
+Environment=CAMILLA_MAX_BANDS=31
+Environment=AGENT_SECRET_PATH=${AGENT_SECRET_PATH}
+Environment=AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH}
+WorkingDirectory=${INSTALL_DIR}/node-agent
+ExecStart=${INSTALL_DIR}/.venv/bin/python ${INSTALL_DIR}/node-agent/agent.py
+Restart=always
+RestartSec=3
+User=${SERVICE_USER}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+enable_services() {
+  systemctl daemon-reload
+  systemctl enable --now roomcast-camilla.service
+  systemctl enable --now roomcast-agent.service
+}
+
+main() {
+  parse_args "$@"
+  require_root
+  ensure_user_exists
+  prepare_state_dir
+  seed_agent_config
+  install_packages
+  sync_repo
+  setup_venv
+  configure_loopback
+  install_camilladsp
+  write_camilla_config
+  write_camilla_unit
+  write_agent_unit
+  enable_services
+  log "Installation complete. Register this node via the RoomCast dashboard."
+}
+
+main "$@"

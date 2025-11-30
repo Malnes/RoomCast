@@ -24,7 +24,6 @@ log = logging.getLogger("roomcast")
 SNAPSERVER_HOST = os.getenv("SNAPSERVER_HOST", "snapserver")
 SNAPSERVER_PORT = int(os.getenv("SNAPSERVER_PORT", "1780"))
 SNAPCLIENT_PORT = int(os.getenv("SNAPCLIENT_PORT", "1704"))
-AGENT_SHARED_SECRET = os.getenv("AGENT_SHARED_SECRET", "changeme")
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/config/spotify.json"))
 CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = Path(__file__).parent / "static"
@@ -39,6 +38,7 @@ TOKEN_SIGNER = URLSafeSerializer(os.getenv("SPOTIFY_STATE_SECRET", "changeme"))
 NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
+SENSITIVE_NODE_FIELDS = {"agent_secret"}
 
 
 class NodeRegistration(BaseModel):
@@ -60,6 +60,7 @@ class EqBand(BaseModel):
 class EqPayload(BaseModel):
     preset: Optional[str] = None
     bands: list[EqBand] = Field(default_factory=list)
+    band_count: int = Field(default=15, ge=1, le=31)
 
 
 class PanPayload(BaseModel):
@@ -125,12 +126,31 @@ nodes: Dict[str, dict] = {}
 browser_ws: Dict[str, WebSocket] = {}
 node_watchers: set[WebSocket] = set()
 webrtc_relay: Optional[WebAudioRelay] = None
+DEFAULT_EQ_PRESET = "peq15"
+
+
+def default_eq_state() -> dict:
+    return {"preset": DEFAULT_EQ_PRESET, "band_count": 15, "bands": []}
+
+
+def public_node(node: dict) -> dict:
+    data = {k: v for k, v in node.items() if k not in SENSITIVE_NODE_FIELDS}
+    data["paired"] = bool(node.get("agent_secret"))
+    if node.get("type") == "browser":
+        data["configured"] = True
+    else:
+        data["configured"] = bool(node.get("audio_configured"))
+    return data
+
+
+def public_nodes() -> list[dict]:
+    return [public_node(node) for node in nodes.values()]
 
 
 async def broadcast_nodes() -> None:
     if not node_watchers:
         return
-    payload = {"type": "nodes", "nodes": list(nodes.values())}
+    payload = {"type": "nodes", "nodes": public_nodes()}
     dead: list[WebSocket] = []
     for ws in list(node_watchers):
         try:
@@ -156,6 +176,9 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
         "last_seen": time.time(),
         "type": node_type,
         "pan": nodes.get(node_id, {}).get("pan", 0.0) if node_id in nodes else 0.0,
+        "eq": default_eq_state(),
+        "agent_secret": nodes.get(node_id, {}).get("agent_secret"),
+        "audio_configured": True if node_type == "browser" else nodes.get(node_id, {}).get("audio_configured", False),
     }
     save_nodes()
     return nodes[node_id]
@@ -163,7 +186,39 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
 
 def create_browser_node(name: str) -> dict:
     reg = NodeRegistration(id=str(uuid.uuid4()), name=name, url=f"browser:{uuid.uuid4()}")
-    return _register_node_internal(reg)
+    return public_node(_register_node_internal(reg))
+
+
+async def request_agent_secret(node: dict, force: bool = False) -> str:
+    if node.get("type") != "agent":
+        raise HTTPException(status_code=400, detail="Pairing only applies to hardware nodes")
+    url = f"{node['url'].rstrip('/')}/pair"
+    payload = {"force": bool(force)}
+    async with httpx.AsyncClient(timeout=5) as client:
+        resp = await client.post(url, json=payload)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text or "Failed to pair node")
+    try:
+        data = resp.json()
+    except ValueError:
+        raise HTTPException(status_code=502, detail="Invalid response from node agent")
+    secret = data.get("secret")
+    if not secret:
+        raise HTTPException(status_code=502, detail="Node agent did not return a secret")
+    return secret
+
+
+async def configure_agent_audio(node: dict) -> dict:
+    if node.get("type") != "agent":
+        raise HTTPException(status_code=400, detail="Audio configuration only applies to hardware nodes")
+    payload = {
+        "snapserver_host": SNAPSERVER_HOST,
+        "snapserver_port": SNAPCLIENT_PORT,
+    }
+    result = await _call_agent(node, "/config/snapclient", payload)
+    node["audio_configured"] = bool(result.get("configured", True))
+    save_nodes()
+    return result
 
 
 async def teardown_browser_node(node_id: str, *, remove_entry: bool = True) -> None:
@@ -197,6 +252,15 @@ def load_nodes() -> None:
         for item in data:
             item = dict(item)
             item.setdefault("pan", 0.0)
+            eq = item.get("eq") or default_eq_state()
+            eq.setdefault("bands", [])
+            eq.setdefault("band_count", len(eq["bands"]) or 15)
+            eq.setdefault("preset", DEFAULT_EQ_PRESET)
+            item["eq"] = eq
+            if item.get("type") == "browser":
+                item["audio_configured"] = True
+            else:
+                item["audio_configured"] = bool(item.get("audio_configured"))
             nodes[item["id"]] = item
     except Exception:
         nodes = {}
@@ -352,13 +416,26 @@ async def snapcast_volume(client_id: str, payload: VolumePayload) -> dict:
 @app.post("/api/nodes/register")
 async def register_node(reg: NodeRegistration) -> dict:
     node = _register_node_internal(reg)
+    if node.get("type") == "agent":
+        try:
+            secret = await request_agent_secret(node, force=True)
+            node["agent_secret"] = secret
+            await configure_agent_audio(node)
+        except Exception:
+            nodes.pop(node["id"], None)
+            save_nodes()
+            raise
+        save_nodes()
     await broadcast_nodes()
-    return node
+    return public_node(node)
 
 
 async def _call_agent(node: dict, path: str, payload: dict) -> dict:
     url = f"{node['url']}{path}"
-    headers = {"X-Agent-Secret": AGENT_SHARED_SECRET}
+    secret = node.get("agent_secret")
+    if not secret:
+        raise HTTPException(status_code=409, detail="Node is not paired. Re-register or pair it first.")
+    headers = {"X-Agent-Secret": secret}
     async with httpx.AsyncClient(timeout=5) as client:
         resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code >= 400:
@@ -420,14 +497,18 @@ async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
+    eq_data = payload.model_dump()
+    node["eq"] = eq_data
+    save_nodes()
     if node.get("type") == "browser":
         ws = browser_ws.get(node_id)
         if not ws:
             raise HTTPException(status_code=503, detail="Browser node not connected")
-        await ws.send_json({"type": "eq", "bands": payload.model_dump()["bands"]})
+        await ws.send_json({"type": "eq", "eq": eq_data})
         result = {"sent": True}
     else:
-        result = await _call_agent(node, "/eq", payload.model_dump())
+        result = await _call_agent(node, "/eq", eq_data)
+    await broadcast_nodes()
     return {"ok": True, "result": result}
 
 
@@ -444,6 +525,34 @@ async def set_node_pan(node_id: str, payload: PanPayload) -> dict:
         await webrtc_relay.set_pan(node_id, payload.pan)
     await broadcast_nodes()
     return {"ok": True, "pan": payload.pan}
+
+
+@app.post("/api/nodes/{node_id}/pair")
+async def pair_node(node_id: str, payload: dict | None = Body(default=None)) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "browser":
+        raise HTTPException(status_code=400, detail="Browser nodes do not support pairing")
+    force = True if payload is None else bool(payload.get("force", False))
+    secret = await request_agent_secret(node, force=force)
+    node["agent_secret"] = secret
+    await configure_agent_audio(node)
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True}
+
+
+@app.post("/api/nodes/{node_id}/configure")
+async def configure_node(node_id: str) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "browser":
+        raise HTTPException(status_code=400, detail="Browser nodes do not require configuration")
+    result = await configure_agent_audio(node)
+    await broadcast_nodes()
+    return {"ok": True, "result": result}
 
 
 @app.delete("/api/nodes/{node_id}")
@@ -463,7 +572,7 @@ async def unregister_node(node_id: str) -> dict:
 
 @app.get("/api/nodes")
 async def list_nodes() -> dict:
-    return {"nodes": list(nodes.values())}
+    return {"nodes": public_nodes()}
 
 
 @app.post("/api/web-nodes/session")
@@ -505,7 +614,7 @@ async def nodes_ws(ws: WebSocket):
     await ws.accept()
     node_watchers.add(ws)
     try:
-        await ws.send_json({"type": "nodes", "nodes": list(nodes.values())})
+        await ws.send_json({"type": "nodes", "nodes": public_nodes()})
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
@@ -518,10 +627,9 @@ async def nodes_ws(ws: WebSocket):
 
 async def _probe_host(host: str) -> Optional[dict]:
     url = f"http://{host}:{AGENT_PORT}"
-    headers = {"X-Agent-Secret": AGENT_SHARED_SECRET}
     try:
         async with httpx.AsyncClient(timeout=2) as client:
-            resp = await client.get(f"{url}/health", headers=headers)
+            resp = await client.get(f"{url}/health")
         if resp.status_code == 200:
             return {"host": host, "url": f"{url}", "healthy": True}
     except Exception:

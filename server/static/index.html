@@ -33,7 +33,18 @@
     .small-btn { width: auto; padding: 8px 12px; }
     .node-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .node-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
+    .node-status { font-size: 12px; color: #cbd5e1; margin-top: 6px; display: flex; align-items: center; gap: 10px; }
+    .status-pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; }
+    .status-pill.ok { background: rgba(34,197,94,0.18); color: #bbf7d0; }
+    .status-pill.warn { background: rgba(249,115,22,0.18); color: #fed7aa; }
     .eq-block { margin-top: 10px; }
+    .eq-band-list { max-height: 70vh; overflow-y: auto; margin-top: 12px; }
+    .eq-band-row { display: grid; grid-template-columns: 56px 1fr 1fr 1fr; gap: 12px; padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.05); }
+    .eq-band-row:last-child { border-bottom: none; }
+    .eq-band-label { font-size: 12px; color: rgba(255,255,255,0.5); align-self: center; }
+    .eq-band-cell label { font-size: 11px; text-transform: uppercase; display: block; margin-bottom: 4px; color: rgba(255,255,255,0.5); }
+    .eq-band-cell input[type="number"] { width: 100%; margin-bottom: 4px; }
+    .eq-band-cell input[type="range"] { width: 100%; }
     .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 24px 12px; }
     .settings-card { background: #0f172a; border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 16px; width: min(960px, 95vw); box-shadow: 0 18px 40px rgba(0,0,0,0.35); }
     .settings-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
@@ -252,7 +263,15 @@
 
     let nodesCache = [];
     const eqState = {};
-    let dragging = null;
+    const eqUpdateTimers = {};
+    const EQ_FREQUENCIES = {
+      peq15: [25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000],
+      peq31: [20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000],
+    };
+    const EQ_GAIN_RANGE = { min: -12, max: 12 };
+    const EQ_Q_RANGE = { min: 0.2, max: 10 };
+    const EQ_PUSH_DEBOUNCE_MS = 120;
+    const LOG_FREQ = { min: Math.log10(20), max: Math.log10(20000) };
     let eqModal = null;
     const spotifyAuthBtn = document.getElementById('spotify-auth');
     const spotifyDashboardBtn = document.getElementById('spotify-dashboard');
@@ -265,12 +284,34 @@
         return;
       }
       nodes.forEach(n => {
+        hydrateEqFromNode(n);
         const wrapper = document.createElement('div');
         wrapper.className = 'panel';
         const header = document.createElement('div');
         header.className = 'node-header';
-        header.innerHTML = `<div><strong>${n.name}</strong><div class="muted" style="font-size:12px;">${n.url}</div></div>`;
+        header.innerHTML = `<div><strong>${n.name}</strong></div>`;
         wrapper.appendChild(header);
+
+        const statusRow = document.createElement('div');
+        statusRow.className = 'node-status';
+        const isBrowser = n.type === 'browser';
+        const paired = !!n.paired;
+        const configured = isBrowser ? true : !!n.configured;
+        const typePill = document.createElement('span');
+        typePill.className = `status-pill ${isBrowser || paired ? 'ok' : 'warn'}`;
+        typePill.textContent = isBrowser ? 'Browser node' : paired ? 'Paired' : 'Pairing required';
+        statusRow.appendChild(typePill);
+        if (!isBrowser) {
+          const cfgPill = document.createElement('span');
+          cfgPill.className = `status-pill ${configured ? 'ok' : 'warn'}`;
+          cfgPill.textContent = configured ? 'Audio ready' : 'Needs config';
+          statusRow.appendChild(cfgPill);
+        }
+        const urlMeta = document.createElement('div');
+        urlMeta.className = 'muted';
+        urlMeta.textContent = n.url;
+        statusRow.appendChild(urlMeta);
+        wrapper.appendChild(statusRow);
 
         const volLabel = document.createElement('div');
         volLabel.className = 'label';
@@ -281,6 +322,8 @@
         volInput.min = 0;
         volInput.max = 100;
         volInput.value = 75;
+        const disableAgentControls = !isBrowser && (!paired || !configured);
+        volInput.disabled = disableAgentControls;
         volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
         wrapper.appendChild(volInput);
 
@@ -319,11 +362,32 @@
         const muteBtn = document.createElement('button');
         muteBtn.className = 'small-btn';
         muteBtn.textContent = 'Mute';
+        muteBtn.disabled = disableAgentControls;
         muteBtn.addEventListener('click', () => toggleMute(n.id, muteBtn));
         const eqBtn = document.createElement('button');
         eqBtn.className = 'small-btn';
         eqBtn.textContent = 'EQ';
+        eqBtn.disabled = n.type !== 'browser' && (!paired || !configured);
         eqBtn.addEventListener('click', () => openEqModal(n.id, n.name));
+        if (n.type !== 'browser') {
+          const pairBtn = document.createElement('button');
+          pairBtn.className = 'small-btn';
+          pairBtn.textContent = paired ? 'Rotate key' : 'Pair node';
+          if (!paired) {
+            pairBtn.style.background = 'linear-gradient(135deg, #f97316, #ea580c)';
+          }
+          pairBtn.addEventListener('click', () => pairNode(n.id, pairBtn));
+          actions.appendChild(pairBtn);
+          const configBtn = document.createElement('button');
+          configBtn.className = 'small-btn';
+          configBtn.textContent = configured ? 'Reconfigure audio' : 'Configure audio';
+          configBtn.disabled = !paired;
+          if (!configured) {
+            configBtn.style.background = 'linear-gradient(135deg, #22c55e, #16a34a)';
+          }
+          configBtn.addEventListener('click', () => configureNode(n.id, configBtn));
+          actions.appendChild(configBtn);
+        }
         const removeBtn = document.createElement('button');
         removeBtn.className = 'small-btn';
         removeBtn.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
@@ -533,6 +597,38 @@
       }
     }
 
+    async function pairNode(nodeId, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/pair`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ force: true }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Node paired');
+        await fetchNodes();
+      } catch (err) {
+        showError(`Failed to pair node: ${err.message}`);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function configureNode(nodeId, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/configure`, { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Node audio configured');
+        await fetchNodes();
+      } catch (err) {
+        showError(`Failed to configure node: ${err.message}`);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
     async function unregisterNode(nodeId) {
       try {
         const res = await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' });
@@ -544,116 +640,292 @@
       }
     }
 
-    function ensureEq(nodeId) {
-      if (!eqState[nodeId] || !eqState[nodeId].length) {
-        eqState[nodeId] = [{ freq: 1000, gain: 0, q: 1 }];
-      }
+    function clampValue(val, min, max) {
+      return Math.min(max, Math.max(min, val));
     }
 
-    function addBand(nodeId) {
-      ensureEq(nodeId);
-      const bands = eqState[nodeId];
-      const newFreq = bands.length ? Math.min(20000, bands[bands.length - 1].freq * 1.5) : 1000;
-      bands.push({ freq: newFreq, gain: 0, q: 1 });
+    function defaultEqBands(mode) {
+      const freqs = EQ_FREQUENCIES[mode] || EQ_FREQUENCIES.peq15;
+      return freqs.map(freq => ({ freq, gain: 0, q: 1 }));
     }
 
-    function drawEq(canvas, bands) {
-      const ctx = canvas.getContext('2d');
-      const w = canvas.width;
-      const h = canvas.height;
-      ctx.clearRect(0, 0, w, h);
-      ctx.fillStyle = 'rgba(255,255,255,0.02)';
-      ctx.fillRect(0, 0, w, h);
-      ctx.strokeStyle = 'rgba(255,255,255,0.08)';
-      ctx.lineWidth = 1;
-      for (let i = 1; i <= 4; i++) {
-        const y = (h / 5) * i;
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
-      }
-      const freqs = bands.map(b => b.freq);
-      ctx.beginPath();
-      ctx.strokeStyle = 'rgba(34,197,94,0.6)';
-      ctx.lineWidth = 2;
-      bands.forEach((b, idx) => {
-        const { x, y } = bandToPos(b, w, h);
-        if (idx === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    function normalizeEqPayload(payload) {
+      if (!payload) return { mode: 'peq15', bands: defaultEqBands('peq15') };
+      const sourceBands = Array.isArray(payload.bands) ? payload.bands : [];
+      const mode = (payload.preset === 'peq31' || Number(payload.band_count) >= 31) ? 'peq31' : 'peq15';
+      const template = defaultEqBands(mode);
+      template.forEach((band, idx) => {
+        const src = sourceBands[idx];
+        if (!src) return;
+        band.freq = clampValue(Number(src.freq) || band.freq, 20, 20000);
+        band.gain = clampValue(Number(src.gain) || 0, EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
+        band.q = clampValue(Number(src.q) || 1, EQ_Q_RANGE.min, EQ_Q_RANGE.max);
       });
-      ctx.stroke();
-      bands.forEach((b, idx) => {
-        const { x, y } = bandToPos(b, w, h);
-        ctx.fillStyle = '#22c55e';
-        ctx.beginPath();
-        ctx.arc(x, y, 8, 0, Math.PI * 2);
-        ctx.fill();
-      });
+      return { mode, bands: template };
     }
 
-    function bandToPos(band, w, h) {
-      const minF = 20, maxF = 20000;
-      const logMin = Math.log10(minF), logMax = Math.log10(maxF);
-      const lx = (Math.log10(band.freq) - logMin) / (logMax - logMin);
-      const x = lx * (w - 20) + 10;
-      const y = ((-band.gain + 24) / 48) * (h - 20) + 10;
-      return { x, y };
+    function hydrateEqFromNode(node) {
+      if (!node || !node.id) return;
+      eqState[node.id] = normalizeEqPayload(node.eq);
     }
 
-    function posToBand(x, y, w, h, band) {
-      const minF = 20, maxF = 20000;
-      const logMin = Math.log10(minF), logMax = Math.log10(maxF);
-      const lx = (x - 10) / (w - 20);
-      const freq = Math.pow(10, lx * (logMax - logMin) + logMin);
-      const gain = -( (y - 10) / (h - 20) * 48 - 24 );
-      band.freq = Math.min(maxF, Math.max(minF, freq));
-      band.gain = Math.min(24, Math.max(-24, gain));
+    function getEqState(nodeId) {
+      if (!eqState[nodeId]) {
+        eqState[nodeId] = { mode: 'peq15', bands: defaultEqBands('peq15') };
+      }
+      return eqState[nodeId];
     }
 
-    function attachCanvasEvents(canvas) {
-      canvas.addEventListener('mousedown', (e) => {
-        const nodeId = canvas.dataset.nodeId;
-        const bands = eqState[nodeId];
-        const rect = canvas.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        let found = -1;
-        bands.forEach((b, idx) => {
-          const p = bandToPos(b, canvas.width, canvas.height);
-          const dx = p.x - x, dy = p.y - y;
-          if (Math.sqrt(dx*dx + dy*dy) < 12) found = idx;
-        });
-        if (e.detail === 2) {
-          bands.push({ freq: 1000, gain: 0, q: 1 });
-          drawEq(canvas, bands);
-          return;
-        }
-        if (found >= 0) {
-          dragging = { nodeId, idx: found, canvas };
+    function setEqMode(nodeId, mode) {
+      const target = EQ_FREQUENCIES[mode] ? mode : 'peq15';
+      const nextBands = defaultEqBands(target);
+      const current = getEqState(nodeId).bands;
+      nextBands.forEach((band, idx) => {
+        if (current[idx]) {
+          band.freq = clampValue(current[idx].freq, 20, 20000);
+          band.gain = clampValue(current[idx].gain, EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
+          band.q = clampValue(current[idx].q, EQ_Q_RANGE.min, EQ_Q_RANGE.max);
         }
       });
-      window.addEventListener('mousemove', (e) => {
-        if (!dragging) return;
-        const { nodeId, idx, canvas } = dragging;
-        const bands = eqState[nodeId];
-        const rect = canvas.getBoundingClientRect();
-        const x = e.clientX - rect.left;
-        const y = e.clientY - rect.top;
-        posToBand(x, y, canvas.width, canvas.height, bands[idx]);
-        drawEq(canvas, bands);
-      });
-      window.addEventListener('mouseup', () => { dragging = null; });
+      eqState[nodeId] = { mode: target, bands: nextBands };
     }
 
-    async function setNodeEq(nodeId) {
+    function freqToSlider(freq) {
+      const logF = Math.log10(clampValue(freq, 20, 20000));
+      const ratio = (logF - LOG_FREQ.min) / (LOG_FREQ.max - LOG_FREQ.min);
+      return Math.round(ratio * 1000);
+    }
+
+    function sliderToFreq(value) {
+      const ratio = clampValue(value, 0, 1000) / 1000;
+      const logF = LOG_FREQ.min + ratio * (LOG_FREQ.max - LOG_FREQ.min);
+      return Math.pow(10, logF);
+    }
+
+    function scheduleEqPush(nodeId) {
+      clearTimeout(eqUpdateTimers[nodeId]);
+      eqUpdateTimers[nodeId] = setTimeout(() => pushEq(nodeId), EQ_PUSH_DEBOUNCE_MS);
+    }
+
+    async function pushEq(nodeId) {
+      const state = getEqState(nodeId);
+      const payload = {
+        preset: state.mode,
+        band_count: state.bands.length,
+        bands: state.bands.map(b => ({
+          freq: Number(b.freq),
+          gain: Number(b.gain),
+          q: Number(b.q),
+        })),
+      };
       try {
         const res = await fetch(`/api/nodes/${nodeId}/eq`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ bands: eqState[nodeId] || [] }),
+          body: JSON.stringify(payload),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        showSuccess('Node EQ updated');
       } catch (err) {
-        showError(`Failed to set node EQ: ${err.message}`);
+        showError(`Failed to update EQ: ${err.message}`);
       }
+    }
+
+    function renderEqBands(nodeId, container) {
+      const state = getEqState(nodeId);
+      container.innerHTML = '';
+      state.bands.forEach((band, idx) => {
+        const row = document.createElement('div');
+        row.className = 'eq-band-row';
+
+        const label = document.createElement('div');
+        label.className = 'eq-band-label';
+        label.textContent = `#${idx + 1}`;
+        row.appendChild(label);
+
+        const freqCell = document.createElement('div');
+        freqCell.className = 'eq-band-cell';
+        const freqLabel = document.createElement('label');
+        freqLabel.textContent = 'Freq (Hz)';
+        const freqInput = document.createElement('input');
+        freqInput.type = 'number';
+        freqInput.min = 20;
+        freqInput.max = 20000;
+        freqInput.value = Math.round(band.freq);
+        freqInput.addEventListener('change', () => {
+          band.freq = clampValue(Number(freqInput.value) || band.freq, 20, 20000);
+          freqSlider.value = freqToSlider(band.freq);
+          scheduleEqPush(nodeId);
+        });
+        const freqSlider = document.createElement('input');
+        freqSlider.type = 'range';
+        freqSlider.min = 0;
+        freqSlider.max = 1000;
+        freqSlider.value = freqToSlider(band.freq);
+        freqSlider.addEventListener('input', () => {
+          band.freq = clampValue(sliderToFreq(Number(freqSlider.value)), 20, 20000);
+          freqInput.value = Math.round(band.freq);
+          scheduleEqPush(nodeId);
+        });
+        freqCell.appendChild(freqLabel);
+        freqCell.appendChild(freqInput);
+        freqCell.appendChild(freqSlider);
+        row.appendChild(freqCell);
+
+        const gainCell = document.createElement('div');
+        gainCell.className = 'eq-band-cell';
+        const gainLabel = document.createElement('label');
+        gainLabel.textContent = 'Gain (dB)';
+        const gainSlider = document.createElement('input');
+        gainSlider.type = 'range';
+        gainSlider.min = EQ_GAIN_RANGE.min;
+        gainSlider.max = EQ_GAIN_RANGE.max;
+        gainSlider.step = 0.5;
+        gainSlider.value = band.gain;
+        const gainValue = document.createElement('div');
+        gainValue.className = 'muted';
+        gainValue.textContent = `${band.gain.toFixed(1)} dB`;
+        gainSlider.addEventListener('input', () => {
+          band.gain = clampValue(Number(gainSlider.value), EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
+          gainValue.textContent = `${band.gain.toFixed(1)} dB`;
+          scheduleEqPush(nodeId);
+        });
+        gainCell.appendChild(gainLabel);
+        gainCell.appendChild(gainSlider);
+        gainCell.appendChild(gainValue);
+        row.appendChild(gainCell);
+
+        const qCell = document.createElement('div');
+        qCell.className = 'eq-band-cell';
+        const qLabel = document.createElement('label');
+        qLabel.textContent = 'Q';
+        const qInput = document.createElement('input');
+        qInput.type = 'number';
+        qInput.step = 0.1;
+        qInput.min = EQ_Q_RANGE.min;
+        qInput.max = EQ_Q_RANGE.max;
+        qInput.value = band.q.toFixed(2);
+        qInput.addEventListener('change', () => {
+          band.q = clampValue(Number(qInput.value) || band.q, EQ_Q_RANGE.min, EQ_Q_RANGE.max);
+          scheduleEqPush(nodeId);
+        });
+        qCell.appendChild(qLabel);
+        qCell.appendChild(qInput);
+        row.appendChild(qCell);
+
+        container.appendChild(row);
+      });
+    }
+
+    function openEqModal(nodeId, nodeName) {
+      const node = nodesCache.find(n => n.id === nodeId);
+      if (node?.eq) {
+        eqState[nodeId] = normalizeEqPayload(node.eq);
+      } else {
+        getEqState(nodeId);
+      }
+      if (eqModal) eqModal.remove();
+      eqModal = document.createElement('div');
+      eqModal.className = 'settings-overlay';
+      eqModal.style.display = 'flex';
+      const card = document.createElement('div');
+      card.className = 'settings-card';
+      const header = document.createElement('div');
+      header.className = 'settings-header';
+      header.innerHTML = `<div class="section-title" style="margin:0;">EQ – ${nodeName}</div>`;
+      const closeBtn = document.createElement('button');
+      closeBtn.className = 'icon-btn';
+      closeBtn.textContent = '✕';
+      closeBtn.addEventListener('click', () => eqModal.remove());
+      header.appendChild(closeBtn);
+      card.appendChild(header);
+
+      const controls = document.createElement('div');
+      controls.className = 'node-actions';
+      const modeSelect = document.createElement('select');
+      modeSelect.innerHTML = '<option value="peq15">15-band parametric</option><option value="peq31">31-band parametric</option>';
+      modeSelect.value = getEqState(nodeId).mode;
+      modeSelect.addEventListener('change', () => {
+        setEqMode(nodeId, modeSelect.value);
+        renderEqBands(nodeId, bandList);
+        scheduleEqPush(nodeId);
+      });
+      const resetBtn = document.createElement('button');
+      resetBtn.className = 'small-btn';
+      resetBtn.textContent = 'Reset';
+      resetBtn.addEventListener('click', () => {
+        eqState[nodeId] = { mode: modeSelect.value, bands: defaultEqBands(modeSelect.value) };
+        renderEqBands(nodeId, bandList);
+        scheduleEqPush(nodeId);
+      });
+      const savePresetBtn = document.createElement('button');
+      savePresetBtn.className = 'small-btn';
+      savePresetBtn.textContent = 'Save preset';
+      savePresetBtn.addEventListener('click', () => savePreset(nodeId, presetList, modeSelect, bandList));
+      controls.appendChild(modeSelect);
+      controls.appendChild(resetBtn);
+      controls.appendChild(savePresetBtn);
+      card.appendChild(controls);
+
+      const bandList = document.createElement('div');
+      bandList.className = 'eq-band-list';
+      renderEqBands(nodeId, bandList);
+      card.appendChild(bandList);
+
+      const presetWrap = document.createElement('div');
+      presetWrap.className = 'panel';
+      presetWrap.style.marginTop = '12px';
+      const presetTitle = document.createElement('div');
+      presetTitle.className = 'section-title';
+      presetTitle.innerText = 'Presets';
+      presetWrap.appendChild(presetTitle);
+      const presetList = document.createElement('div');
+      presetList.id = 'preset-list';
+      presetList.className = 'muted';
+      presetWrap.appendChild(presetList);
+      card.appendChild(presetWrap);
+
+      eqModal.appendChild(card);
+      document.body.appendChild(eqModal);
+      renderPresets(nodeId, presetList, modeSelect, bandList);
+    }
+
+    function savePreset(nodeId, presetList, modeSelect, bandList) {
+      const name = prompt('Preset name?');
+      if (!name) return;
+      const presets = JSON.parse(localStorage.getItem('eq-presets') || '{}');
+      const state = getEqState(nodeId);
+      presets[name] = { mode: state.mode, bands: state.bands.map(b => ({ ...b })) };
+      localStorage.setItem('eq-presets', JSON.stringify(presets));
+      renderPresets(nodeId, presetList, modeSelect, bandList);
+      showSuccess('Preset saved');
+    }
+
+    function renderPresets(nodeId, container, modeSelect, bandList) {
+      const presets = JSON.parse(localStorage.getItem('eq-presets') || '{}');
+      const entries = Object.entries(presets);
+      if (!entries.length) {
+        container.innerHTML = 'No presets saved yet.';
+        return;
+      }
+      container.innerHTML = '';
+      entries.forEach(([name, data]) => {
+        const row = document.createElement('div');
+        row.className = 'node-actions';
+        const label = document.createElement('div');
+        label.textContent = name;
+        const apply = document.createElement('button');
+        apply.className = 'small-btn';
+        apply.textContent = 'Apply';
+        apply.addEventListener('click', () => {
+          eqState[nodeId] = normalizeEqPayload(data);
+          modeSelect.value = getEqState(nodeId).mode;
+          renderEqBands(nodeId, bandList);
+          scheduleEqPush(nodeId);
+        });
+        row.appendChild(label);
+        row.appendChild(apply);
+        container.appendChild(row);
+      });
     }
 
     async function setMasterVolume(percent) {
@@ -753,108 +1025,6 @@
       }
     }
 
-    function openEqModal(nodeId, nodeName) {
-      ensureEq(nodeId);
-      if (eqModal) eqModal.remove();
-      eqModal = document.createElement('div');
-      eqModal.className = 'settings-overlay';
-      eqModal.style.display = 'flex';
-      const card = document.createElement('div');
-      card.className = 'settings-card';
-      const header = document.createElement('div');
-      header.className = 'settings-header';
-      header.innerHTML = `<div class="section-title" style="margin:0;">EQ – ${nodeName}</div>`;
-      const closeBtn = document.createElement('button');
-      closeBtn.className = 'icon-btn';
-      closeBtn.textContent = '✕';
-      closeBtn.addEventListener('click', () => eqModal.remove());
-      header.appendChild(closeBtn);
-      card.appendChild(header);
-
-      const canvas = document.createElement('canvas');
-      canvas.width = 840;
-      canvas.height = 260;
-      canvas.style.width = '100%';
-      canvas.style.borderRadius = '12px';
-      canvas.style.background = 'rgba(255,255,255,0.03)';
-      canvas.style.border = '1px solid rgba(255,255,255,0.06)';
-      canvas.dataset.nodeId = nodeId;
-      attachCanvasEvents(canvas);
-      card.appendChild(canvas);
-      drawEq(canvas, eqState[nodeId]);
-
-      const eqButtons = document.createElement('div');
-      eqButtons.className = 'node-actions';
-      const addBandBtn = document.createElement('button');
-      addBandBtn.className = 'small-btn';
-      addBandBtn.textContent = 'Add band';
-      addBandBtn.addEventListener('click', () => { addBand(nodeId); drawEq(canvas, eqState[nodeId]); });
-      const applyBtn = document.createElement('button');
-      applyBtn.className = 'small-btn';
-      applyBtn.textContent = 'Apply EQ';
-      applyBtn.addEventListener('click', () => setNodeEq(nodeId));
-      const savePresetBtn = document.createElement('button');
-      savePresetBtn.className = 'small-btn';
-      savePresetBtn.textContent = 'Save preset';
-      savePresetBtn.addEventListener('click', () => savePreset(nodeId));
-      eqButtons.appendChild(addBandBtn);
-      eqButtons.appendChild(applyBtn);
-      eqButtons.appendChild(savePresetBtn);
-      card.appendChild(eqButtons);
-
-      const presetWrap = document.createElement('div');
-      presetWrap.className = 'panel';
-      presetWrap.style.marginTop = '12px';
-      const presetTitle = document.createElement('div');
-      presetTitle.className = 'section-title';
-      presetTitle.innerText = 'Presets';
-      presetWrap.appendChild(presetTitle);
-      const presetList = document.createElement('div');
-      presetList.id = 'preset-list';
-      presetList.className = 'muted';
-      presetWrap.appendChild(presetList);
-      card.appendChild(presetWrap);
-
-      eqModal.appendChild(card);
-      document.body.appendChild(eqModal);
-      renderPresets(nodeId, presetList, canvas);
-    }
-
-    function savePreset(nodeId) {
-      const name = prompt('Preset name?');
-      if (!name) return;
-      const presets = JSON.parse(localStorage.getItem('eq-presets') || '{}');
-      presets[name] = eqState[nodeId] || [];
-      localStorage.setItem('eq-presets', JSON.stringify(presets));
-      const list = document.getElementById('preset-list');
-      if (list) renderPresets(nodeId, list, document.querySelector('canvas[data-node-id="'+nodeId+'"]'));
-      showSuccess('Preset saved');
-    }
-
-    function renderPresets(nodeId, container, canvas) {
-      const presets = JSON.parse(localStorage.getItem('eq-presets') || '{}');
-      if (!Object.keys(presets).length) {
-        container.innerHTML = 'No presets saved yet.';
-        return;
-      }
-      container.innerHTML = '';
-      Object.entries(presets).forEach(([name, bands]) => {
-        const row = document.createElement('div');
-        row.className = 'node-actions';
-        const label = document.createElement('div');
-        label.textContent = name;
-        const apply = document.createElement('button');
-        apply.className = 'small-btn';
-        apply.textContent = 'Apply';
-        apply.addEventListener('click', () => {
-          eqState[nodeId] = bands.map(b => ({...b}));
-          drawEq(canvas, eqState[nodeId]);
-        });
-        row.appendChild(label);
-        row.appendChild(apply);
-        container.appendChild(row);
-      });
-    }
 
     async function registerNode() {
       try {

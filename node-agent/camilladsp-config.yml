@@ -1,0 +1,94 @@
+samplerate: 48000
+chunksize: 1024
+channels: 2
+format: S16LE
+
+devices:
+  capture:
+    type: Alsa
+    device: "hw:Loopback,1,0"
+    channels: 2
+    rate: 48000
+    format: S16LE
+    period_time: 10
+    buffer_time: 40
+  playback:
+    type: Alsa
+    device: "__PLAYBACK_DEVICE__"
+    channels: 2
+    rate: 48000
+    format: S16LE
+    period_time: 10
+    buffer_time: 40
+
+pipeline:
+  - type: Filter
+    channel: all
+    filter: peq_stack
+
+filters:
+  peq_stack:
+    type: BiquadStack
+    biquads:
+      - { type: Peq, freq: 28.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 31.5, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 36.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 40.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 45.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 50.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 56.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 63.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 71.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 80.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 90.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 100.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 112.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 125.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 140.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 160.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 180.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 200.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 225.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 250.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 280.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 315.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 355.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 400.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 450.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 500.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 560.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 630.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 710.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 800.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 900.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 1000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 1120.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 1250.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 1400.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 1600.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 1800.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 2000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 2250.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 2500.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 2800.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 3150.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 3550.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 4000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 4500.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 5000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 5600.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 6300.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 7100.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 8000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 9000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 10000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 11200.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 12500.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 14000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 16000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 18000.0, q: 1.0, gain: 0.0 }
+      - { type: Peq, freq: 20000.0, q: 1.0, gain: 0.0 }
+
+control:
+  type: TcpServer
+  port: __CAMILLA_PORT__

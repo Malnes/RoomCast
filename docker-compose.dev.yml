@@ -11,7 +11,6 @@ services:
   node-agent-dev:
     build: ./node-agent
     environment:
-      AGENT_SHARED_SECRET: ${AGENT_SHARED_SECRET:-changeme}
       AGENT_DRY_RUN: "true"
     ports:
       - "9700:9700"

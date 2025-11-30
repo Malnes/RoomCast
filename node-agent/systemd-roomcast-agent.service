@@ -1,11 +1,14 @@
 [Unit]
 Description=RoomCast Node Agent
-After=network-online.target
-Wants=network-online.target
+After=network-online.target roomcast-camilla.service
+Requires=roomcast-camilla.service
 
 [Service]
-Environment=AGENT_SHARED_SECRET=changeme
 Environment=MIXER_CONTROL=Master
+Environment=PLAYBACK_DEVICE=hw:Loopback,0,0
+Environment=SNAPCLIENT_PORT=1704
+Environment=AGENT_SECRET_PATH=/var/lib/roomcast/agent-secret
+Environment=AGENT_CONFIG_PATH=/var/lib/roomcast/agent-config.json
 WorkingDirectory=/home/pi/roomcast/node-agent
 ExecStart=/usr/bin/python3 /home/pi/roomcast/node-agent/agent.py
 Restart=always
