@@ -51,6 +51,10 @@ Pairing workflow
 - Moving a node between controllers? Either click **Pair node** on the server UI or run `curl -X POST http://<node-ip>:9700/pair -H 'Content-Type: application/json' -d '{"force": true}'` before registering it with the new controller.  
 - You can rotate the key at any time; the controller will push the new secret to the agent and update its own record automatically.
 
+### Updating nodes
+- Each agent exposes its version via `/health`, and the controller UI displays that version next to the node entry.  
+- The installer now drops `/usr/local/bin/roomcast-updater` plus a sudoers rule so the controller can trigger updates remotely. Click **Update node** in the UI to download and install the latest `main` build on that Pi; the agent restarts automatically when the update completes.
+
 ### Docker on the node (optional)
 The `node-agent/Dockerfile` builds for arm/v7 and arm64. If you prefer containerized deployment:
 ```

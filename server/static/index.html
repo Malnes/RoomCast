@@ -311,6 +311,12 @@
         urlMeta.className = 'muted';
         urlMeta.textContent = n.url;
         statusRow.appendChild(urlMeta);
+        if (!isBrowser) {
+          const versionMeta = document.createElement('div');
+          versionMeta.className = 'label';
+          versionMeta.textContent = n.agent_version ? `Agent ${n.agent_version}` : 'Agent version unknown';
+          statusRow.appendChild(versionMeta);
+        }
         wrapper.appendChild(statusRow);
 
         const volLabel = document.createElement('div');
@@ -387,6 +393,13 @@
           }
           configBtn.addEventListener('click', () => configureNode(n.id, configBtn));
           actions.appendChild(configBtn);
+
+          const updateBtn = document.createElement('button');
+          updateBtn.className = 'small-btn';
+          updateBtn.textContent = 'Update node';
+          updateBtn.disabled = !paired;
+          updateBtn.addEventListener('click', () => updateNode(n.id, updateBtn));
+          actions.appendChild(updateBtn);
         }
         const removeBtn = document.createElement('button');
         removeBtn.className = 'small-btn';
@@ -443,7 +456,8 @@
         row.className = 'panel';
         row.style.marginBottom = '8px';
         const title = document.createElement('div');
-        title.innerHTML = `<strong>${item.host}</strong> <span class="muted">${item.url}</span>`;
+        const versionLabel = item.version ? `Agent ${item.version}` : 'Version unknown';
+        title.innerHTML = `<strong>${item.host}</strong> <span class="muted">${item.url}</span><div class="label">${versionLabel}</div>`;
         const nameInput = document.createElement('input');
         nameInput.value = `Node ${item.host}`;
         nameInput.style.marginTop = '6px';
@@ -624,6 +638,20 @@
         await fetchNodes();
       } catch (err) {
         showError(`Failed to configure node: ${err.message}`);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    async function updateNode(nodeId, btn) {
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/update`, { method: 'POST' });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Node update triggered. Agent will restart shortly.');
+        setTimeout(fetchNodes, 15000);
+      } catch (err) {
+        showError(`Failed to update node: ${err.message}`);
       } finally {
         if (btn) btn.disabled = false;
       }

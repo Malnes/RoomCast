@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import secrets
+import shlex
 import subprocess
 from pathlib import Path
 from typing import List, Optional
@@ -12,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.2.0")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 PLAYBACK_DEVICE = os.getenv("PLAYBACK_DEVICE", "hw:Loopback,0,0")
 DRY_RUN = os.getenv("AGENT_DRY_RUN", "").lower() in ("1", "true", "yes")
@@ -25,8 +27,14 @@ AGENT_SECRET_PATH = Path(os.getenv("AGENT_SECRET_PATH", "/var/lib/roomcast/agent
 AGENT_CONFIG_PATH = Path(os.getenv("AGENT_CONFIG_PATH", "/var/lib/roomcast/agent-config.json"))
 SNAPCLIENT_BIN = os.getenv("SNAPCLIENT_BIN", "snapclient")
 SNAPCLIENT_DEFAULT_PORT = int(os.getenv("SNAPCLIENT_PORT", "1704"))
+UPDATE_COMMAND = os.getenv("ROOMCAST_UPDATE_COMMAND", "sudo /usr/local/bin/roomcast-updater")
+UPDATE_COMMAND_ARGS = shlex.split(UPDATE_COMMAND) if UPDATE_COMMAND else []
 
-app = FastAPI(title="RoomCast Node Agent", version="0.1.0")
+app = FastAPI(title="RoomCast Node Agent", version=AGENT_VERSION)
+
+update_lock = asyncio.Lock()
+update_task: asyncio.Task | None = None
+
 eq_state: dict = {"preset": "peq15", "band_count": 15, "bands": []}
 muted_state: bool = False
 log = logging.getLogger("roomcast-agent")
@@ -294,6 +302,8 @@ async def health() -> dict:
         "muted": muted_state,
         "paired": bool(agent_secret),
         "configured": bool(agent_config.get("snapserver_host")),
+        "version": AGENT_VERSION,
+        "updating": bool(update_task and not update_task.done()),
     }
 
 
@@ -361,6 +371,41 @@ async def set_eq(payload: EqPayload, request: Request) -> dict:
         log.exception("Failed to apply EQ via CamillaDSP")
         raise HTTPException(status_code=500, detail=f"Failed to apply EQ: {exc}")
     return {"ok": True, "eq": eq_state}
+
+
+@app.post("/update")
+async def trigger_update(request: Request) -> dict:
+    _auth(request)
+    if not UPDATE_COMMAND_ARGS:
+        raise HTTPException(status_code=500, detail="Update command is not configured")
+
+    global update_task
+    async with update_lock:
+        if update_task and not update_task.done():
+            raise HTTPException(status_code=409, detail="Update already in progress")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *UPDATE_COMMAND_ARGS,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="Update command executable not found")
+        except Exception as exc:  # pragma: no cover - subprocess failures
+            log.exception("Failed to launch update command")
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        async def monitor() -> None:
+            try:
+                rc = await proc.wait()
+                if rc != 0:
+                    log.error("roomcast updater exited with code %s", rc)
+            except Exception as exc:  # pragma: no cover
+                log.exception("roomcast updater failed: %s", exc)
+
+        update_task = asyncio.create_task(monitor())
+
+    return {"ok": True, "status": "started"}
 
 
 @app.on_event("startup")

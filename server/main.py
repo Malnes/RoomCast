@@ -140,6 +140,7 @@ def public_node(node: dict) -> dict:
         data["configured"] = True
     else:
         data["configured"] = bool(node.get("audio_configured"))
+    data["agent_version"] = node.get("agent_version")
     return data
 
 
@@ -179,6 +180,7 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
         "eq": default_eq_state(),
         "agent_secret": nodes.get(node_id, {}).get("agent_secret"),
         "audio_configured": True if node_type == "browser" else nodes.get(node_id, {}).get("audio_configured", False),
+        "agent_version": nodes.get(node_id, {}).get("agent_version"),
     }
     save_nodes()
     return nodes[node_id]
@@ -217,8 +219,50 @@ async def configure_agent_audio(node: dict) -> dict:
     }
     result = await _call_agent(node, "/config/snapclient", payload)
     node["audio_configured"] = bool(result.get("configured", True))
+    await refresh_agent_metadata(node, persist=False)
     save_nodes()
     return result
+
+
+async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> bool:
+    if node.get("type") != "agent":
+        return False
+    url = f"{node['url'].rstrip('/')}/health"
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url)
+        if resp.status_code != 200:
+            return False
+        data = resp.json()
+    except Exception:
+        return False
+
+    changed = False
+    version = data.get("version")
+    if version and node.get("agent_version") != version:
+        node["agent_version"] = version
+        changed = True
+    if "configured" in data:
+        configured = bool(data.get("configured"))
+        if node.get("audio_configured") != configured:
+            node["audio_configured"] = configured
+            changed = True
+    if persist and changed:
+        save_nodes()
+    return changed
+
+
+def schedule_agent_refresh(node_id: str, delay: float = 10.0) -> None:
+    async def _task() -> None:
+        await asyncio.sleep(delay)
+        node = nodes.get(node_id)
+        if not node:
+            return
+        changed = await refresh_agent_metadata(node)
+        if changed:
+            await broadcast_nodes()
+
+    asyncio.create_task(_task())
 
 
 async def teardown_browser_node(node_id: str, *, remove_entry: bool = True) -> None:
@@ -555,6 +599,18 @@ async def configure_node(node_id: str) -> dict:
     return {"ok": True, "result": result}
 
 
+@app.post("/api/nodes/{node_id}/update")
+async def update_agent_node(node_id: str) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "browser":
+        raise HTTPException(status_code=400, detail="Browser nodes cannot be updated from the controller")
+    result = await _call_agent(node, "/update", {})
+    schedule_agent_refresh(node_id, delay=20.0)
+    return {"ok": True, "result": result}
+
+
 @app.delete("/api/nodes/{node_id}")
 async def unregister_node(node_id: str) -> dict:
     node = nodes.pop(node_id, None)
@@ -631,7 +687,16 @@ async def _probe_host(host: str) -> Optional[dict]:
         async with httpx.AsyncClient(timeout=2) as client:
             resp = await client.get(f"{url}/health")
         if resp.status_code == 200:
-            return {"host": host, "url": f"{url}", "healthy": True}
+            try:
+                data = resp.json()
+            except ValueError:
+                data = {}
+            return {
+                "host": host,
+                "url": f"{url}",
+                "healthy": True,
+                "version": data.get("version"),
+            }
     except Exception:
         return None
     return None

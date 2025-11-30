@@ -22,5 +22,6 @@ Follow these steps on a fresh Raspberry Pi OS **Lite** (or any Debian-based) ins
 
 4. **Register and pair the node in RoomCast**
    Open the RoomCast dashboard (usually `http://localhost:8000` on the controller), click **Discover nodes**, and add the Pi (or add it manually with `http://<pi-ip>:9700`). The controller will automatically pair with the agent, push its snapserver host/port, and mint a per-controller key. If you move this Pi to a different RoomCast controller later, just click **Pair node** and **Configure audio** in the dashboard (or rerun the install script) to rotate the key and point the node at the new snapserver.
+   Once registered you'll see the node's agent version plus an **Update node** button in the UI, which runs the installer again on that Pi so keeping nodes current is a single click.
 
 That’s it. No manual package installs, unit edits, or extra steps per Pi. Re-run the installer later to pull updates.

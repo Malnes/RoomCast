@@ -13,6 +13,7 @@ What exists here
 - `docker-compose.yml` to spin up Snapserver, Librespot, and the controller (web UI).
 - `server/` FastAPI + static web UI; all config (Spotify creds, node registration, per-node EQ/volume) is via the UI.
 - `node-agent/` minimal agent to run on each speaker node (volume hook + health).
+- Controller UI shows per-node agent versions and can trigger remote self-updates so you always know which Raspberry Pis run the latest bits.
 - Built-in WebRTC “web nodes” reachable via the UI; the controller relays Snapcast audio through an internal snapclient + WebRTC bridge so any browser can join in sync without extra installs.
 - Documentation for wiring Spotify and registering nodes; EQ support is stubbed but the hook is there so you can plug in ALSA LADSPA/pipewire effects.
 

@@ -11,6 +11,9 @@ CAMILLA_VERSION="3.0.1"
 CAMILLA_PORT="1234"
 CAMILLA_ARCHIVE=""
 CAMILLA_REPO="HEnquist/camilladsp"
+UPDATE_HELPER="/usr/local/bin/roomcast-updater"
+UPDATE_ENV="/etc/roomcast/update-env"
+SUDOERS_SNIPPET="/etc/sudoers.d/roomcast-agent"
 STATE_DIR="/var/lib/roomcast"
 AGENT_SECRET_PATH="${STATE_DIR}/agent-secret"
 AGENT_CONFIG_PATH="${STATE_DIR}/agent-config.json"
@@ -37,6 +40,64 @@ EOF
 
 log() {
   echo "[roomcast-install] $*"
+}
+
+write_update_env() {
+  install -d /etc/roomcast
+  {
+    printf 'SERVICE_USER=%q\n' "$SERVICE_USER"
+    printf 'INSTALL_DIR=%q\n' "$INSTALL_DIR"
+    printf 'REPO_URL=%q\n' "$REPO_URL"
+    printf 'SNAP_PORT=%q\n' "$SNAP_PORT"
+    printf 'MIXER_CONTROL=%q\n' "$MIXER_CONTROL"
+    printf 'PLAYBACK_DEVICE=%q\n' "$PLAYBACK_DEVICE"
+    printf 'CAMILLA_PORT=%q\n' "$CAMILLA_PORT"
+  } >"$UPDATE_ENV"
+  chmod 600 "$UPDATE_ENV"
+}
+
+write_update_helper() {
+  cat <<'EOF' >"$UPDATE_HELPER"
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/roomcast/update-env"
+
+if [[ -f "$ENV_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+fi
+
+SERVICE_USER=${SERVICE_USER:-pi}
+INSTALL_DIR=${INSTALL_DIR:-/opt/roomcast}
+REPO_URL=${REPO_URL:-https://github.com/Malnes/RoomCast.git}
+SNAP_PORT=${SNAP_PORT:-1704}
+MIXER_CONTROL=${MIXER_CONTROL:-Master}
+PLAYBACK_DEVICE=${PLAYBACK_DEVICE:-plughw:0,0}
+CAMILLA_PORT=${CAMILLA_PORT:-1234}
+
+TMP_SCRIPT=$(mktemp)
+cleanup() { rm -f "$TMP_SCRIPT"; }
+trap cleanup EXIT
+
+curl -fsSL https://raw.githubusercontent.com/Malnes/RoomCast/main/node-agent/install.sh -o "$TMP_SCRIPT"
+
+bash "$TMP_SCRIPT" \
+  --user "$SERVICE_USER" \
+  --install-dir "$INSTALL_DIR" \
+  --repo "$REPO_URL" \
+  --snap-port "$SNAP_PORT" \
+  --mixer "$MIXER_CONTROL" \
+  --playback-device "$PLAYBACK_DEVICE" \
+  --camilla-port "$CAMILLA_PORT"
+EOF
+  chmod 750 "$UPDATE_HELPER"
+  chown root:root "$UPDATE_HELPER"
+}
+
+configure_update_sudoers() {
+  echo "${SERVICE_USER} ALL=(root) NOPASSWD: ${UPDATE_HELPER}" >"$SUDOERS_SNIPPET"
+  chmod 440 "$SUDOERS_SNIPPET"
 }
 
 detect_camilla_archive() {
@@ -245,6 +306,9 @@ main() {
   write_camilla_config
   write_camilla_unit
   write_agent_unit
+  write_update_env
+  write_update_helper
+  configure_update_sudoers
   enable_services
   log "Installation complete. Register this node via the RoomCast dashboard."
 }
