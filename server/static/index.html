@@ -243,6 +243,13 @@
       successEl.style.display = 'block';
     }
 
+    function describePan(value) {
+      const num = typeof value === 'number' ? value : Number(value);
+      if (Number.isNaN(num) || Math.abs(num) < 0.01) return 'Center';
+      const pct = Math.round(Math.abs(num) * 100);
+      return num > 0 ? `Right ${pct}%` : `Left ${pct}%`;
+    }
+
     let nodesCache = [];
     const eqState = {};
     let dragging = null;
@@ -276,6 +283,36 @@
         volInput.value = 75;
         volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
         wrapper.appendChild(volInput);
+
+        if (n.type === 'browser') {
+          const panLabel = document.createElement('div');
+          panLabel.className = 'label';
+          let currentPan = typeof n.pan === 'number' ? n.pan : 0;
+          panLabel.innerText = `Pan – ${describePan(currentPan)}`;
+          wrapper.appendChild(panLabel);
+
+          const panInput = document.createElement('input');
+          panInput.type = 'range';
+          panInput.min = -100;
+          panInput.max = 100;
+          panInput.step = 2;
+          panInput.value = Math.round(currentPan * 100);
+          panInput.addEventListener('input', () => {
+            const nextPan = Number(panInput.value) / 100;
+            panLabel.innerText = `Pan – ${describePan(nextPan)}`;
+          });
+          panInput.addEventListener('change', async () => {
+            const nextPan = Math.max(-1, Math.min(1, Number(panInput.value) / 100));
+            try {
+              await setNodePan(n.id, nextPan);
+              currentPan = nextPan;
+            } catch (err) {
+              panInput.value = Math.round(currentPan * 100);
+              panLabel.innerText = `Pan – ${describePan(currentPan)}`;
+            }
+          });
+          wrapper.appendChild(panInput);
+        }
 
         const actions = document.createElement('div');
         actions.className = 'node-actions';
@@ -451,6 +488,22 @@
         showSuccess('Node volume updated');
       } catch (err) {
         showError(`Failed to set node volume: ${err.message}`);
+      }
+    }
+
+    async function setNodePan(nodeId, pan) {
+      const clamped = Math.max(-1, Math.min(1, Number(pan)));
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/pan`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ pan: clamped }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        showSuccess('Web node pan updated');
+      } catch (err) {
+        showError(`Failed to set pan: ${err.message}`);
+        throw err;
       }
     }
 
@@ -914,11 +967,13 @@
     playerSeek.addEventListener('change', () => playerAction('/api/spotify/player/seek', { position_ms: Number(playerSeek.value) }));
     spotifyAuthBtn.addEventListener('click', startSpotifyAuth);
     spotifyDashboardBtn.addEventListener('click', () => window.open('https://developer.spotify.com/dashboard', '_blank'));
-    newWebNodeBtn.addEventListener('click', () => window.location.href = '/web-node');
+    newWebNodeBtn.addEventListener('click', () => window.open('/web-node', '_blank'));
 
+    const NODE_REFRESH_MS = 4000;
     fetchNodes();
     fetchStatus();
     fetchPlayerStatus();
+    setInterval(fetchNodes, NODE_REFRESH_MS);
     setInterval(fetchPlayerStatus, 4000);
   </script>
 </body>

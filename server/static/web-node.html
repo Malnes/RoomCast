@@ -23,78 +23,188 @@
     <div id="register-block">
       <label>Node name</label>
       <input id="node-name" placeholder="Browser node">
-      <button id="register">Register & Play</button>
+      <button id="register">Start web node</button>
     </div>
+    <button id="disconnect" style="width:100%; margin-top:10px; display:none; background:linear-gradient(135deg,#ef4444,#dc2626);">Disconnect</button>
     <div id="status" class="muted" style="margin-top:8px;">Idle</div>
     <div style="margin-top:8px;">
       <label>Node volume</label>
       <input id="node-volume" type="range" min="0" max="100" value="75" disabled>
     </div>
-    <audio id="player" controls style="margin-top:12px; width:100%;" crossorigin="anonymous"></audio>
+    <audio id="player" controls autoplay style="margin-top:12px; width:100%;" crossorigin="anonymous"></audio>
   </div>
   <script>
     const nameInput = document.getElementById('node-name');
-    const btn = document.getElementById('register');
+    const registerBtn = document.getElementById('register');
+    const disconnectBtn = document.getElementById('disconnect');
     const statusEl = document.getElementById('status');
     const audio = document.getElementById('player');
     const nodeVol = document.getElementById('node-volume');
     const registerBlock = document.getElementById('register-block');
+
     let nodeId = null;
+    let pc = null;
     let ws = null;
 
-    async function register() {
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function wsUrl(id) {
+      const proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+      return `${proto}${window.location.host}/ws/web-node?node_id=${encodeURIComponent(id)}`;
+    }
+
+    async function waitForIce(connection, timeoutMs = 2500) {
+      if (connection.iceGatheringState === 'complete') return;
+      await new Promise(resolve => {
+        const timer = setTimeout(() => {
+          connection.removeEventListener('icegatheringstatechange', check);
+          resolve();
+        }, timeoutMs);
+        function check() {
+          if (connection.iceGatheringState === 'complete') {
+            clearTimeout(timer);
+            connection.removeEventListener('icegatheringstatechange', check);
+            resolve();
+          }
+        }
+        connection.addEventListener('icegatheringstatechange', check);
+      });
+    }
+
+    async function startWebNode() {
+      if (pc) {
+        setStatus('Already connected. Disconnect first.');
+        return;
+      }
+      registerBtn.disabled = true;
+      setStatus('Connecting…');
       try {
-        const payload = { name: nameInput.value || 'Browser node', url: 'browser:' + crypto.randomUUID() };
-        const res = await fetch('/api/nodes/register', {
+        const name = nameInput.value.trim() || 'Browser node';
+        pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+        pc.ontrack = (event) => {
+          const [stream] = event.streams;
+          audio.srcObject = stream;
+          audio.play().catch(() => {});
+          nodeVol.disabled = false;
+        };
+        pc.onconnectionstatechange = () => {
+          if (!pc) return;
+          if (['disconnected', 'failed'].includes(pc.connectionState)) {
+            setStatus('Connection lost');
+            disconnect(false);
+          }
+        };
+
+        const offer = await pc.createOffer({ offerToReceiveAudio: true });
+        await pc.setLocalDescription(offer);
+        await waitForIce(pc);
+
+        const res = await fetch('/api/web-nodes/session', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
+          body: JSON.stringify({
+            name,
+            sdp: pc.localDescription?.sdp,
+            type: pc.localDescription?.type,
+          }),
         });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        nodeId = data.id;
-        statusEl.textContent = `Registered as ${data.name}`;
+        nodeId = data.node.id;
+        await pc.setRemoteDescription({ type: data.answer_type, sdp: data.answer });
+        await connectControlSocket();
         registerBlock.style.display = 'none';
-        startAudio();
-        connectWs();
+        disconnectBtn.style.display = 'block';
+        disconnectBtn.disabled = false;
+        setStatus(`Connected as ${data.node.name}`);
       } catch (err) {
-        statusEl.textContent = 'Register failed: ' + err.message;
+        console.error(err);
+        setStatus(`Failed to connect: ${err.message}`);
+        await cleanupLocal();
+      } finally {
+        registerBtn.disabled = false;
       }
     }
 
-    function startAudio() {
-      const streamUrl = `/stream/spotify`;
-      audio.src = streamUrl;
-      audio.play().catch(() => { /* user gesture may be needed */ });
-      nodeVol.disabled = false;
-    }
-
-    function connectWs() {
+    async function connectControlSocket() {
       if (!nodeId) return;
-      ws = new WebSocket(`ws://${location.host}/ws/web-node?node_id=${encodeURIComponent(nodeId)}`);
+      ws = new WebSocket(wsUrl(nodeId));
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data);
-          if (msg.type === 'volume') {
-            audio.volume = Math.max(0, Math.min(1, (msg.percent || 0) / 100));
-            nodeVol.value = msg.percent ?? 0;
-          }
-          if (msg.type === 'mute') {
-            audio.muted = !!msg.muted;
-            statusEl.textContent = msg.muted ? 'Muted' : 'Playing';
-          }
-        } catch (e) {}
+          handleControlMessage(msg);
+        } catch (err) {
+          console.warn('Invalid control message', err);
+        }
       };
       ws.onclose = () => {
-        statusEl.textContent = 'Disconnected; reconnecting…';
-        setTimeout(connectWs, 2000);
+        if (nodeId) {
+          setStatus('Control channel closed');
+          disconnect(false);
+        }
       };
     }
 
-    btn.addEventListener('click', register);
+    function handleControlMessage(msg) {
+      if (msg.type === 'volume') {
+        const percent = Math.max(0, Math.min(100, msg.percent ?? 0));
+        audio.volume = percent / 100;
+        nodeVol.value = percent;
+        setStatus(`Volume ${percent}%`);
+      } else if (msg.type === 'mute') {
+        audio.muted = !!msg.muted;
+        setStatus(msg.muted ? 'Muted' : 'Playing');
+      } else if (msg.type === 'session' && msg.state === 'ended') {
+        setStatus('Session ended by controller');
+        disconnect(false);
+      }
+    }
 
+    async function disconnect(manual = true) {
+      if (!nodeId) {
+        await cleanupLocal();
+        return;
+      }
+      disconnectBtn.disabled = true;
+      try {
+        if (manual) {
+          await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' });
+        }
+      } catch (err) {
+        console.warn('Failed to unregister node', err);
+      } finally {
+        await cleanupLocal();
+        setStatus(manual ? 'Disconnected' : 'Idle');
+      }
+    }
+
+    async function cleanupLocal() {
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+        ws = null;
+      }
+      if (pc) {
+        pc.onconnectionstatechange = null;
+        pc.getSenders().forEach(sender => sender.track?.stop());
+        pc.close();
+        pc = null;
+      }
+      nodeId = null;
+      audio.pause();
+      audio.srcObject = null;
+      audio.currentTime = 0;
+      nodeVol.disabled = true;
+      nodeVol.value = 75;
+      registerBlock.style.display = 'block';
+      disconnectBtn.style.display = 'none';
+    }
+
+    registerBtn.addEventListener('click', startWebNode);
+    disconnectBtn.addEventListener('click', () => disconnect(true));
     nodeVol.addEventListener('input', () => { audio.volume = nodeVol.value / 100; });
-
   </script>
 </body>
 </html>

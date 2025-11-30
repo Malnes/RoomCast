@@ -10,11 +10,12 @@ from typing import Dict, Optional
 
 import httpx
 import websockets
-from fastapi import Body, FastAPI, HTTPException, WebSocket, Request
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer
 from pydantic import BaseModel, Field
+from webrtc import WebAudioRelay
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -22,6 +23,7 @@ log = logging.getLogger("roomcast")
 
 SNAPSERVER_HOST = os.getenv("SNAPSERVER_HOST", "snapserver")
 SNAPSERVER_PORT = int(os.getenv("SNAPSERVER_PORT", "1780"))
+SNAPCLIENT_PORT = int(os.getenv("SNAPCLIENT_PORT", "1704"))
 AGENT_SHARED_SECRET = os.getenv("AGENT_SHARED_SECRET", "changeme")
 CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/config/spotify.json"))
 CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -35,6 +37,8 @@ SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8000/
 SPOTIFY_TOKEN_PATH = Path(os.getenv("SPOTIFY_TOKEN_PATH", "/config/spotify-token.json"))
 TOKEN_SIGNER = URLSafeSerializer(os.getenv("SPOTIFY_STATE_SECRET", "changeme"))
 NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
+WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
+WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 
 
 class NodeRegistration(BaseModel):
@@ -56,6 +60,16 @@ class EqBand(BaseModel):
 class EqPayload(BaseModel):
     preset: Optional[str] = None
     bands: list[EqBand] = Field(default_factory=list)
+
+
+class PanPayload(BaseModel):
+    pan: float = Field(ge=-1.0, le=1.0)
+
+
+class WebNodeOffer(BaseModel):
+    name: str = Field(default="Web node", min_length=1)
+    sdp: str
+    type: str
 
 
 class SpotifyConfig(BaseModel):
@@ -109,6 +123,67 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 nodes: Dict[str, dict] = {}
 browser_ws: Dict[str, WebSocket] = {}
+node_watchers: set[WebSocket] = set()
+webrtc_relay: Optional[WebAudioRelay] = None
+
+
+async def broadcast_nodes() -> None:
+    if not node_watchers:
+        return
+    payload = {"type": "nodes", "nodes": list(nodes.values())}
+    dead: list[WebSocket] = []
+    for ws in list(node_watchers):
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        node_watchers.discard(ws)
+
+
+def _register_node_internal(reg: NodeRegistration) -> dict:
+    normalized_url = str(reg.url).rstrip("/")
+    for existing in nodes.values():
+        if existing["url"].rstrip("/") == normalized_url:
+            existing["last_seen"] = time.time()
+            return existing
+    node_id = reg.id or str(uuid.uuid4())
+    node_type = "browser" if normalized_url.startswith("browser:") else "agent"
+    nodes[node_id] = {
+        "id": node_id,
+        "name": reg.name,
+        "url": normalized_url,
+        "last_seen": time.time(),
+        "type": node_type,
+        "pan": nodes.get(node_id, {}).get("pan", 0.0) if node_id in nodes else 0.0,
+    }
+    save_nodes()
+    return nodes[node_id]
+
+
+def create_browser_node(name: str) -> dict:
+    reg = NodeRegistration(id=str(uuid.uuid4()), name=name, url=f"browser:{uuid.uuid4()}")
+    return _register_node_internal(reg)
+
+
+async def teardown_browser_node(node_id: str, *, remove_entry: bool = True) -> None:
+    ws = browser_ws.pop(node_id, None)
+    if ws:
+        try:
+            await ws.send_json({"type": "session", "state": "ended"})
+        except Exception:
+            pass
+        await ws.close()
+    if remove_entry and nodes.pop(node_id, None):
+        save_nodes()
+        await broadcast_nodes()
+
+
+async def _handle_webrtc_session_closed(node_id: str) -> None:
+    node = nodes.get(node_id)
+    if node and node.get("type") != "browser":
+        return
+    await teardown_browser_node(node_id)
 
 
 def load_nodes() -> None:
@@ -118,7 +193,11 @@ def load_nodes() -> None:
         return
     try:
         data = json.loads(NODES_PATH.read_text())
-        nodes = {item["id"]: item for item in data}
+        nodes = {}
+        for item in data:
+            item = dict(item)
+            item.setdefault("pan", 0.0)
+            nodes[item["id"]] = item
     except Exception:
         nodes = {}
 
@@ -128,6 +207,26 @@ def save_nodes() -> None:
 
 
 load_nodes()
+
+
+@app.on_event("startup")
+async def _startup_events() -> None:
+    global webrtc_relay
+    if not WEBRTC_ENABLED:
+        return
+    webrtc_relay = WebAudioRelay(
+        snap_host=SNAPSERVER_HOST,
+        snap_port=SNAPCLIENT_PORT,
+        latency_ms=WEBRTC_LATENCY_MS,
+        on_session_closed=_handle_webrtc_session_closed,
+    )
+    await webrtc_relay.start()
+
+
+@app.on_event("shutdown")
+async def _shutdown_events() -> None:
+    if webrtc_relay:
+        await webrtc_relay.stop()
 
 
 def current_spotify_creds() -> tuple[str, str, str]:
@@ -252,20 +351,9 @@ async def snapcast_volume(client_id: str, payload: VolumePayload) -> dict:
 
 @app.post("/api/nodes/register")
 async def register_node(reg: NodeRegistration) -> dict:
-    for existing in nodes.values():
-        if existing["url"].rstrip("/") == str(reg.url).rstrip("/"):
-            return existing
-    node_id = reg.id or str(uuid.uuid4())
-    node_type = "browser" if str(reg.url).startswith("browser:") else "agent"
-    nodes[node_id] = {
-        "id": node_id,
-        "name": reg.name,
-        "url": str(reg.url).rstrip("/"),
-        "last_seen": time.time(),
-        "type": node_type,
-    }
-    save_nodes()
-    return nodes[node_id]
+    node = _register_node_internal(reg)
+    await broadcast_nodes()
+    return node
 
 
 async def _call_agent(node: dict, path: str, payload: dict) -> dict:
@@ -343,18 +431,56 @@ async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
     return {"ok": True, "result": result}
 
 
+@app.post("/api/nodes/{node_id}/pan")
+async def set_node_pan(node_id: str, payload: PanPayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") != "browser":
+        raise HTTPException(status_code=400, detail="Pan is only supported for web nodes")
+    node["pan"] = payload.pan
+    save_nodes()
+    if webrtc_relay:
+        await webrtc_relay.set_pan(node_id, payload.pan)
+    await broadcast_nodes()
+    return {"ok": True, "pan": payload.pan}
+
+
 @app.delete("/api/nodes/{node_id}")
 async def unregister_node(node_id: str) -> dict:
     node = nodes.pop(node_id, None)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
     save_nodes()
+    await broadcast_nodes()
+    if node.get("type") == "browser":
+        if webrtc_relay:
+            await webrtc_relay.drop_session(node_id)
+        else:
+            await teardown_browser_node(node_id, remove_entry=False)
     return {"ok": True, "removed": node_id}
 
 
 @app.get("/api/nodes")
 async def list_nodes() -> dict:
     return {"nodes": list(nodes.values())}
+
+
+@app.post("/api/web-nodes/session")
+async def web_node_session(payload: WebNodeOffer) -> dict:
+    if not WEBRTC_ENABLED or not webrtc_relay:
+        raise HTTPException(status_code=503, detail="Web nodes are disabled")
+    name = payload.name.strip() or "Web node"
+    node = create_browser_node(name)
+    try:
+        session = await webrtc_relay.create_session(node["id"], pan=node.get("pan", 0.0))
+        answer = await session.accept(payload.sdp, payload.type)
+    except Exception as exc:
+        log.exception("Failed to establish web node session")
+        await teardown_browser_node(node["id"])
+        raise HTTPException(status_code=500, detail=f"Failed to start WebRTC session: {exc}")
+    await broadcast_nodes()
+    return {"node": node, "answer": answer.sdp, "answer_type": answer.type}
 
 
 @app.websocket("/ws/web-node")
@@ -372,6 +498,22 @@ async def web_node_ws(ws: WebSocket):
         pass
     finally:
         browser_ws.pop(node_id, None)
+
+
+@app.websocket("/ws/nodes")
+async def nodes_ws(ws: WebSocket):
+    await ws.accept()
+    node_watchers.add(ws)
+    try:
+        await ws.send_json({"type": "nodes", "nodes": list(nodes.values())})
+        while True:
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        node_watchers.discard(ws)
 
 
 async def _probe_host(host: str) -> Optional[dict]:
