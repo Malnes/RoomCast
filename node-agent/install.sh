@@ -10,6 +10,7 @@ PLAYBACK_DEVICE="plughw:0,0"
 CAMILLA_VERSION="3.0.1"
 CAMILLA_PORT="1234"
 CAMILLA_ARCHIVE=""
+CAMILLA_REPO="HEnquist/camilladsp"
 STATE_DIR="/var/lib/roomcast"
 AGENT_SECRET_PATH="${STATE_DIR}/agent-secret"
 AGENT_CONFIG_PATH="${STATE_DIR}/agent-config.json"
@@ -157,7 +158,7 @@ install_camilladsp() {
   fi
   tmpdir=$(mktemp -d)
   archive="${tmpdir}/${archive_name}"
-  curl -L -o "$archive" "https://github.com/HEnquist/camilla-dsp/releases/download/v${CAMILLA_VERSION}/${archive_name}"
+  curl -L -o "$archive" "https://github.com/${CAMILLA_REPO}/releases/download/v${CAMILLA_VERSION}/${archive_name}"
   tar -xzf "$archive" -C "$tmpdir"
   if [[ ! -f ${tmpdir}/camilladsp ]]; then
     echo "Failed to find camilladsp binary in archive" >&2
