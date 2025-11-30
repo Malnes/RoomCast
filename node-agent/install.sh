@@ -7,7 +7,7 @@ REPO_URL="https://github.com/Malnes/RoomCast.git"
 SNAP_PORT="1704"
 MIXER_CONTROL="Master"
 PLAYBACK_DEVICE="plughw:0,0"
-CAMILLA_VERSION="2.1.0"
+CAMILLA_VERSION="3.0.1"
 CAMILLA_PORT="1234"
 CAMILLA_ARCHIVE=""
 STATE_DIR="/var/lib/roomcast"
@@ -47,7 +47,7 @@ detect_camilla_archive() {
     aarch64|arm64)
       echo "camilladsp-linux-aarch64.tar.gz" ;;
     x86_64|amd64)
-      echo "camilladsp-linux-x86_64.tar.gz" ;;
+      echo "camilladsp-linux-amd64.tar.gz" ;;
     *)
       echo "" ;;
   esac
