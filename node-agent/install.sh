@@ -9,7 +9,7 @@ MIXER_CONTROL="Master"
 PLAYBACK_DEVICE="plughw:0,0"
 CAMILLA_VERSION="2.1.0"
 CAMILLA_PORT="1234"
-CAMILLA_ARCHIVE="camilladsp-linux-armv7.tar.gz"
+CAMILLA_ARCHIVE=""
 STATE_DIR="/var/lib/roomcast"
 AGENT_SECRET_PATH="${STATE_DIR}/agent-secret"
 AGENT_CONFIG_PATH="${STATE_DIR}/agent-config.json"
@@ -36,6 +36,21 @@ EOF
 
 log() {
   echo "[roomcast-install] $*"
+}
+
+detect_camilla_archive() {
+  local arch
+  arch=$(uname -m)
+  case "$arch" in
+    armv7l|armv6l)
+      echo "camilladsp-linux-armv7.tar.gz" ;;
+    aarch64|arm64)
+      echo "camilladsp-linux-aarch64.tar.gz" ;;
+    x86_64|amd64)
+      echo "camilladsp-linux-x86_64.tar.gz" ;;
+    *)
+      echo "" ;;
+  esac
 }
 
 require_root() {
@@ -132,9 +147,17 @@ install_camilladsp() {
     return
   fi
   log "Installing CamillaDSP v${CAMILLA_VERSION}"
+  local archive_name="${CAMILLA_ARCHIVE}"
+  if [[ -z "$archive_name" ]]; then
+    archive_name=$(detect_camilla_archive)
+    if [[ -z "$archive_name" ]]; then
+      echo "Unsupported architecture $(uname -m); please set CAMILLA_ARCHIVE manually" >&2
+      exit 1
+    fi
+  fi
   tmpdir=$(mktemp -d)
-  archive="${tmpdir}/${CAMILLA_ARCHIVE}"
-  curl -L -o "$archive" "https://github.com/HEnquist/camilla-dsp/releases/download/v${CAMILLA_VERSION}/${CAMILLA_ARCHIVE}"
+  archive="${tmpdir}/${archive_name}"
+  curl -L -o "$archive" "https://github.com/HEnquist/camilla-dsp/releases/download/v${CAMILLA_VERSION}/${archive_name}"
   tar -xzf "$archive" -C "$tmpdir"
   if [[ ! -f ${tmpdir}/camilladsp ]]; then
     echo "Failed to find camilladsp binary in archive" >&2

@@ -37,8 +37,6 @@ curl -fsSL https://raw.githubusercontent.com/Malnes/RoomCast/main/node-agent/ins
    | sudo bash
 ```
 
-> Private repository? Copy your local `node-agent/install.sh` onto the Pi (e.g. `scp node-agent/install.sh pi@rcn.local:/tmp/ && ssh pi@rcn.local 'sudo bash /tmp/install.sh'`) instead of using `curl` so you don't need to expose the repo.
-
 Flags you might care about:
 
 - `--user` – system user that should own the repo/services (defaults to `pi`)

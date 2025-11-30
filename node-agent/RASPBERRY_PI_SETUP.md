@@ -8,16 +8,7 @@ Follow these steps on a fresh Raspberry Pi OS **Lite** (or any Debian-based) ins
    ```
 
 2. **Run the one-command installer**
-      Nodes now boot in an "unassigned" state with no knowledge of any controller. Pick whichever option fits how you access the repository today:
-
-      **2a. Private repo (recommended): copy the local script**
-      ```bash
-      scp /home/<your-user>/repos/RoomCast/node-agent/install.sh pi@rcn.local:/tmp/roomcast-install.sh
-      ssh pi@rcn.local
-      sudo bash /tmp/roomcast-install.sh
-      ```
-
-      **2b. Public repo: curl directly from GitHub**
+      Nodes now boot in an "unassigned" state with no knowledge of any controller. Fetch the installer directly from GitHub and run it with sudo:
       ```bash
       curl -fsSL https://raw.githubusercontent.com/Malnes/RoomCast/main/node-agent/install.sh \
          | sudo bash

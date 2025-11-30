@@ -1,0 +1,1 @@
+- i want to see the RoomCast node version for each node that i have registered. So basically, when a node is discovered, i should see the node version, and when i register/add a node, i should be able to update the node from the server webUI by a click of a button.
