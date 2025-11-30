@@ -15,7 +15,7 @@ Follow these steps on a fresh Raspberry Pi OS **Lite** (or any Debian-based) ins
       ```
 
 3. **Wait for services to start**
-   The script installs everything, writes the systemd units, and enables them. You can confirm with:
+   The script installs everything, writes the systemd units, and enables them. The node agent now starts independently, even if you skip CamillaDSP. You can confirm with:
    ```bash
    sudo systemctl status roomcast-agent roomcast-camilla
    ```

@@ -179,17 +179,13 @@
         <div class="section-title" style="margin:0;">Discover nodes</div>
         <button id="close-discover" class="icon-btn">✕</button>
       </div>
-      <div class="grid" style="margin-bottom:8px;">
-        <div>
-          <label>CIDR to scan</label>
-          <input id="discover-cidr" value="172.20.0.0/24" placeholder="192.168.1.0/24">
-        </div>
-        <div style="display:flex; align-items:flex-end;">
-          <button id="start-discover" class="small-btn">Scan</button>
-        </div>
+      <div style="display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:8px;">
+        <div class="muted" style="flex:1; min-width:200px;">Scans all available networks and streams results live.</div>
+        <button id="start-discover" class="small-btn" style="min-width:120px;">Scan</button>
       </div>
       <div id="discover-spinner" style="margin-bottom:8px; display:none;"><span class="spinner"></span> <span class="muted">Scanning...</span></div>
-      <div id="discover-list" class="muted">Not started.</div>
+      <div id="discover-status" class="muted">Ready to scan.</div>
+      <div id="discover-list"></div>
     </div>
   </div>
 
@@ -222,8 +218,8 @@
     const discoverOverlay = document.getElementById('discover-overlay');
     const closeDiscoverBtn = document.getElementById('close-discover');
     const discoverSpinner = document.getElementById('discover-spinner');
+    const discoverStatus = document.getElementById('discover-status');
     const discoverList = document.getElementById('discover-list');
-    const discoverCidr = document.getElementById('discover-cidr');
     const startDiscoverBtn = document.getElementById('start-discover');
     const masterVolume = document.getElementById('master-volume');
     const playerPanel = document.getElementById('player-panel');
@@ -238,6 +234,8 @@
     let playerStatus = null;
     let playerTick = null;
     const eqOverlay = document.createElement('div');
+    let discoverAbortController = null;
+    let discoverResultsCount = 0;
 
     function clearMessages() {
       errorEl.style.display = 'none';
@@ -445,15 +443,12 @@
       }
     }
 
-    function renderDiscovered(list) {
-      if (!list || !list.length) {
-        discoverList.innerHTML = 'No agents found yet. Ensure they run on the same subnet and respond on port 9700.';
-        return;
-      }
-      discoverList.innerHTML = '';
+    function appendDiscovered(items) {
+      const list = Array.isArray(items) ? items : [items];
       list.forEach(item => {
+        if (!item || !item.url) return;
         const row = document.createElement('div');
-        row.className = 'panel';
+        row.className = 'panel discover-row';
         row.style.marginBottom = '8px';
         const title = document.createElement('div');
         const versionLabel = item.version ? `Agent ${item.version}` : 'Version unknown';
@@ -527,18 +522,89 @@
     }
 
     async function discoverNodes() {
+      if (discoverAbortController) {
+        discoverAbortController.abort();
+        discoverAbortController = null;
+      }
+      discoverResultsCount = 0;
+      discoverList.innerHTML = '';
+      discoverStatus.textContent = 'Preparing scan…';
       discoverSpinner.style.display = 'block';
-      discoverList.innerHTML = 'Scanning...';
+      startDiscoverBtn.disabled = true;
+      startDiscoverBtn.textContent = 'Scanning…';
+      discoverAbortController = new AbortController();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      const processLine = (line) => {
+        if (!line) return;
+        let payload;
+        try {
+          payload = JSON.parse(line);
+        } catch (err) {
+          return;
+        }
+        if (payload.type === 'start') {
+          const nets = Array.isArray(payload.networks) && payload.networks.length ? payload.networks.join(', ') : 'detected networks';
+          const limited = payload.limited ? ' (limited – narrow networks for deeper scan)' : '';
+          discoverStatus.textContent = `Scanning ${nets} (${payload.host_count ?? '?'} hosts)${limited}.`;
+          return;
+        }
+        if (payload.type === 'discovered') {
+          if (discoverResultsCount === 0) {
+            discoverList.innerHTML = '';
+          }
+          discoverResultsCount += 1;
+          appendDiscovered(payload.data);
+          discoverStatus.textContent = `Found ${discoverResultsCount} node${discoverResultsCount === 1 ? '' : 's'} so far…`;
+          return;
+        }
+        if (payload.type === 'complete') {
+          discoverStatus.textContent = payload.found ? `Scan complete – ${payload.found} node${payload.found === 1 ? '' : 's'} found.` : 'Scan complete – no nodes responded.';
+          return;
+        }
+        if (payload.type === 'cancelled') {
+          discoverStatus.textContent = `Scan cancelled after ${payload.found || discoverResultsCount} result${(payload.found || discoverResultsCount) === 1 ? '' : 's'}.`;
+          return;
+        }
+        if (payload.type === 'error') {
+          discoverStatus.textContent = `Discovery error: ${payload.message || 'unknown error'}`;
+        }
+      };
+
       try {
-        const cidr = encodeURIComponent(discoverCidr.value || '');
-        const res = await fetch(`/api/nodes/discover?cidr=${cidr}`);
+        const res = await fetch('/api/nodes/discover', { signal: discoverAbortController.signal });
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const data = await res.json();
-        renderDiscovered(data.discovered || []);
+        if (!res.body) throw new Error('Streaming not supported in this browser');
+        const reader = res.body.getReader();
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          let idx = buffer.indexOf('\n');
+          while (idx >= 0) {
+            const line = buffer.slice(0, idx).trim();
+            buffer = buffer.slice(idx + 1);
+            processLine(line);
+            idx = buffer.indexOf('\n');
+          }
+        }
+        const tail = buffer.trim();
+        if (tail) processLine(tail);
       } catch (err) {
-        discoverList.innerHTML = `Failed to discover: ${err.message}`;
+        if (err.name === 'AbortError') {
+          discoverStatus.textContent = 'Scan cancelled.';
+        } else {
+          discoverStatus.textContent = `Failed to discover: ${err.message}`;
+        }
       } finally {
         discoverSpinner.style.display = 'none';
+        startDiscoverBtn.disabled = false;
+        startDiscoverBtn.textContent = 'Scan';
+        discoverAbortController = null;
+        if (!discoverResultsCount && discoverList.children.length === 0) {
+          discoverList.innerHTML = '<div class="muted">No agents found yet. Ensure nodes run on the same subnet and respond on port 9700.</div>';
+        }
       }
     }
 
@@ -1143,9 +1209,23 @@
 
     function openDiscover() {
       discoverOverlay.style.display = 'flex';
-      discoverList.innerHTML = 'Not started.';
+      discoverResultsCount = 0;
+      discoverStatus.textContent = 'Ready to scan.';
+      discoverList.innerHTML = '';
+      discoverSpinner.style.display = 'none';
+      startDiscoverBtn.disabled = false;
+      startDiscoverBtn.textContent = 'Scan';
     }
-    function closeDiscover() { discoverOverlay.style.display = 'none'; }
+    function closeDiscover() {
+      if (discoverAbortController) {
+        discoverAbortController.abort();
+        discoverAbortController = null;
+      }
+      discoverSpinner.style.display = 'none';
+      startDiscoverBtn.disabled = false;
+      startDiscoverBtn.textContent = 'Scan';
+      discoverOverlay.style.display = 'none';
+    }
 
     refreshBtn.addEventListener('click', () => { fetchNodes(); fetchStatus(); });
     refreshNodesBtn.addEventListener('click', fetchNodes);

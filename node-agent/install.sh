@@ -262,8 +262,8 @@ write_agent_unit() {
   cat <<EOF >/etc/systemd/system/roomcast-agent.service
 [Unit]
 Description=RoomCast Node Agent
-After=network-online.target roomcast-camilla.service
-Requires=roomcast-camilla.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Environment=MIXER_CONTROL=${MIXER_CONTROL}

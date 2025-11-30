@@ -3,10 +3,11 @@ import asyncio
 import ipaddress
 import logging
 import os
+import subprocess
 import time
 import uuid
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, AsyncIterator
 
 import httpx
 import websockets
@@ -29,6 +30,8 @@ CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = Path(__file__).parent / "static"
 LIBRESPOT_STATUS_PATH = Path(os.getenv("STATUS_PATH", "/config/librespot-status.json"))
 DISCOVERY_CIDR = os.getenv("DISCOVERY_CIDR", "192.168.1.0/24")
+DISCOVERY_MAX_HOSTS = int(os.getenv("DISCOVERY_MAX_HOSTS", "4096"))
+DISCOVERY_CONCURRENCY = int(os.getenv("DISCOVERY_CONCURRENCY", "25"))
 AGENT_PORT = int(os.getenv("AGENT_PORT", "9700"))
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
@@ -702,28 +705,137 @@ async def _probe_host(host: str) -> Optional[dict]:
     return None
 
 
-@app.get("/api/nodes/discover")
-async def discover_nodes(cidr: Optional[str] = None) -> dict:
-    target_cidr = cidr or DISCOVERY_CIDR
+def _configured_discovery_networks() -> list[str]:
+    configured: list[str] = []
+    raw_value = DISCOVERY_CIDR or ""
+    if not raw_value:
+        return configured
+    for chunk in raw_value.replace(";", ",").split(","):
+        part = chunk.strip()
+        if not part:
+            continue
+        try:
+            net = str(ipaddress.ip_network(part, strict=False))
+        except ValueError:
+            log.warning("Ignoring invalid DISCOVERY_CIDR entry: %s", part)
+            continue
+        if net not in configured:
+            configured.append(net)
+    return configured
+
+
+def _detect_discovery_networks() -> list[str]:
+    """Return IPv4 networks to scan, defaulting to DISCOVERY_CIDR."""
+    networks: list[str] = _configured_discovery_networks()
     try:
-        net = ipaddress.ip_network(target_cidr, strict=False)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid CIDR")
-    hosts_list = list(net.hosts())
-    if len(hosts_list) > 4096:
-        raise HTTPException(status_code=400, detail="CIDR too large; please narrow the range")
-    hosts = [str(h) for h in hosts_list]
-    results = []
-    sem = asyncio.Semaphore(25)
+        output = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show", "up", "scope", "global"],
+            text=True,
+        )
+    except Exception:
+        output = ""
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        cidr = parts[3]
+        try:
+            iface = ipaddress.ip_interface(cidr)
+        except ValueError:
+            continue
+        if iface.ip.is_loopback or iface.ip.is_link_local:
+            continue
+        net = iface.network
+        if net.num_addresses <= 2:
+            continue
+        if net.version != 4:
+            continue
+        _net_str = str(net)
+        if _net_str not in networks:
+            networks.append(_net_str)
+    if not networks:
+        return []
+    return networks
 
-    async def probe(h: str):
+
+def _hosts_for_networks(networks: list[str], limit: int = DISCOVERY_MAX_HOSTS) -> list[str]:
+    seen: set[str] = set()
+    hosts: list[str] = []
+    for net_str in networks:
+        try:
+            net = ipaddress.ip_network(net_str, strict=False)
+        except ValueError:
+            continue
+        if net.version != 4:
+            continue
+        for host in net.hosts():
+            host_str = str(host)
+            if host_str in seen:
+                continue
+            seen.add(host_str)
+            hosts.append(host_str)
+            if len(hosts) >= limit:
+                return hosts
+    return hosts
+
+
+async def _stream_host_probes(hosts: list[str]) -> AsyncIterator[dict]:
+    if not hosts:
+        return
+    sem = asyncio.Semaphore(max(1, DISCOVERY_CONCURRENCY))
+    tasks = []
+
+    async def _runner(target: str) -> Optional[dict]:
         async with sem:
-            res = await _probe_host(h)
-            if res:
-                results.append(res)
+            return await _probe_host(target)
 
-    await asyncio.gather(*(probe(h) for h in hosts))
-    return {"discovered": results, "cidr": target_cidr}
+    for host in hosts:
+        tasks.append(asyncio.create_task(_runner(host)))
+
+    try:
+        for task in asyncio.as_completed(tasks):
+            result = await task
+            if result:
+                yield result
+    finally:
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@app.get("/api/nodes/discover")
+async def discover_nodes() -> StreamingResponse:
+    networks = _detect_discovery_networks()
+    if not networks:
+        raise HTTPException(status_code=503, detail="No IPv4 networks available for discovery")
+    hosts = _hosts_for_networks(networks)
+    if not hosts:
+        raise HTTPException(status_code=503, detail="No hosts available for discovery")
+
+    async def _event_stream() -> AsyncIterator[str]:
+        found = 0
+        limited = len(hosts) >= DISCOVERY_MAX_HOSTS
+        yield json.dumps({
+            "type": "start",
+            "networks": networks,
+            "host_count": len(hosts),
+            "limited": limited,
+        }) + "\n"
+        try:
+            async for result in _stream_host_probes(hosts):
+                found += 1
+                yield json.dumps({"type": "discovered", "data": result}) + "\n"
+        except asyncio.CancelledError:
+            yield json.dumps({"type": "cancelled", "found": found}) + "\n"
+            raise
+        except Exception as exc:  # pragma: no cover - defensive
+            log.exception("Discovery failed", exc_info=exc)
+            yield json.dumps({"type": "error", "message": "Discovery failed"}) + "\n"
+        else:
+            yield json.dumps({"type": "complete", "found": found}) + "\n"
+
+    return StreamingResponse(_event_stream(), media_type="application/x-ndjson")
 
 
 @app.get("/api/config/spotify")

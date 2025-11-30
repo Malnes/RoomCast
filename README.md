@@ -42,7 +42,7 @@ Prereqs: Docker, Docker Compose, Spotify Premium (Librespot needs it), open TCP 
 3) On each hardware node (e.g. Raspberry Pi Zero 2), install `snapclient` and run the `node-agent` service (see `node-agent/README.md`). Native install via systemd is recommended on Pi Zero 2 for the lightest footprint; Docker is optional and supported with the provided Dockerfile. Register nodes via the web UI (name + agent URL).
 4) To create an ad-hoc browser speaker, click **New web node** in the UI. A new tab will open, negotiate WebRTC against the controller, and the controller’s snapclient relay will keep that browser in lockstep with the rest of the Snapcast group.
 5) Use the UI to set per-node EQ (bands JSON) and volume; adjust Snapcast client volumes in the “Snapcast clients” section.
-Optional: set `DISCOVERY_CIDR` (default `192.168.1.0/24`) to control auto-discovery scanning range for node agents on port 9700.
+Optional (but recommended when the controller runs inside Docker bridge networking): set `DISCOVERY_CIDR` to your LAN range so discovery can reach hardware nodes. The value accepts a comma/semicolon separated list (e.g. `192.168.1.0/24,10.10.0.0/24`) and every listed network is scanned alongside any interfaces the container sees.
 
 Caveats / next steps
 --------------------
