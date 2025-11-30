@@ -1,0 +1,3 @@
+# Ignore runtime snapshots and secrets
+snapserver.json
+pat

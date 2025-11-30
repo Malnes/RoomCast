@@ -36,6 +36,7 @@ Quick start
 Prereqs: Docker, Docker Compose, Spotify Premium (Librespot needs it), open TCP 1704/1780 to nodes.
 
 1) Local dev with auto-reload: `make dev` (uses `docker-compose.dev.yml` to mount code and reload FastAPI). Prod-ish run: `docker compose up -d`.  
+   - Snapshot config: copy the sanitized example before starting containers so Docker has a host file to mount: `cp snapserver.example.json snapserver.json`. The runtime file is `.gitignore`d so your environment-specific client list never leaves your machine.
 2) Open the web UI at `http://<controller-host>:8000`. The landing view lists nodes with per-node volume/mute/EQ; open the ⚙︎ settings menu to enter Spotify credentials + device name (Librespot reloads automatically), add nodes, and view Snapcast clients.  
 3) On each hardware node (e.g. Raspberry Pi Zero 2), install `snapclient` and run the `node-agent` service (see `node-agent/README.md`). Native install via systemd is recommended on Pi Zero 2 for the lightest footprint; Docker is optional and supported with the provided Dockerfile. Register nodes via the web UI (name + agent URL).
 4) To create an ad-hoc browser speaker, click **New web node** in the UI. A new tab will open, negotiate WebRTC against the controller, and the controller’s snapclient relay will keep that browser in lockstep with the rest of the Snapcast group.
