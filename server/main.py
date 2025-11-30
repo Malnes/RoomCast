@@ -42,7 +42,7 @@ NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.1").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.2").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 
@@ -75,6 +75,10 @@ class EqPayload(BaseModel):
 
 class PanPayload(BaseModel):
     pan: float = Field(ge=-1.0, le=1.0)
+
+
+class OutputSelectionPayload(BaseModel):
+    device: str = Field(min_length=1)
 
 
 class WebNodeOffer(BaseModel):
@@ -163,6 +167,8 @@ def public_node(node: dict) -> dict:
     else:
         data["update_available"] = True
     data["restarting"] = bool(pending_restarts.get(node["id"]))
+    data["playback_device"] = node.get("playback_device")
+    data["outputs"] = node.get("outputs") or {}
     return data
 
 
@@ -207,6 +213,8 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
         "volume_percent": previous.get("volume_percent", 75),
         "muted": previous.get("muted", False),
         "updating": bool(previous.get("updating", False)),
+        "playback_device": previous.get("playback_device"),
+        "outputs": previous.get("outputs", {}),
     }
     save_nodes()
     return nodes[node_id]
@@ -277,6 +285,16 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[b
         updating = bool(data.get("updating"))
         if node.get("updating") != updating:
             node["updating"] = updating
+            changed = True
+    if "playback_device" in data:
+        device = data.get("playback_device")
+        if node.get("playback_device") != device:
+            node["playback_device"] = device
+            changed = True
+    if isinstance(data.get("outputs"), dict):
+        outputs = data["outputs"]
+        if node.get("outputs") != outputs:
+            node["outputs"] = outputs
             changed = True
     if persist and changed:
         save_nodes()
@@ -390,6 +408,11 @@ def load_nodes() -> None:
             item["volume_percent"] = int(item.get("volume_percent", 75))
             item["muted"] = bool(item.get("muted", False))
             item["updating"] = bool(item.get("updating", False))
+            item["playback_device"] = item.get("playback_device")
+            outputs = item.get("outputs")
+            if not isinstance(outputs, dict):
+                outputs = {}
+            item["outputs"] = outputs
             nodes[item["id"]] = item
     except Exception:
         nodes = {}
@@ -567,6 +590,19 @@ async def _call_agent(node: dict, path: str, payload: dict) -> dict:
     headers = {"X-Agent-Secret": secret}
     async with httpx.AsyncClient(timeout=5) as client:
         resp = await client.post(url, json=payload, headers=headers)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return resp.json()
+
+
+async def _get_agent(node: dict, path: str) -> dict:
+    url = f"{node['url']}{path}"
+    secret = node.get("agent_secret")
+    if not secret:
+        raise HTTPException(status_code=409, detail="Node is not paired. Re-register or pair it first.")
+    headers = {"X-Agent-Secret": secret}
+    async with httpx.AsyncClient(timeout=5) as client:
+        resp = await client.get(url, headers=headers)
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return resp.json()

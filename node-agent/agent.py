@@ -3,8 +3,10 @@ import itertools
 import json
 import logging
 import os
+import re
 import secrets
 import shlex
+import shutil
 import subprocess
 from pathlib import Path
 from typing import List, Optional
@@ -13,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.1")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.2")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -33,6 +35,10 @@ CAMILLA_PORT = int(os.getenv("CAMILLA_PORT", "1234"))
 CAMILLA_FILTER_PATH = os.getenv("CAMILLA_FILTER_PATH", "filters.peq_stack")
 CAMILLA_MAX_BANDS = int(os.getenv("CAMILLA_MAX_BANDS", "31"))
 CAMILLA_RETRY_INTERVAL = int(os.getenv("CAMILLA_RETRY_INTERVAL", "5"))
+CAMILLA_CONFIG_PATH = Path(os.getenv("CAMILLA_CONFIG_PATH", "/etc/roomcast/camilladsp.yml"))
+CAMILLA_TEMPLATE_PATH = Path(os.getenv("CAMILLA_TEMPLATE_PATH", Path(__file__).resolve().parent / "camilladsp-config.yml"))
+CAMILLA_SERVICE_NAME = os.getenv("CAMILLA_SERVICE_NAME", "roomcast-camilla.service")
+SYSTEMCTL_BIN = shutil.which("systemctl") or "/bin/systemctl"
 AGENT_SECRET_PATH = Path(os.getenv("AGENT_SECRET_PATH", "/var/lib/roomcast/agent-secret"))
 AGENT_CONFIG_PATH = Path(os.getenv("AGENT_CONFIG_PATH", "/var/lib/roomcast/agent-config.json"))
 SNAPCLIENT_BIN = os.getenv("SNAPCLIENT_BIN", "snapclient")
@@ -80,6 +86,7 @@ agent_secret = _load_agent_secret()
 DEFAULT_AGENT_CONFIG = {
     "snapserver_host": None,
     "snapserver_port": SNAPCLIENT_DEFAULT_PORT,
+    "playback_device": PLAYBACK_DEVICE,
 }
 
 
@@ -113,6 +120,110 @@ def _persist_agent_config(data: dict) -> None:
 agent_config = _load_agent_config()
 snapclient_process = None
 _resolved_control: Optional[str] = None
+
+
+def _current_playback_device() -> str:
+    device = (agent_config.get("playback_device") or PLAYBACK_DEVICE or "").strip()
+    return device or "plughw:0,0"
+
+
+def _list_playback_devices() -> list[dict]:
+    try:
+        proc = subprocess.run(
+            ["aplay", "-l"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except FileNotFoundError:
+        log.warning("aplay not installed; unable to list hardware outputs")
+        return []
+    except subprocess.CalledProcessError as exc:
+        log.warning("Failed to list playback devices: %s", exc.stderr.strip() or exc)
+        return []
+
+    pattern = re.compile(r"card (\d+): ([^ ]+) \[([^\]]+)\], device (\d+): ([^ ]+) \[([^\]]+)\]")
+    options: list[dict] = []
+    seen: set[str] = set()
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        match = pattern.match(line)
+        if not match:
+            continue
+        card_idx, _card_id, card_desc, dev_idx, _dev_id, dev_desc = match.groups()
+        device_id = f"plughw:{card_idx},{dev_idx}"
+        if device_id in seen:
+            continue
+        label = f"{card_desc.strip()} – {dev_desc.strip()} (hw:{card_idx},{dev_idx})"
+        options.append({"id": device_id, "label": label})
+        seen.add(device_id)
+    return options
+
+
+def _outputs_snapshot() -> dict:
+    options = _list_playback_devices()
+    selected = _current_playback_device()
+    if selected and selected not in {opt["id"] for opt in options}:
+        options.insert(0, {"id": selected, "label": f"{selected} (current)"})
+    return {"selected": selected, "options": options}
+
+
+def _render_camilla_config(playback_device: str) -> str:
+    if CAMILLA_TEMPLATE_PATH.exists():
+        template = CAMILLA_TEMPLATE_PATH.read_text()
+    else:
+        template = CAMILLA_CONFIG_PATH.read_text() if CAMILLA_CONFIG_PATH.exists() else ""
+    if not template:
+        raise RuntimeError("CamillaDSP template not found")
+    rendered = template.replace("__PLAYBACK_DEVICE__", playback_device)
+    rendered = rendered.replace("__CAMILLA_PORT__", str(CAMILLA_PORT))
+    return rendered
+
+
+def _write_camilla_config(playback_device: str) -> None:
+    rendered = _render_camilla_config(playback_device)
+    CAMILLA_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CAMILLA_CONFIG_PATH.write_text(rendered)
+
+
+def _restart_camilla_service_sync() -> None:
+    cmd = ["sudo", SYSTEMCTL_BIN, "restart", CAMILLA_SERVICE_NAME]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+async def _restart_camilla_service() -> None:
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, _restart_camilla_service_sync)
+    except subprocess.CalledProcessError as exc:
+        raise HTTPException(status_code=500, detail=exc.stderr.decode() or str(exc))
+
+
+async def _set_playback_device(device: str) -> dict:
+    normalized = (device or "").strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Device must be provided")
+    agent_config["playback_device"] = normalized
+    _persist_agent_config(agent_config)
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _write_camilla_config, normalized)
+    except Exception as exc:
+        log.exception("Failed to write Camilla config")
+        raise HTTPException(status_code=500, detail=f"Failed to write Camilla config: {exc}")
+    await _restart_camilla_service()
+    global camilla_pending_eq
+    try:
+        await _apply_camilla_eq()
+        camilla_pending_eq = False
+    except Exception as exc:  # pragma: no cover - hardware path
+        if CAMILLA_ENABLED and _is_connection_error(exc):
+            camilla_pending_eq = True
+            _schedule_camilla_retry()
+        else:
+            log.exception("Failed to reapply EQ after output change")
+            raise HTTPException(status_code=500, detail=f"Failed to reapply EQ: {exc}")
+    return _outputs_snapshot()
 
 
 def _list_mixer_controls() -> list[str]:
@@ -286,6 +397,10 @@ class PairPayload(BaseModel):
 class SnapclientConfigPayload(BaseModel):
     snapserver_host: Optional[str] = None
     snapserver_port: int = Field(default=SNAPCLIENT_DEFAULT_PORT, ge=1, le=65535)
+
+
+class OutputSelectionPayload(BaseModel):
+    device: str
 
 
 class CamillaController:
@@ -478,6 +593,8 @@ async def health() -> dict:
         "version": AGENT_VERSION,
         "updating": bool(update_task and not update_task.done()),
         "camilla_pending": camilla_pending_eq,
+        "playback_device": _current_playback_device(),
+        "outputs": _outputs_snapshot(),
     }
 
 
@@ -515,6 +632,19 @@ async def set_snapclient_config(payload: SnapclientConfigPayload, request: Reque
     _persist_agent_config(agent_config)
     await _reconcile_snapclient()
     return {"ok": True, "configured": bool(host)}
+
+
+@app.get("/outputs")
+async def list_outputs(request: Request) -> dict:
+    _auth(request)
+    return _outputs_snapshot()
+
+
+@app.post("/outputs")
+async def set_output(payload: OutputSelectionPayload, request: Request) -> dict:
+    _auth(request)
+    snapshot = await _set_playback_device(payload.device)
+    return {"ok": True, "outputs": snapshot}
 
 
 @app.post("/volume")

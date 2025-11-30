@@ -12,12 +12,14 @@ CAMILLA_PORT="1234"
 CAMILLA_ARCHIVE=""
 CAMILLA_REPO="HEnquist/camilladsp"
 CAMILLA_RETRY_INTERVAL="5"
+CAMILLA_SERVICE_NAME="roomcast-camilla.service"
 UPDATE_HELPER="/usr/local/bin/roomcast-updater"
 UPDATE_ENV="/etc/roomcast/update-env"
 SUDOERS_SNIPPET="/etc/sudoers.d/roomcast-agent"
 STATE_DIR="/var/lib/roomcast"
 AGENT_SECRET_PATH="${STATE_DIR}/agent-secret"
 AGENT_CONFIG_PATH="${STATE_DIR}/agent-config.json"
+SYSTEMCTL_BIN="$(command -v systemctl || echo /bin/systemctl)"
 
 usage() {
   cat <<'EOF'
@@ -101,7 +103,7 @@ EOF
 }
 
 configure_update_sudoers() {
-  echo "${SERVICE_USER} ALL=(root) NOPASSWD: ${UPDATE_HELPER}" >"$SUDOERS_SNIPPET"
+  echo "${SERVICE_USER} ALL=(root) NOPASSWD: ${UPDATE_HELPER}, ${SYSTEMCTL_BIN} restart ${CAMILLA_SERVICE_NAME}" >"$SUDOERS_SNIPPET"
   chmod 440 "$SUDOERS_SNIPPET"
 }
 

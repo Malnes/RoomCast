@@ -423,6 +423,9 @@
         const restarting = !!n.restarting;
         const updateAvailable = n.update_available !== false;
         const updating = !!n.updating;
+        const outputInfo = n.outputs || {};
+        const outputOptions = Array.isArray(outputInfo.options) ? outputInfo.options : [];
+        const selectedOutput = outputInfo.selected || n.playback_device || '';
         const disableAgentControls = !isBrowser && (!paired || !configured || restarting);
         const typePill = document.createElement('span');
         typePill.className = `status-pill ${isBrowser || paired ? 'ok' : 'warn'}`;
@@ -488,6 +491,44 @@
         volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
         volRow.appendChild(volInput);
         wrapper.appendChild(volRow);
+
+        if (!isBrowser) {
+          const outputWrap = document.createElement('div');
+          outputWrap.style.marginTop = '8px';
+          const outputLabel = document.createElement('div');
+          outputLabel.className = 'label';
+          outputLabel.innerText = 'Audio output';
+          const outputSelect = document.createElement('select');
+          outputSelect.style.width = '100%';
+          outputSelect.disabled = disableAgentControls || updating || !outputOptions.length;
+          const mappedOptions = [...outputOptions];
+          if (selectedOutput && !mappedOptions.some(opt => opt.id === selectedOutput)) {
+            mappedOptions.unshift({ id: selectedOutput, label: `${selectedOutput} (current)` });
+          }
+          mappedOptions.forEach(opt => {
+            const optionEl = document.createElement('option');
+            optionEl.value = opt.id;
+            optionEl.textContent = opt.label || opt.id;
+            outputSelect.appendChild(optionEl);
+          });
+          if (selectedOutput) {
+            outputSelect.value = selectedOutput;
+          }
+          outputSelect.addEventListener('change', () => {
+            if (!outputSelect.value) return;
+            setNodeOutput(n.id, outputSelect.value, outputSelect);
+          });
+          outputWrap.appendChild(outputLabel);
+          if (!mappedOptions.length) {
+            const emptyLabel = document.createElement('div');
+            emptyLabel.className = 'muted';
+            emptyLabel.innerText = 'No outputs detected';
+            outputWrap.appendChild(emptyLabel);
+          } else {
+            outputWrap.appendChild(outputSelect);
+          }
+          wrapper.appendChild(outputWrap);
+        }
 
         if (n.type === 'browser') {
           const panLabel = document.createElement('div');
@@ -878,6 +919,29 @@
         showError(`Failed to configure node: ${err.message}`);
       } finally {
         if (btn) btn.disabled = false;
+      }
+    }
+
+    async function setNodeOutput(nodeId, deviceId, selectEl) {
+      if (!deviceId) return;
+      const originalValue = selectEl ? selectEl.value : null;
+      if (selectEl) selectEl.disabled = true;
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/outputs`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ device: deviceId }),
+        });
+        await ensureOk(res);
+        showSuccess('Audio output updated');
+        await fetchNodes();
+      } catch (err) {
+        showError(`Failed to set output: ${err.message}`);
+        if (selectEl && originalValue !== null) {
+          selectEl.value = originalValue;
+        }
+      } finally {
+        if (selectEl) selectEl.disabled = false;
       }
     }
 
