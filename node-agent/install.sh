@@ -296,8 +296,10 @@ EOF
 
 enable_services() {
   systemctl daemon-reload
-  systemctl enable --now roomcast-camilla.service
-  systemctl enable --now roomcast-agent.service
+  systemctl enable roomcast-camilla.service
+  systemctl enable roomcast-agent.service
+  systemctl restart roomcast-camilla.service
+  systemctl restart roomcast-agent.service
 }
 
 main() {
