@@ -32,7 +32,7 @@ CAMILLA_ENABLED = os.getenv("CAMILLA_ENABLED", "1").lower() not in {"0", "false"
 
 CAMILLA_HOST = os.getenv("CAMILLA_HOST", "127.0.0.1")
 CAMILLA_PORT = int(os.getenv("CAMILLA_PORT", "1234"))
-CAMILLA_FILTER_PATH = os.getenv("CAMILLA_FILTER_PATH", "filters.peq_stack")
+CAMILLA_FILTER_PATH = os.getenv("CAMILLA_FILTER_PATH", "filters.peq_stack_{slot:02d}")
 CAMILLA_MAX_BANDS = int(os.getenv("CAMILLA_MAX_BANDS", "31"))
 CAMILLA_RETRY_INTERVAL = int(os.getenv("CAMILLA_RETRY_INTERVAL", "5"))
 CAMILLA_CONFIG_PATH = Path(os.getenv("CAMILLA_CONFIG_PATH", "/etc/roomcast/camilladsp.yml"))
@@ -143,7 +143,7 @@ def _list_playback_devices() -> list[dict]:
         log.warning("Failed to list playback devices: %s", exc.stderr.strip() or exc)
         return []
 
-    pattern = re.compile(r"card (\d+): ([^ ]+) \[([^\]]+)\], device (\d+): ([^ ]+) \[([^\]]+)\]")
+    pattern = re.compile(r"card (\d+): ([^\[]+)\[([^\]]+)\], device (\d+): ([^\[]+)\[([^\]]+)\]")
     options: list[dict] = []
     seen: set[str] = set()
     for line in proc.stdout.splitlines():
@@ -152,6 +152,8 @@ def _list_playback_devices() -> list[dict]:
         if not match:
             continue
         card_idx, _card_id, card_desc, dev_idx, _dev_id, dev_desc = match.groups()
+        card_desc = card_desc.strip()
+        dev_desc = dev_desc.strip()
         device_id = f"plughw:{card_idx},{dev_idx}"
         if device_id in seen:
             continue
@@ -410,11 +412,39 @@ class CamillaController:
         self.filter_path = filter_path
         self._ids = itertools.count(1)
 
+    # Camilla v3 exposes single filters, so we need a predictable per-slot path.
+    def _filter_path_for_slot(self, slot: int) -> str:
+        template = self.filter_path or ""
+        replacements = {
+            "slot": slot,
+            "slot_index": slot,
+            "slot1": slot + 1,
+            "slot_one_based": slot + 1,
+            "slot02": f"{slot:02d}",
+            "slot03": f"{slot:03d}",
+            "slot1_02": f"{slot + 1:02d}",
+        }
+        if "{" in template and "}" in template:
+            try:
+                return template.format(**replacements)
+            except (KeyError, ValueError):
+                pass
+        if "%" in template:
+            try:
+                return template % slot
+            except (TypeError, ValueError):
+                pass
+        suffix = f"{slot:02d}"
+        if template.endswith(("_", "-")):
+            return f"{template}{suffix}"
+        if not template:
+            return suffix
+        return f"{template}_{suffix}"
+
     async def apply_eq(self, bands: List[EqBand], target_slots: int) -> None:
         if not CAMILLA_ENABLED:
             return
         slots = max(1, min(CAMILLA_MAX_BANDS, target_slots))
-        biquads: list[dict] = []
         for idx in range(slots):
             if idx < len(bands):
                 band = bands[idx]
@@ -430,9 +460,19 @@ class CamillaController:
                 freq = 1000.0
                 gain = 0.0
                 q_val = 1.0
-            biquads.append({"type": "Peq", "freq": freq, "gain": gain, "q": q_val})
-        payload = {"path": self.filter_path, "config": {"type": "BiquadStack", "biquads": biquads}}
-        await self._call("SetFilter", payload)
+            payload = {
+                "path": self._filter_path_for_slot(idx),
+                "config": {
+                    "type": "Biquad",
+                    "parameters": {
+                        "type": "Peaking",
+                        "freq": freq,
+                        "gain": gain,
+                        "q": q_val,
+                    },
+                },
+            }
+            await self._call("SetFilter", payload)
 
     async def _call(self, method: str, params: dict | None = None) -> dict | None:
         reader, writer = await asyncio.open_connection(self.host, self.port)

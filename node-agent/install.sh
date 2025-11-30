@@ -13,6 +13,8 @@ CAMILLA_ARCHIVE=""
 CAMILLA_REPO="HEnquist/camilladsp"
 CAMILLA_RETRY_INTERVAL="5"
 CAMILLA_SERVICE_NAME="roomcast-camilla.service"
+CAMILLA_TEMPLATE_PATH="/etc/roomcast/camilladsp.template.yml"
+CAMILLA_CONFIG_PATH="/etc/roomcast/camilladsp.yml"
 UPDATE_HELPER="/usr/local/bin/roomcast-updater"
 UPDATE_ENV="/etc/roomcast/update-env"
 SUDOERS_SNIPPET="/etc/sudoers.d/roomcast-agent"
@@ -34,6 +36,9 @@ Options:
   --playback-device <d>   ALSA playback device for CamillaDSP output (default: plughw:0,0)
   --camilla-port <port>   CamillaDSP control port (default: 1234)
   --camilla-retry <sec>   Seconds between CamillaDSP retry attempts (default: 5)
+  --camilla-template <p>  CamillaDSP template path (default: /etc/roomcast/camilladsp.template.yml)
+  --camilla-config <p>    Rendered CamillaDSP config path (default: /etc/roomcast/camilladsp.yml)
+  --camilla-service <n>   Systemd service responsible for CamillaDSP (default: roomcast-camilla.service)
   -h, --help              Show this help message
 
 Example:
@@ -57,6 +62,9 @@ write_update_env() {
     printf 'PLAYBACK_DEVICE=%q\n' "$PLAYBACK_DEVICE"
     printf 'CAMILLA_PORT=%q\n' "$CAMILLA_PORT"
     printf 'CAMILLA_RETRY_INTERVAL=%q\n' "$CAMILLA_RETRY_INTERVAL"
+    printf 'CAMILLA_TEMPLATE_PATH=%q\n' "$CAMILLA_TEMPLATE_PATH"
+    printf 'CAMILLA_CONFIG_PATH=%q\n' "$CAMILLA_CONFIG_PATH"
+    printf 'CAMILLA_SERVICE_NAME=%q\n' "$CAMILLA_SERVICE_NAME"
   } >"$UPDATE_ENV"
   chmod 600 "$UPDATE_ENV"
 }
@@ -81,6 +89,9 @@ MIXER_CONTROL=${MIXER_CONTROL:-Master}
 PLAYBACK_DEVICE=${PLAYBACK_DEVICE:-plughw:0,0}
 CAMILLA_PORT=${CAMILLA_PORT:-1234}
 CAMILLA_RETRY_INTERVAL=${CAMILLA_RETRY_INTERVAL:-5}
+CAMILLA_TEMPLATE_PATH=${CAMILLA_TEMPLATE_PATH:-/etc/roomcast/camilladsp.template.yml}
+CAMILLA_CONFIG_PATH=${CAMILLA_CONFIG_PATH:-/etc/roomcast/camilladsp.yml}
+CAMILLA_SERVICE_NAME=${CAMILLA_SERVICE_NAME:-roomcast-camilla.service}
 
 TMP_SCRIPT=$(mktemp)
 cleanup() { rm -f "$TMP_SCRIPT"; }
@@ -96,7 +107,10 @@ bash "$TMP_SCRIPT" \
   --mixer "$MIXER_CONTROL" \
   --playback-device "$PLAYBACK_DEVICE" \
   --camilla-port "$CAMILLA_PORT" \
-  --camilla-retry "$CAMILLA_RETRY_INTERVAL"
+  --camilla-retry "$CAMILLA_RETRY_INTERVAL" \
+  --camilla-template "$CAMILLA_TEMPLATE_PATH" \
+  --camilla-config "$CAMILLA_CONFIG_PATH" \
+  --camilla-service "$CAMILLA_SERVICE_NAME"
 EOF
   chmod 750 "$UPDATE_HELPER"
   chown root:root "$UPDATE_HELPER"
@@ -148,6 +162,12 @@ parse_args() {
         CAMILLA_PORT="$2"; shift 2 ;;
       --camilla-retry)
         CAMILLA_RETRY_INTERVAL="$2"; shift 2 ;;
+      --camilla-template)
+        CAMILLA_TEMPLATE_PATH="$2"; shift 2 ;;
+      --camilla-config)
+        CAMILLA_CONFIG_PATH="$2"; shift 2 ;;
+      --camilla-service)
+        CAMILLA_SERVICE_NAME="$2"; shift 2 ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -238,13 +258,28 @@ install_camilladsp() {
   rm -rf "$tmpdir"
 }
 
+install_camilla_template() {
+  log "Staging CamillaDSP template"
+  local template_source="${INSTALL_DIR}/node-agent/camilladsp-config.yml"
+  if [[ ! -f "$template_source" ]]; then
+    echo "Camilla template not found at $template_source" >&2
+    exit 1
+  fi
+  install -d "$(dirname "$CAMILLA_TEMPLATE_PATH")"
+  install -m 0640 "$template_source" "$CAMILLA_TEMPLATE_PATH"
+  chown "$SERVICE_USER":"$SERVICE_USER" "$CAMILLA_TEMPLATE_PATH" || true
+}
+
 write_camilla_config() {
-  log "Generating CamillaDSP config"
-  install -d /etc/roomcast
+  log "Rendering CamillaDSP config"
+  install -d "$(dirname "$CAMILLA_CONFIG_PATH")"
+  if [[ ! -f "$CAMILLA_TEMPLATE_PATH" ]]; then
+    install_camilla_template
+  fi
   sed -e "s#__PLAYBACK_DEVICE__#${PLAYBACK_DEVICE}#g" \
       -e "s#__CAMILLA_PORT__#${CAMILLA_PORT}#g" \
-    "$INSTALL_DIR/node-agent/camilladsp-config.yml" > /etc/roomcast/camilladsp.yml
-  chown "$SERVICE_USER":"$SERVICE_USER" /etc/roomcast/camilladsp.yml || true
+    "$CAMILLA_TEMPLATE_PATH" > "$CAMILLA_CONFIG_PATH"
+  chown "$SERVICE_USER":"$SERVICE_USER" "$CAMILLA_CONFIG_PATH" || true
 }
 
 write_camilla_unit() {
@@ -255,7 +290,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/camilladsp -c /etc/roomcast/camilladsp.yml
+ExecStart=/usr/local/bin/camilladsp -c ${CAMILLA_CONFIG_PATH}
 Restart=always
 RestartSec=3
 User=${SERVICE_USER}
@@ -280,9 +315,12 @@ Environment=PLAYBACK_DEVICE=${PLAYBACK_DEVICE}
 Environment=SNAPCLIENT_PORT=${SNAP_PORT}
 Environment=CAMILLA_HOST=127.0.0.1
 Environment=CAMILLA_PORT=${CAMILLA_PORT}
-Environment=CAMILLA_FILTER_PATH=filters.peq_stack
+Environment=CAMILLA_FILTER_PATH=filters.peq_stack_{slot:02d}
 Environment=CAMILLA_MAX_BANDS=31
 Environment=CAMILLA_RETRY_INTERVAL=${CAMILLA_RETRY_INTERVAL}
+Environment=CAMILLA_TEMPLATE_PATH=${CAMILLA_TEMPLATE_PATH}
+Environment=CAMILLA_CONFIG_PATH=${CAMILLA_CONFIG_PATH}
+Environment=CAMILLA_SERVICE_NAME=${CAMILLA_SERVICE_NAME}
 Environment=AGENT_SECRET_PATH=${AGENT_SECRET_PATH}
 Environment=AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH}
 WorkingDirectory=${INSTALL_DIR}/node-agent
@@ -315,6 +353,7 @@ main() {
   setup_venv
   configure_loopback
   install_camilladsp
+  install_camilla_template
   write_camilla_config
   write_camilla_unit
   write_agent_unit
