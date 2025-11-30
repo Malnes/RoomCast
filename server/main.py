@@ -704,6 +704,28 @@ async def configure_node(node_id: str) -> dict:
     return {"ok": True, "result": result}
 
 
+@app.post("/api/nodes/{node_id}/check-updates")
+async def check_node_updates(node_id: str) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "browser":
+        raise HTTPException(status_code=400, detail="Browser nodes do not support updates")
+    reachable, changed = await refresh_agent_metadata(node)
+    if not reachable:
+        raise HTTPException(status_code=504, detail="Node agent is not responding")
+    if node.get("agent_version"):
+        log.info("Checked updates for node %s (version %s)", node_id, node.get("agent_version"))
+    await broadcast_nodes()
+    public = public_node(node)
+    return {
+        "ok": True,
+        "agent_version": public.get("agent_version"),
+        "update_available": public.get("update_available"),
+        "changed": changed,
+    }
+
+
 @app.post("/api/nodes/{node_id}/update")
 async def update_agent_node(node_id: str) -> dict:
     node = nodes.get(node_id)

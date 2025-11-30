@@ -174,6 +174,7 @@
         <div class="section-title">Snapcast clients (view)</div>
         <div id="clients-settings"></div>
       </div>
+
     </div>
   </div>
 
@@ -539,6 +540,8 @@
           }
           const restartBtn = addMenuButton(restarting ? 'Restarting…' : 'Restart node', (btn) => restartNode(n.id, btn));
           restartBtn.disabled = !paired || restarting;
+          const checkBtn = addMenuButton('Check for updates', (btn) => checkNodeUpdates(n.id, btn));
+          checkBtn.disabled = !paired || restarting || updating;
           if (updateAvailable) {
             const updateBtn = document.createElement('button');
             updateBtn.className = 'small-btn';
@@ -875,6 +878,32 @@
         showError(`Failed to configure node: ${err.message}`);
       } finally {
         if (btn) btn.disabled = false;
+      }
+    }
+
+    async function checkNodeUpdates(nodeId, btn) {
+      const originalLabel = btn ? btn.textContent : '';
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Checking…';
+      }
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/check-updates`, { method: 'POST' });
+        await ensureOk(res);
+        const data = await res.json().catch(() => ({}));
+        if (data?.update_available) {
+          showSuccess('Update available for this node.');
+        } else {
+          showSuccess('Node is up to date.');
+        }
+        await fetchNodes();
+      } catch (err) {
+        showError(`Failed to check updates: ${err.message}`);
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = originalLabel || 'Check for updates';
+        }
       }
     }
 
