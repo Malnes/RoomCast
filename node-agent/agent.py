@@ -303,9 +303,14 @@ class CamillaController:
         for idx in range(slots):
             if idx < len(bands):
                 band = bands[idx]
-                freq = float(band.freq)
-                gain = float(band.gain)
-                q_val = float(band.q)
+                if isinstance(band, dict):
+                    freq = float(band.get("freq", 1000.0))
+                    gain = float(band.get("gain", 0.0))
+                    q_val = float(band.get("q", 1.0))
+                else:
+                    freq = float(getattr(band, "freq", 1000.0))
+                    gain = float(getattr(band, "gain", 0.0))
+                    q_val = float(getattr(band, "q", 1.0))
             else:
                 freq = 1000.0
                 gain = 0.0
