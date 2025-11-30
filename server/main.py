@@ -138,6 +138,7 @@ node_watchers: set[WebSocket] = set()
 webrtc_relay: Optional[WebAudioRelay] = None
 DEFAULT_EQ_PRESET = "peq15"
 pending_restarts: Dict[str, dict] = {}
+agent_refresh_tasks: Dict[str, asyncio.Task] = {}
 
 
 def default_eq_state() -> dict:
@@ -282,17 +283,36 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[b
     return True, changed
 
 
-def schedule_agent_refresh(node_id: str, delay: float = 10.0) -> None:
-    async def _task() -> None:
-        await asyncio.sleep(delay)
-        node = nodes.get(node_id)
-        if not node:
-            return
-        reachable, changed = await refresh_agent_metadata(node)
-        if reachable and changed:
-            await broadcast_nodes()
+def schedule_agent_refresh(node_id: str, delay: float = 10.0, *, repeat: bool = False, attempts: int = 6) -> None:
+    existing = agent_refresh_tasks.pop(node_id, None)
+    if existing:
+        existing.cancel()
 
-    asyncio.create_task(_task())
+    async def _task() -> None:
+        remaining = max(1, attempts)
+        try:
+            while remaining > 0:
+                await asyncio.sleep(delay)
+                node = nodes.get(node_id)
+                if not node:
+                    return
+                reachable, changed = await refresh_agent_metadata(node)
+                if reachable and changed:
+                    await broadcast_nodes()
+                if not repeat:
+                    return
+                if reachable and not node.get("updating"):
+                    return
+                remaining -= 1
+            node = nodes.get(node_id)
+            if repeat and node and node.get("updating"):
+                node["updating"] = False
+                save_nodes()
+                await broadcast_nodes()
+        finally:
+            agent_refresh_tasks.pop(node_id, None)
+
+    agent_refresh_tasks[node_id] = asyncio.create_task(_task())
 
 
 def schedule_restart_watch(node_id: str) -> None:
@@ -695,7 +715,7 @@ async def update_agent_node(node_id: str) -> dict:
     node["updating"] = True
     save_nodes()
     await broadcast_nodes()
-    schedule_agent_refresh(node_id, delay=20.0)
+    schedule_agent_refresh(node_id, delay=20.0, repeat=True, attempts=12)
     return {"ok": True, "result": result}
 
 
