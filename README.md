@@ -36,13 +36,13 @@ Quick start
 -----------
 Prereqs: Docker, Docker Compose, Spotify Premium (Librespot needs it), open TCP 1704/1780 to nodes.
 
-1) Local dev with auto-reload: `make dev` (uses `docker-compose.dev.yml` to mount code and reload FastAPI). Prod-ish run: `docker compose up -d`.  
+1) Local dev with auto-reload: `make dev` (uses `docker-compose.dev.yml` to mount code and reload FastAPI). Prod-ish run: `docker compose up -d`. The compose stack runs the controller, Snapserver, and Librespot in **host networking mode** so the controller automatically sees the same LAN interfaces as the host—no CIDR configuration, no hardcoded ranges, discovery “just works.” Run on a Linux host and make sure ports 8000/1704/1705/1780 are free.
    - Snapshot config: copy the sanitized example before starting containers so Docker has a host file to mount: `cp snapserver.example.json snapserver.json`. The runtime file is `.gitignore`d so your environment-specific client list never leaves your machine.
 2) Open the web UI at `http://<controller-host>:8000`. The landing view lists nodes with per-node volume/mute/EQ; open the ⚙︎ settings menu to enter Spotify credentials + device name (Librespot reloads automatically), add nodes, and view Snapcast clients.  
 3) On each hardware node (e.g. Raspberry Pi Zero 2), install `snapclient` and run the `node-agent` service (see `node-agent/README.md`). Native install via systemd is recommended on Pi Zero 2 for the lightest footprint; Docker is optional and supported with the provided Dockerfile. Register nodes via the web UI (name + agent URL).
 4) To create an ad-hoc browser speaker, click **New web node** in the UI. A new tab will open, negotiate WebRTC against the controller, and the controller’s snapclient relay will keep that browser in lockstep with the rest of the Snapcast group.
 5) Use the UI to set per-node EQ (bands JSON) and volume; adjust Snapcast client volumes in the “Snapcast clients” section.
-Optional (but recommended when the controller runs inside Docker bridge networking): set `DISCOVERY_CIDR` to your LAN range so discovery can reach hardware nodes. The value accepts a comma/semicolon separated list (e.g. `192.168.1.0/24,10.10.0.0/24`) and every listed network is scanned alongside any interfaces the container sees.
+Optional: if your host participates in multiple VLANs/subnets and you want to scan additional ranges beyond whatever interfaces the OS exposes, set `DISCOVERY_CIDR` to a comma/semicolon separated list (e.g. `192.168.1.0/24;10.10.0.0/24`). Those ranges will be scanned in addition to the interfaces that host networking already reveals.
 
 Caveats / next steps
 --------------------

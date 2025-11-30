@@ -1,16 +1,14 @@
 services:
   controller:
     build: ./server
+    network_mode: host
     environment:
-      SNAPSERVER_HOST: snapserver
+      SNAPSERVER_HOST: 127.0.0.1
       SNAPSERVER_PORT: 1780
       CONFIG_PATH: /config/spotify.json
-      DISCOVERY_CIDR: ${DISCOVERY_CIDR:-192.168.1.0/24}
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
       SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:8000/api/spotify/callback}
-    ports:
-      - "8000:8000"
     depends_on:
       - snapserver
       - librespot
@@ -20,18 +18,16 @@ services:
 
   snapserver:
     image: saiyato/snapserver:latest
+    network_mode: host
     environment:
       SNAPSERVER_OPTS: "--stream pipe:///tmp/snapfifo?name=Spotify --http-cors *"
-    ports:
-      - "1704:1704/tcp"   # snapcast control
-      - "1705:1705/udp"   # snapcast discovery
-      - "1780:1780/tcp"   # json-rpc / websocket
     volumes:
       - snapfifo:/tmp
       - ./snapserver.json:/root/.config/snapserver/server.json
 
   librespot:
     build: ./librespot
+    network_mode: host
     entrypoint: []
     depends_on:
       - snapserver

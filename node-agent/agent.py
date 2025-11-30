@@ -13,8 +13,17 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.2.0")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.1")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
+MIXER_FALLBACKS = [
+    MIXER_CONTROL,
+    "Master",
+    "PCM",
+    "Digital",
+    "Speaker",
+    "Headphone",
+    "Playback",
+]
 PLAYBACK_DEVICE = os.getenv("PLAYBACK_DEVICE", "hw:Loopback,0,0")
 DRY_RUN = os.getenv("AGENT_DRY_RUN", "").lower() in ("1", "true", "yes")
 CAMILLA_ENABLED = os.getenv("CAMILLA_ENABLED", "1").lower() not in {"0", "false", "no"}
@@ -23,12 +32,15 @@ CAMILLA_HOST = os.getenv("CAMILLA_HOST", "127.0.0.1")
 CAMILLA_PORT = int(os.getenv("CAMILLA_PORT", "1234"))
 CAMILLA_FILTER_PATH = os.getenv("CAMILLA_FILTER_PATH", "filters.peq_stack")
 CAMILLA_MAX_BANDS = int(os.getenv("CAMILLA_MAX_BANDS", "31"))
+CAMILLA_RETRY_INTERVAL = int(os.getenv("CAMILLA_RETRY_INTERVAL", "5"))
 AGENT_SECRET_PATH = Path(os.getenv("AGENT_SECRET_PATH", "/var/lib/roomcast/agent-secret"))
 AGENT_CONFIG_PATH = Path(os.getenv("AGENT_CONFIG_PATH", "/var/lib/roomcast/agent-config.json"))
 SNAPCLIENT_BIN = os.getenv("SNAPCLIENT_BIN", "snapclient")
 SNAPCLIENT_DEFAULT_PORT = int(os.getenv("SNAPCLIENT_PORT", "1704"))
 UPDATE_COMMAND = os.getenv("ROOMCAST_UPDATE_COMMAND", "sudo /usr/local/bin/roomcast-updater")
 UPDATE_COMMAND_ARGS = shlex.split(UPDATE_COMMAND) if UPDATE_COMMAND else []
+RESTART_COMMAND = os.getenv("ROOMCAST_RESTART_COMMAND", "sudo /sbin/reboot")
+RESTART_COMMAND_ARGS = shlex.split(RESTART_COMMAND) if RESTART_COMMAND else []
 
 app = FastAPI(title="RoomCast Node Agent", version=AGENT_VERSION)
 
@@ -100,6 +112,76 @@ def _persist_agent_config(data: dict) -> None:
 
 agent_config = _load_agent_config()
 snapclient_process = None
+_resolved_control: Optional[str] = None
+
+
+def _list_mixer_controls() -> list[str]:
+    if DRY_RUN:
+        return [MIXER_CONTROL]
+    try:
+        proc = subprocess.run(
+            ["amixer", "scontrols"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        log.warning("amixer not installed; unable to auto-detect mixer controls")
+        return []
+    except subprocess.CalledProcessError as exc:
+        log.warning(
+            "Failed to list ALSA simple controls: %s",
+            exc.stderr.decode(errors="ignore") or str(exc),
+        )
+        return []
+    names: list[str] = []
+    for line in proc.stdout.decode(errors="ignore").splitlines():
+        if "'" not in line:
+            continue
+        start = line.find("'") + 1
+        end = line.find("'", start)
+        if start >= 0 and end > start:
+            names.append(line[start:end])
+    return names
+
+
+def _resolved_mixer_control() -> str:
+    global _resolved_control
+    if _resolved_control:
+        return _resolved_control
+
+    preferred = (MIXER_CONTROL or "Master").strip() or "Master"
+    if DRY_RUN:
+        _resolved_control = preferred
+        return preferred
+
+    controls = _list_mixer_controls()
+    if not controls:
+        _resolved_control = preferred
+        return preferred
+
+    if preferred in controls:
+        _resolved_control = preferred
+        return preferred
+
+    for candidate in [c for c in MIXER_FALLBACKS if c]:
+        if candidate in controls:
+            log.warning(
+                "Mixer control '%s' not available, using '%s'. Set MIXER_CONTROL to override.",
+                preferred,
+                candidate,
+            )
+            _resolved_control = candidate
+            return candidate
+
+    fallback = controls[0]
+    log.warning(
+        "Mixer control '%s' not available, falling back to '%s'. Set MIXER_CONTROL to override.",
+        preferred,
+        fallback,
+    )
+    _resolved_control = fallback
+    return fallback
 
 
 def _snapclient_args(config: dict) -> list[str]:
@@ -252,6 +334,60 @@ class CamillaController:
 
 
 camilla = CamillaController(CAMILLA_HOST, CAMILLA_PORT, CAMILLA_FILTER_PATH)
+camilla_retry_task: asyncio.Task | None = None
+camilla_pending_eq = False
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    if isinstance(exc, ConnectionError):
+        return True
+    errno = getattr(exc, "errno", None)
+    return errno in {104, 107, 111, 113}
+
+
+async def _apply_camilla_eq() -> None:
+    if not CAMILLA_ENABLED:
+        return
+    state = eq_state or {}
+    bands = state.get("bands") or []
+    band_count = state.get("band_count") or len(bands) or 15
+    await camilla.apply_eq(bands, band_count)
+
+
+def _cancel_camilla_retry() -> None:
+    global camilla_retry_task
+    if camilla_retry_task and not camilla_retry_task.done():
+        camilla_retry_task.cancel()
+    camilla_retry_task = None
+
+
+def _schedule_camilla_retry() -> None:
+    if not CAMILLA_ENABLED:
+        return
+    global camilla_retry_task
+    if camilla_retry_task and not camilla_retry_task.done():
+        return
+
+    async def _runner() -> None:
+        global camilla_pending_eq, camilla_retry_task
+        try:
+            while True:
+                await asyncio.sleep(max(1, CAMILLA_RETRY_INTERVAL))
+                try:
+                    await _apply_camilla_eq()
+                except Exception as exc:  # pragma: no cover - hardware path
+                    if _is_connection_error(exc):
+                        log.warning("CamillaDSP still unavailable (%s); retrying", exc)
+                        continue
+                    log.exception("Failed to apply EQ via CamillaDSP")
+                    return
+                camilla_pending_eq = False
+                log.info("Applied pending EQ after CamillaDSP recovery")
+                return
+        finally:
+            camilla_retry_task = None
+
+    camilla_retry_task = asyncio.create_task(_runner())
 
 
 def _auth(request: Request) -> None:
@@ -264,9 +400,10 @@ def _auth(request: Request) -> None:
 def _amixer_set(percent: int) -> None:
     if DRY_RUN:
         return
+    control = _resolved_mixer_control()
     try:
         subprocess.run(
-            ["amixer", "-M", "set", MIXER_CONTROL, f"{percent}%"],
+            ["amixer", "-M", "set", control, f"{percent}%"],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -281,9 +418,10 @@ def _amixer_mute(muted: bool) -> None:
     if DRY_RUN:
         return
     cmd = "mute" if muted else "unmute"
+    control = _resolved_mixer_control()
     try:
         subprocess.run(
-            ["amixer", "-M", "set", MIXER_CONTROL, cmd],
+            ["amixer", "-M", "set", control, cmd],
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -292,6 +430,36 @@ def _amixer_mute(muted: bool) -> None:
         raise HTTPException(status_code=500, detail="amixer not installed")
     except subprocess.CalledProcessError as exc:
         raise HTTPException(status_code=500, detail=exc.stderr.decode() or str(exc))
+
+
+async def _run_maintenance_command(args: list[str], label: str) -> None:
+    global update_task
+    if not args:
+        raise HTTPException(status_code=500, detail=f"{label} is not configured")
+    async with update_lock:
+        if update_task and not update_task.done():
+            raise HTTPException(status_code=409, detail="Another maintenance action is already running")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *args,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail=f"{label} executable not found")
+        except Exception as exc:  # pragma: no cover - subprocess failures
+            log.exception("Failed to launch %s", label)
+            raise HTTPException(status_code=500, detail=str(exc))
+
+        async def monitor() -> None:
+            try:
+                rc = await proc.wait()
+                if rc != 0:
+                    log.error("%s exited with code %s", label, rc)
+            except Exception as exc:  # pragma: no cover
+                log.exception("%s failed: %s", label, exc)
+
+        update_task = asyncio.create_task(monitor())
 
 
 @app.get("/health")
@@ -304,6 +472,7 @@ async def health() -> dict:
         "configured": bool(agent_config.get("snapserver_host")),
         "version": AGENT_VERSION,
         "updating": bool(update_task and not update_task.done()),
+        "camilla_pending": camilla_pending_eq,
     }
 
 
@@ -365,12 +534,22 @@ async def set_eq(payload: EqPayload, request: Request) -> dict:
     eq_state["preset"] = payload.preset or eq_state.get("preset") or "peq15"
     eq_state["band_count"] = payload.band_count
     eq_state["bands"] = [band.model_dump() for band in payload.bands]
+    global camilla_pending_eq
     try:
-        await camilla.apply_eq(payload.bands, payload.band_count)
+        await _apply_camilla_eq()
+        camilla_pending_eq = False
+        _cancel_camilla_retry()
+        pending = False
     except Exception as exc:  # pragma: no cover - hardware/API path
-        log.exception("Failed to apply EQ via CamillaDSP")
-        raise HTTPException(status_code=500, detail=f"Failed to apply EQ: {exc}")
-    return {"ok": True, "eq": eq_state}
+        if CAMILLA_ENABLED and _is_connection_error(exc):
+            camilla_pending_eq = True
+            log.warning("CamillaDSP unavailable (%s); queueing EQ for retry", exc)
+            _schedule_camilla_retry()
+            pending = True
+        else:
+            log.exception("Failed to apply EQ via CamillaDSP")
+            raise HTTPException(status_code=500, detail=f"Failed to apply EQ: {exc}")
+    return {"ok": True, "eq": eq_state, "camilla_pending": pending}
 
 
 @app.post("/update")
@@ -378,34 +557,17 @@ async def trigger_update(request: Request) -> dict:
     _auth(request)
     if not UPDATE_COMMAND_ARGS:
         raise HTTPException(status_code=500, detail="Update command is not configured")
-
-    global update_task
-    async with update_lock:
-        if update_task and not update_task.done():
-            raise HTTPException(status_code=409, detail="Update already in progress")
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *UPDATE_COMMAND_ARGS,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-            )
-        except FileNotFoundError:
-            raise HTTPException(status_code=500, detail="Update command executable not found")
-        except Exception as exc:  # pragma: no cover - subprocess failures
-            log.exception("Failed to launch update command")
-            raise HTTPException(status_code=500, detail=str(exc))
-
-        async def monitor() -> None:
-            try:
-                rc = await proc.wait()
-                if rc != 0:
-                    log.error("roomcast updater exited with code %s", rc)
-            except Exception as exc:  # pragma: no cover
-                log.exception("roomcast updater failed: %s", exc)
-
-        update_task = asyncio.create_task(monitor())
-
+    await _run_maintenance_command(UPDATE_COMMAND_ARGS, "update command")
     return {"ok": True, "status": "started"}
+
+
+@app.post("/restart")
+async def trigger_restart(request: Request) -> dict:
+    _auth(request)
+    if not RESTART_COMMAND_ARGS:
+        raise HTTPException(status_code=500, detail="Restart command is not configured")
+    await _run_maintenance_command(RESTART_COMMAND_ARGS, "restart command")
+    return {"ok": True, "status": "restarting"}
 
 
 @app.on_event("startup")

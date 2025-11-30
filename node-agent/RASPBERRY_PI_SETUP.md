@@ -25,3 +25,7 @@ Follow these steps on a fresh Raspberry Pi OS **Lite** (or any Debian-based) ins
    Once registered you'll see the node's agent version plus an **Update node** button in the UI, which runs the installer again on that Pi so keeping nodes current is a single click.
 
 That’s it. No manual package installs, unit edits, or extra steps per Pi. Re-run the installer later to pull updates.
+
+   ## Audio mixer control notes
+
+   Most Pi images expose a `Master` simple mixer control, but some HDMI or USB DACs only provide controls like `PCM`, `Digital`, or `Speaker`. The agent now auto-detects the first available control when `Master` is missing so mute/volume actions keep working out of the box. If you want to force a specific control, set the `MIXER_CONTROL` environment variable in the `roomcast-agent` systemd unit (for example run `sudo systemctl edit roomcast-agent`, add `Environment=MIXER_CONTROL=PCM`, then `sudo systemctl restart roomcast-agent`).

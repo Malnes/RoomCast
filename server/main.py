@@ -29,7 +29,7 @@ CONFIG_PATH = Path(os.getenv("CONFIG_PATH", "/config/spotify.json"))
 CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
 STATIC_DIR = Path(__file__).parent / "static"
 LIBRESPOT_STATUS_PATH = Path(os.getenv("STATUS_PATH", "/config/librespot-status.json"))
-DISCOVERY_CIDR = os.getenv("DISCOVERY_CIDR", "192.168.1.0/24")
+DISCOVERY_CIDR = os.getenv("DISCOVERY_CIDR", "").strip()
 DISCOVERY_MAX_HOSTS = int(os.getenv("DISCOVERY_MAX_HOSTS", "4096"))
 DISCOVERY_CONCURRENCY = int(os.getenv("DISCOVERY_CONCURRENCY", "25"))
 AGENT_PORT = int(os.getenv("AGENT_PORT", "9700"))
@@ -42,12 +42,19 @@ NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.1").strip()
+NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
+NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 
 
 class NodeRegistration(BaseModel):
     id: Optional[str] = None
     name: str
     url: str = Field(min_length=1)
+
+
+class RenameNodePayload(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
 
 
 class VolumePayload(BaseModel):
@@ -130,6 +137,7 @@ browser_ws: Dict[str, WebSocket] = {}
 node_watchers: set[WebSocket] = set()
 webrtc_relay: Optional[WebAudioRelay] = None
 DEFAULT_EQ_PRESET = "peq15"
+pending_restarts: Dict[str, dict] = {}
 
 
 def default_eq_state() -> dict:
@@ -144,6 +152,16 @@ def public_node(node: dict) -> dict:
     else:
         data["configured"] = bool(node.get("audio_configured"))
     data["agent_version"] = node.get("agent_version")
+    data["volume_percent"] = int(node.get("volume_percent", 75))
+    data["muted"] = bool(node.get("muted"))
+    data["updating"] = bool(node.get("updating"))
+    if node.get("type") == "browser":
+        data["update_available"] = False
+    elif AGENT_LATEST_VERSION:
+        data["update_available"] = (node.get("agent_version") or "") != AGENT_LATEST_VERSION
+    else:
+        data["update_available"] = True
+    data["restarting"] = bool(pending_restarts.get(node["id"]))
     return data
 
 
@@ -172,6 +190,7 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
             existing["last_seen"] = time.time()
             return existing
     node_id = reg.id or str(uuid.uuid4())
+    previous = nodes.get(node_id, {})
     node_type = "browser" if normalized_url.startswith("browser:") else "agent"
     nodes[node_id] = {
         "id": node_id,
@@ -179,11 +198,14 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
         "url": normalized_url,
         "last_seen": time.time(),
         "type": node_type,
-        "pan": nodes.get(node_id, {}).get("pan", 0.0) if node_id in nodes else 0.0,
+        "pan": previous.get("pan", 0.0),
         "eq": default_eq_state(),
-        "agent_secret": nodes.get(node_id, {}).get("agent_secret"),
-        "audio_configured": True if node_type == "browser" else nodes.get(node_id, {}).get("audio_configured", False),
-        "agent_version": nodes.get(node_id, {}).get("agent_version"),
+        "agent_secret": previous.get("agent_secret"),
+        "audio_configured": True if node_type == "browser" else previous.get("audio_configured", False),
+        "agent_version": previous.get("agent_version"),
+        "volume_percent": previous.get("volume_percent", 75),
+        "muted": previous.get("muted", False),
+        "updating": bool(previous.get("updating", False)),
     }
     save_nodes()
     return nodes[node_id]
@@ -227,18 +249,18 @@ async def configure_agent_audio(node: dict) -> dict:
     return result
 
 
-async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> bool:
+async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[bool, bool]:
     if node.get("type") != "agent":
-        return False
+        return False, False
     url = f"{node['url'].rstrip('/')}/health"
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(url)
         if resp.status_code != 200:
-            return False
+            return False, False
         data = resp.json()
     except Exception:
-        return False
+        return False, False
 
     changed = False
     version = data.get("version")
@@ -250,9 +272,14 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> bool:
         if node.get("audio_configured") != configured:
             node["audio_configured"] = configured
             changed = True
+    if "updating" in data:
+        updating = bool(data.get("updating"))
+        if node.get("updating") != updating:
+            node["updating"] = updating
+            changed = True
     if persist and changed:
         save_nodes()
-    return changed
+    return True, changed
 
 
 def schedule_agent_refresh(node_id: str, delay: float = 10.0) -> None:
@@ -261,11 +288,43 @@ def schedule_agent_refresh(node_id: str, delay: float = 10.0) -> None:
         node = nodes.get(node_id)
         if not node:
             return
-        changed = await refresh_agent_metadata(node)
-        if changed:
+        reachable, changed = await refresh_agent_metadata(node)
+        if reachable and changed:
             await broadcast_nodes()
 
     asyncio.create_task(_task())
+
+
+def schedule_restart_watch(node_id: str) -> None:
+    existing = pending_restarts.pop(node_id, None)
+    if existing:
+        task = existing.get("task")
+        if task:
+            task.cancel()
+    deadline = time.time() + NODE_RESTART_TIMEOUT
+
+    async def _monitor() -> None:
+        saw_offline = False
+        try:
+            while time.time() < deadline:
+                await asyncio.sleep(NODE_RESTART_INTERVAL)
+                node = nodes.get(node_id)
+                if not node:
+                    return
+                reachable, _ = await refresh_agent_metadata(node)
+                if reachable:
+                    if saw_offline:
+                        log.info("Node %s reported healthy after restart", node_id)
+                        return
+                else:
+                    saw_offline = True
+            log.warning("Node %s did not return within restart timeout", node_id)
+        finally:
+            pending_restarts.pop(node_id, None)
+            await broadcast_nodes()
+
+    task = asyncio.create_task(_monitor())
+    pending_restarts[node_id] = {"deadline": deadline, "task": task}
 
 
 async def teardown_browser_node(node_id: str, *, remove_entry: bool = True) -> None:
@@ -308,6 +367,9 @@ def load_nodes() -> None:
                 item["audio_configured"] = True
             else:
                 item["audio_configured"] = bool(item.get("audio_configured"))
+            item["volume_percent"] = int(item.get("volume_percent", 75))
+            item["muted"] = bool(item.get("muted", False))
+            item["updating"] = bool(item.get("updating", False))
             nodes[item["id"]] = item
     except Exception:
         nodes = {}
@@ -503,6 +565,9 @@ async def set_node_volume(node_id: str, payload: VolumePayload) -> dict:
         result = {"sent": True}
     else:
         result = await _call_agent(node, "/volume", payload.model_dump())
+    node["volume_percent"] = int(payload.percent)
+    save_nodes()
+    await broadcast_nodes()
     return {"ok": True, "result": result}
 
 
@@ -522,6 +587,9 @@ async def set_node_mute(node_id: str, payload: dict = Body(...)) -> dict:
         result = {"sent": True}
     else:
         result = await _call_agent(node, "/mute", {"muted": bool(muted)})
+    node["muted"] = bool(muted)
+    save_nodes()
+    await broadcast_nodes()
     return {"ok": True, "result": result}
 
 
@@ -590,6 +658,20 @@ async def pair_node(node_id: str, payload: dict | None = Body(default=None)) -> 
     return {"ok": True}
 
 
+@app.post("/api/nodes/{node_id}/rename")
+async def rename_node(node_id: str, payload: RenameNodePayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    new_name = payload.name.strip()
+    if not new_name:
+        raise HTTPException(status_code=400, detail="Name must not be empty")
+    node["name"] = new_name
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True, "name": new_name}
+
+
 @app.post("/api/nodes/{node_id}/configure")
 async def configure_node(node_id: str) -> dict:
     node = nodes.get(node_id)
@@ -610,8 +692,24 @@ async def update_agent_node(node_id: str) -> dict:
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes cannot be updated from the controller")
     result = await _call_agent(node, "/update", {})
+    node["updating"] = True
+    save_nodes()
+    await broadcast_nodes()
     schedule_agent_refresh(node_id, delay=20.0)
     return {"ok": True, "result": result}
+
+
+@app.post("/api/nodes/{node_id}/restart")
+async def restart_agent_node(node_id: str) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "browser":
+        raise HTTPException(status_code=400, detail="Browser nodes cannot be restarted from the controller")
+    result = await _call_agent(node, "/restart", {})
+    schedule_restart_watch(node_id)
+    await broadcast_nodes()
+    return {"ok": True, "result": result, "timeout": NODE_RESTART_TIMEOUT}
 
 
 @app.delete("/api/nodes/{node_id}")

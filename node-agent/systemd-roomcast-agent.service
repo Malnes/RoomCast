@@ -9,6 +9,7 @@ Environment=PLAYBACK_DEVICE=hw:Loopback,0,0
 Environment=SNAPCLIENT_PORT=1704
 Environment=AGENT_SECRET_PATH=/var/lib/roomcast/agent-secret
 Environment=AGENT_CONFIG_PATH=/var/lib/roomcast/agent-config.json
+Environment=CAMILLA_RETRY_INTERVAL=5
 WorkingDirectory=/home/pi/roomcast/node-agent
 ExecStart=/usr/bin/python3 /home/pi/roomcast/node-agent/agent.py
 Restart=always

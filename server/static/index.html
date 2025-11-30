@@ -25,13 +25,17 @@
     textarea { min-height: 64px; }
     .muted { opacity: 0.7; }
     .label { font-size: 13px; color: #cbd5e1; margin-top: 6px; }
-    .error { background: #fecdd3; color: #7f1d1d; padding: 12px; border-radius: 12px; margin-top: 12px; }
-    .success { background: rgba(34,197,94,0.14); color: #bbf7d0; padding: 12px; border-radius: 12px; margin-top: 12px; }
+    .toast { position: fixed; top: 16px; left: 50%; transform: translate(-50%, -8px); min-width: 240px; max-width: 90vw; z-index: 1000; transition: opacity 0.2s ease, transform 0.2s ease; }
+    .error { background: #fecdd3; color: #7f1d1d; padding: 12px; border-radius: 12px; box-shadow: 0 15px 30px rgba(0,0,0,0.35); }
+    .success { background: rgba(34,197,94,0.14); color: #bbf7d0; padding: 12px; border-radius: 12px; box-shadow: 0 15px 30px rgba(0,0,0,0.35); }
     input[type=range] { accent-color: #22c55e; }
     button { background: linear-gradient(135deg, #22c55e, #16a34a); color: #0b1020; border: none; padding: 10px 14px; border-radius: 12px; cursor: pointer; font-weight: 700; width: 100%; transition: transform 0.08s ease, filter 0.12s ease; }
     button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95); }
     .small-btn { width: auto; padding: 8px 12px; }
     .node-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+    .node-gear { position: relative; }
+    .node-menu { position: absolute; top: calc(100% + 6px); right: 0; background: rgba(15,23,42,0.95); border: 1px solid rgba(255,255,255,0.08); border-radius: 12px; padding: 8px; display: none; flex-direction: column; gap: 6px; min-width: 180px; box-shadow: 0 18px 40px rgba(0,0,0,0.45); z-index: 20; }
+    .node-menu button { width: 100%; }
     .node-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
     .node-status { font-size: 12px; color: #cbd5e1; margin-top: 6px; display: flex; align-items: center; gap: 10px; }
     .status-pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; }
@@ -67,8 +71,8 @@
       </div>
     </header>
 
-    <div id="error" class="error" style="display:none;"></div>
-    <div id="success" class="success" style="display:none;"></div>
+    <div id="error" class="toast error" style="display:none; opacity:0;"></div>
+    <div id="success" class="toast success" style="display:none; opacity:0;"></div>
 
     <div class="panel" id="master-panel">
       <div class="section-title">Master volume</div>
@@ -236,20 +240,86 @@
     const eqOverlay = document.createElement('div');
     let discoverAbortController = null;
     let discoverResultsCount = 0;
+    let openNodeMenu = null;
+    let openNodeMenuId = null;
+
+    function hideNodeMenu(options = {}) {
+      if (openNodeMenu) {
+        openNodeMenu.style.display = 'none';
+      }
+      openNodeMenu = null;
+      if (!options.preserveId) {
+        openNodeMenuId = null;
+      }
+    }
+
+    document.addEventListener('click', () => hideNodeMenu());
 
     function clearMessages() {
       errorEl.style.display = 'none';
       successEl.style.display = 'none';
     }
 
+    const toastQueue = [];
+    let toastActive = false;
+
+    function showToast(el, msg, timeout = 3500) {
+      el.innerText = msg;
+      el.style.display = 'block';
+      el.style.opacity = '1';
+      el.style.transform = 'translateY(0)';
+      setTimeout(() => {
+        el.style.opacity = '0';
+        el.style.transform = 'translateY(-8px)';
+        setTimeout(() => {
+          el.style.display = 'none';
+        }, 200);
+      }, timeout);
+    }
+
+    function enqueueToast(el, msg, timeout) {
+      toastQueue.push({ el, msg, timeout });
+      if (!toastActive) runToastQueue();
+    }
+
+    function runToastQueue() {
+      if (!toastQueue.length) {
+        toastActive = false;
+        return;
+      }
+      toastActive = true;
+      const { el, msg, timeout } = toastQueue.shift();
+      showToast(el, msg, timeout);
+      setTimeout(runToastQueue, (timeout || 3500) + 250);
+    }
+
     function showError(msg) {
-      errorEl.innerText = msg;
-      errorEl.style.display = 'block';
+      enqueueToast(errorEl, msg, 4500);
     }
 
     function showSuccess(msg) {
-      successEl.innerText = msg;
-      successEl.style.display = 'block';
+      enqueueToast(successEl, msg, 3000);
+    }
+
+    async function ensureOk(res, fallback) {
+      if (res.ok) return res;
+      let detail = fallback || `HTTP ${res.status}`;
+      try {
+        const text = await res.text();
+        if (text) {
+          try {
+            const parsed = JSON.parse(text);
+            if (parsed?.detail) detail = parsed.detail;
+            else if (parsed?.message) detail = parsed.message;
+            else detail = text;
+          } catch (_) {
+            detail = text;
+          }
+        }
+      } catch (_) {
+        /* ignore body parse errors */
+      }
+      throw new Error(detail);
     }
 
     function describePan(value) {
@@ -259,9 +329,17 @@
       return num > 0 ? `Right ${pct}%` : `Left ${pct}%`;
     }
 
+    function applyMuteButtonState(btn, muted) {
+      const active = !!muted;
+      btn.dataset.muted = active ? 'true' : 'false';
+      btn.textContent = active ? 'Unmute' : 'Mute';
+      btn.style.background = active ? 'linear-gradient(135deg, #f59e0b, #d97706)' : '';
+    }
+
     let nodesCache = [];
     const eqState = {};
     const eqUpdateTimers = {};
+    const camillaPendingNodes = {};
     const EQ_FREQUENCIES = {
       peq15: [25, 40, 63, 100, 160, 250, 400, 630, 1000, 1600, 2500, 4000, 6300, 10000, 16000],
       peq31: [20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630, 800, 1000, 1250, 1600, 2000, 2500, 3150, 4000, 5000, 6300, 8000, 10000, 12500, 16000, 20000],
@@ -276,9 +354,12 @@
 
     function renderNodes(nodes) {
       nodesCache = nodes;
+      const reopenMenuNodeId = openNodeMenuId;
+      hideNodeMenu({ preserveId: true });
       nodesEl.innerHTML = '';
       if (!nodes.length) {
         nodesEl.innerHTML = '<div class="muted">No nodes registered yet.</div>';
+        Object.keys(camillaPendingNodes).forEach(id => delete camillaPendingNodes[id]);
         return;
       }
       nodes.forEach(n => {
@@ -287,14 +368,61 @@
         wrapper.className = 'panel';
         const header = document.createElement('div');
         header.className = 'node-header';
-        header.innerHTML = `<div><strong>${n.name}</strong></div>`;
+        const title = document.createElement('div');
+        title.innerHTML = `<strong>${n.name}</strong>`;
+        header.appendChild(title);
+
+        const gearWrap = document.createElement('div');
+        gearWrap.className = 'node-gear';
+        const gearBtn = document.createElement('button');
+        gearBtn.className = 'icon-btn small-btn';
+        gearBtn.textContent = '⚙︎';
+        const gearMenu = document.createElement('div');
+        gearMenu.className = 'node-menu';
+        gearMenu.addEventListener('click', (event) => event.stopPropagation());
+        const addMenuButton = (label, handler) => {
+          const btn = document.createElement('button');
+          btn.className = 'small-btn';
+          btn.textContent = label;
+          btn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            hideNodeMenu();
+            if (typeof handler === 'function') handler(btn);
+          });
+          gearMenu.appendChild(btn);
+          return btn;
+        };
+        gearBtn.addEventListener('click', (event) => {
+          event.stopPropagation();
+          if (openNodeMenu === gearMenu) {
+            hideNodeMenu();
+            return;
+          }
+          hideNodeMenu();
+          gearMenu.style.display = 'flex';
+          openNodeMenu = gearMenu;
+          openNodeMenuId = n.id;
+        });
+        gearWrap.appendChild(gearBtn);
+        gearWrap.appendChild(gearMenu);
+        addMenuButton('Rename', () => renameNode(n.id, n.name));
+        header.appendChild(gearWrap);
         wrapper.appendChild(header);
+        if (reopenMenuNodeId && reopenMenuNodeId === n.id) {
+          gearMenu.style.display = 'flex';
+          openNodeMenu = gearMenu;
+          openNodeMenuId = n.id;
+        }
 
         const statusRow = document.createElement('div');
         statusRow.className = 'node-status';
         const isBrowser = n.type === 'browser';
         const paired = !!n.paired;
         const configured = isBrowser ? true : !!n.configured;
+        const restarting = !!n.restarting;
+        const updateAvailable = n.update_available !== false;
+        const updating = !!n.updating;
+        const disableAgentControls = !isBrowser && (!paired || !configured || restarting);
         const typePill = document.createElement('span');
         typePill.className = `status-pill ${isBrowser || paired ? 'ok' : 'warn'}`;
         typePill.textContent = isBrowser ? 'Browser node' : paired ? 'Paired' : 'Pairing required';
@@ -312,24 +440,53 @@
         if (!isBrowser) {
           const versionMeta = document.createElement('div');
           versionMeta.className = 'label';
-          versionMeta.textContent = n.agent_version ? `Agent ${n.agent_version}` : 'Agent version unknown';
+          if (n.agent_version) {
+            let suffix = '';
+            if (updating) suffix = ' (updating…)';
+            else if (!updateAvailable) suffix = ' (latest)';
+            versionMeta.textContent = `Agent ${n.agent_version}${suffix}`;
+          } else {
+            versionMeta.textContent = 'Agent version unknown';
+          }
           statusRow.appendChild(versionMeta);
+        }
+        if (restarting) {
+          const restartPill = document.createElement('span');
+          restartPill.className = 'status-pill warn';
+          restartPill.textContent = 'Restarting';
+          statusRow.appendChild(restartPill);
+        }
+        if (updating) {
+          const updatingPill = document.createElement('span');
+          updatingPill.className = 'status-pill warn';
+          updatingPill.textContent = 'Updating';
+          statusRow.appendChild(updatingPill);
         }
         wrapper.appendChild(statusRow);
 
-        const volLabel = document.createElement('div');
-        volLabel.className = 'label';
-        volLabel.innerText = 'Volume';
-        wrapper.appendChild(volLabel);
+        const volRow = document.createElement('div');
+        volRow.style.display = 'grid';
+        volRow.style.gridTemplateColumns = 'auto minmax(0, 1fr)';
+        volRow.style.alignItems = 'center';
+        volRow.style.gap = '8px';
+        const muteBtn = document.createElement('button');
+        muteBtn.className = 'small-btn';
+        muteBtn.textContent = 'Mute';
+        muteBtn.disabled = disableAgentControls;
+        muteBtn.addEventListener('click', () => toggleMute(n.id, muteBtn));
+        applyMuteButtonState(muteBtn, n.muted === true);
+        volRow.appendChild(muteBtn);
         const volInput = document.createElement('input');
         volInput.type = 'range';
         volInput.min = 0;
         volInput.max = 100;
-        volInput.value = 75;
-        const disableAgentControls = !isBrowser && (!paired || !configured);
+        const parsedVolume = Number(n.volume_percent);
+        volInput.value = Number.isFinite(parsedVolume) ? parsedVolume : 75;
         volInput.disabled = disableAgentControls;
+        volInput.style.width = '100%';
         volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
-        wrapper.appendChild(volInput);
+        volRow.appendChild(volInput);
+        wrapper.appendChild(volRow);
 
         if (n.type === 'browser') {
           const panLabel = document.createElement('div');
@@ -363,54 +520,50 @@
 
         const actions = document.createElement('div');
         actions.className = 'node-actions';
-        const muteBtn = document.createElement('button');
-        muteBtn.className = 'small-btn';
-        muteBtn.textContent = 'Mute';
-        muteBtn.disabled = disableAgentControls;
-        muteBtn.addEventListener('click', () => toggleMute(n.id, muteBtn));
         const eqBtn = document.createElement('button');
         eqBtn.className = 'small-btn';
         eqBtn.textContent = 'EQ';
-        eqBtn.disabled = n.type !== 'browser' && (!paired || !configured);
+        eqBtn.disabled = n.type !== 'browser' && (!paired || !configured || restarting);
         eqBtn.addEventListener('click', () => openEqModal(n.id, n.name));
+        actions.appendChild(eqBtn);
         if (n.type !== 'browser') {
-          const pairBtn = document.createElement('button');
-          pairBtn.className = 'small-btn';
-          pairBtn.textContent = paired ? 'Rotate key' : 'Pair node';
+          const pairBtn = addMenuButton(paired ? 'Rotate key' : 'Pair node', (btn) => pairNode(n.id, btn));
+          pairBtn.disabled = restarting;
           if (!paired) {
             pairBtn.style.background = 'linear-gradient(135deg, #f97316, #ea580c)';
           }
-          pairBtn.addEventListener('click', () => pairNode(n.id, pairBtn));
-          actions.appendChild(pairBtn);
-          const configBtn = document.createElement('button');
-          configBtn.className = 'small-btn';
-          configBtn.textContent = configured ? 'Reconfigure audio' : 'Configure audio';
-          configBtn.disabled = !paired;
+          const configBtn = addMenuButton(configured ? 'Reconfigure audio' : 'Configure audio', (btn) => configureNode(n.id, btn));
+          configBtn.disabled = !paired || restarting;
           if (!configured) {
             configBtn.style.background = 'linear-gradient(135deg, #22c55e, #16a34a)';
           }
-          configBtn.addEventListener('click', () => configureNode(n.id, configBtn));
-          actions.appendChild(configBtn);
-
-          const updateBtn = document.createElement('button');
-          updateBtn.className = 'small-btn';
-          updateBtn.textContent = 'Update node';
-          updateBtn.disabled = !paired;
-          updateBtn.addEventListener('click', () => updateNode(n.id, updateBtn));
-          actions.appendChild(updateBtn);
+          const restartBtn = addMenuButton(restarting ? 'Restarting…' : 'Restart node', (btn) => restartNode(n.id, btn));
+          restartBtn.disabled = !paired || restarting;
+          if (updateAvailable) {
+            const updateBtn = document.createElement('button');
+            updateBtn.className = 'small-btn';
+            updateBtn.textContent = updating ? 'Updating…' : 'Update node';
+            updateBtn.disabled = !paired || restarting || updating;
+            if (!updating) {
+              updateBtn.addEventListener('click', () => updateNode(n.id, updateBtn));
+            }
+            actions.appendChild(updateBtn);
+          }
         }
-        const removeBtn = document.createElement('button');
-        removeBtn.className = 'small-btn';
+        const removeBtn = addMenuButton('Unregister', () => unregisterNode(n.id));
         removeBtn.style.background = 'linear-gradient(135deg, #ef4444, #dc2626)';
-        removeBtn.textContent = 'Unregister';
-        removeBtn.addEventListener('click', () => unregisterNode(n.id));
-        actions.appendChild(muteBtn);
-        actions.appendChild(eqBtn);
-        actions.appendChild(removeBtn);
         wrapper.appendChild(actions);
 
         nodesEl.appendChild(wrapper);
       });
+
+      const nodeIds = new Set(nodes.map(n => n.id));
+      Object.keys(camillaPendingNodes).forEach(id => {
+        if (!nodeIds.has(id)) delete camillaPendingNodes[id];
+      });
+      if (reopenMenuNodeId && !openNodeMenu) {
+        openNodeMenuId = null;
+      }
     }
 
     function renderClients(groups, target) {
@@ -472,7 +625,7 @@
       try {
         clearMessages();
         const res = await fetch('/api/snapcast/status');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         const data = await res.json();
         renderClients(data.server?.groups || [], clientsSettingsEl);
       } catch (err) {
@@ -483,7 +636,7 @@
     async function fetchNodes() {
       try {
         const res = await fetch('/api/nodes');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         const data = await res.json();
         renderNodes(data.nodes || []);
       } catch (err) {
@@ -494,7 +647,7 @@
     async function fetchSpotifyConfig() {
       try {
         const res = await fetch('/api/config/spotify');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         const cfg = await res.json();
         spUsername.value = cfg.username || '';
         spName.value = cfg.device_name || 'RoomCast';
@@ -513,7 +666,7 @@
     async function fetchLibrespotStatus() {
       try {
         const res = await fetch('/api/librespot/status');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         const data = await res.json();
         librespotStatus.innerText = `Status: ${data.state || 'unknown'}${data.message ? ' – ' + data.message : ''}`;
       } catch (err) {
@@ -574,7 +727,7 @@
 
       try {
         const res = await fetch('/api/nodes/discover', { signal: discoverAbortController.signal });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         if (!res.body) throw new Error('Streaming not supported in this browser');
         const reader = res.body.getReader();
         while (true) {
@@ -615,7 +768,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ percent: Number(percent) }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
       } catch (err) {
         showError(`Failed to set volume: ${err.message}`);
       }
@@ -628,7 +781,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ percent: Number(percent) }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         showSuccess('Node volume updated');
       } catch (err) {
         showError(`Failed to set node volume: ${err.message}`);
@@ -643,7 +796,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ pan: clamped }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         showSuccess('Web node pan updated');
       } catch (err) {
         showError(`Failed to set pan: ${err.message}`);
@@ -660,16 +813,10 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ muted: !currentlyMuted }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         const data = await res.json();
         const muted = data?.result?.muted ?? !currentlyMuted;
-        btn.dataset.muted = muted ? 'true' : 'false';
-        btn.textContent = muted ? 'Unmute' : 'Mute';
-        if (muted) {
-          btn.style.background = 'linear-gradient(135deg, #f59e0b, #d97706)';
-        } else {
-          btn.style.background = '';
-        }
+        applyMuteButtonState(btn, muted);
       } catch (err) {
         showError(`Failed to toggle mute: ${err.message}`);
       } finally {
@@ -685,7 +832,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ force: true }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         showSuccess('Node paired');
         await fetchNodes();
       } catch (err) {
@@ -695,11 +842,33 @@
       }
     }
 
+    async function renameNode(nodeId, currentName) {
+      const nextName = prompt('Rename node', currentName || 'Node');
+      if (nextName === null) return;
+      const trimmed = nextName.trim();
+      if (!trimmed) {
+        showError('Node name cannot be empty');
+        return;
+      }
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/rename`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: trimmed }),
+        });
+        await ensureOk(res);
+        showSuccess('Node renamed');
+        await fetchNodes();
+      } catch (err) {
+        showError(`Failed to rename node: ${err.message}`);
+      }
+    }
+
     async function configureNode(nodeId, btn) {
       if (btn) btn.disabled = true;
       try {
         const res = await fetch(`/api/nodes/${nodeId}/configure`, { method: 'POST' });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         showSuccess('Node audio configured');
         await fetchNodes();
       } catch (err) {
@@ -710,23 +879,52 @@
     }
 
     async function updateNode(nodeId, btn) {
-      if (btn) btn.disabled = true;
+      const originalLabel = btn ? btn.textContent : '';
+      let failed = false;
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Updating…';
+      }
       try {
         const res = await fetch(`/api/nodes/${nodeId}/update`, { method: 'POST' });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         showSuccess('Node update triggered. Agent will restart shortly.');
+        fetchNodes();
         setTimeout(fetchNodes, 15000);
       } catch (err) {
         showError(`Failed to update node: ${err.message}`);
+        failed = true;
       } finally {
-        if (btn) btn.disabled = false;
+        if (btn && failed) {
+          btn.disabled = false;
+          btn.textContent = originalLabel || 'Update node';
+        }
+      }
+    }
+
+    async function restartNode(nodeId, btn) {
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = 'Restarting…';
+      }
+      try {
+        const res = await fetch(`/api/nodes/${nodeId}/restart`, { method: 'POST' });
+        await ensureOk(res);
+        showSuccess('Node restart requested');
+        await fetchNodes();
+      } catch (err) {
+        showError(`Failed to restart node: ${err.message}`);
+        if (btn) {
+          btn.disabled = false;
+          btn.textContent = 'Restart node';
+        }
       }
     }
 
     async function unregisterNode(nodeId) {
       try {
         const res = await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         showSuccess('Node unregistered');
         await fetchNodes();
       } catch (err) {
@@ -801,6 +999,19 @@
       eqUpdateTimers[nodeId] = setTimeout(() => pushEq(nodeId), EQ_PUSH_DEBOUNCE_MS);
     }
 
+    function handleCamillaPending(nodeId, pending) {
+      const prev = camillaPendingNodes[nodeId] || false;
+      camillaPendingNodes[nodeId] = pending;
+      if (prev === pending) return;
+      const node = nodesCache.find(n => n.id === nodeId);
+      const label = node?.name || 'Node';
+      if (pending) {
+        showError(`${label}: EQ queued until DSP is available`);
+      } else {
+        showSuccess(`${label}: EQ applied after DSP recovery`);
+      }
+    }
+
     async function pushEq(nodeId) {
       const state = getEqState(nodeId);
       const payload = {
@@ -818,7 +1029,15 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (_) {
+          data = null;
+        }
+        const pending = !!data?.result?.camilla_pending;
+        handleCamillaPending(nodeId, pending);
       } catch (err) {
         showError(`Failed to update EQ: ${err.message}`);
       }
@@ -1029,7 +1248,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ percent: Number(percent) }),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
       } catch (err) {
         showError(`Failed to set master volume: ${err.message}`);
       }
@@ -1045,7 +1264,7 @@
     async function fetchPlayerStatus() {
       try {
         const res = await fetch('/api/spotify/player/status');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         playerStatus = await res.json();
         renderPlayer(playerStatus);
       } catch (err) {
@@ -1101,7 +1320,7 @@
     async function playerAction(path, body) {
       try {
         const res = await fetch(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         setTimeout(fetchPlayerStatus, 500);
       } catch (err) {
         showError(`Player action failed: ${err.message}`);
@@ -1111,7 +1330,7 @@
     async function startSpotifyAuth() {
       try {
         const res = await fetch('/api/spotify/auth-url');
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         const data = await res.json();
         if (data.url) window.open(data.url, '_blank');
       } catch (err) {
@@ -1148,7 +1367,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         showSuccess('Node registered');
         await fetchNodes();
       } finally {
@@ -1178,7 +1397,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        await ensureOk(res);
         spPassword.value = '';
         showSuccess('Spotify config saved. Librespot will reload and connect.');
         await pollLibrespotStatus();

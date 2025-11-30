@@ -11,6 +11,7 @@ CAMILLA_VERSION="3.0.1"
 CAMILLA_PORT="1234"
 CAMILLA_ARCHIVE=""
 CAMILLA_REPO="HEnquist/camilladsp"
+CAMILLA_RETRY_INTERVAL="5"
 UPDATE_HELPER="/usr/local/bin/roomcast-updater"
 UPDATE_ENV="/etc/roomcast/update-env"
 SUDOERS_SNIPPET="/etc/sudoers.d/roomcast-agent"
@@ -30,6 +31,7 @@ Options:
   --mixer <name>          ALSA mixer control to adjust (default: Master)
   --playback-device <d>   ALSA playback device for CamillaDSP output (default: plughw:0,0)
   --camilla-port <port>   CamillaDSP control port (default: 1234)
+  --camilla-retry <sec>   Seconds between CamillaDSP retry attempts (default: 5)
   -h, --help              Show this help message
 
 Example:
@@ -52,6 +54,7 @@ write_update_env() {
     printf 'MIXER_CONTROL=%q\n' "$MIXER_CONTROL"
     printf 'PLAYBACK_DEVICE=%q\n' "$PLAYBACK_DEVICE"
     printf 'CAMILLA_PORT=%q\n' "$CAMILLA_PORT"
+    printf 'CAMILLA_RETRY_INTERVAL=%q\n' "$CAMILLA_RETRY_INTERVAL"
   } >"$UPDATE_ENV"
   chmod 600 "$UPDATE_ENV"
 }
@@ -75,6 +78,7 @@ SNAP_PORT=${SNAP_PORT:-1704}
 MIXER_CONTROL=${MIXER_CONTROL:-Master}
 PLAYBACK_DEVICE=${PLAYBACK_DEVICE:-plughw:0,0}
 CAMILLA_PORT=${CAMILLA_PORT:-1234}
+CAMILLA_RETRY_INTERVAL=${CAMILLA_RETRY_INTERVAL:-5}
 
 TMP_SCRIPT=$(mktemp)
 cleanup() { rm -f "$TMP_SCRIPT"; }
@@ -89,7 +93,8 @@ bash "$TMP_SCRIPT" \
   --snap-port "$SNAP_PORT" \
   --mixer "$MIXER_CONTROL" \
   --playback-device "$PLAYBACK_DEVICE" \
-  --camilla-port "$CAMILLA_PORT"
+  --camilla-port "$CAMILLA_PORT" \
+  --camilla-retry "$CAMILLA_RETRY_INTERVAL"
 EOF
   chmod 750 "$UPDATE_HELPER"
   chown root:root "$UPDATE_HELPER"
@@ -139,6 +144,8 @@ parse_args() {
         PLAYBACK_DEVICE="$2"; shift 2 ;;
       --camilla-port)
         CAMILLA_PORT="$2"; shift 2 ;;
+      --camilla-retry)
+        CAMILLA_RETRY_INTERVAL="$2"; shift 2 ;;
       -h|--help)
         usage; exit 0 ;;
       *)
@@ -273,6 +280,7 @@ Environment=CAMILLA_HOST=127.0.0.1
 Environment=CAMILLA_PORT=${CAMILLA_PORT}
 Environment=CAMILLA_FILTER_PATH=filters.peq_stack
 Environment=CAMILLA_MAX_BANDS=31
+Environment=CAMILLA_RETRY_INTERVAL=${CAMILLA_RETRY_INTERVAL}
 Environment=AGENT_SECRET_PATH=${AGENT_SECRET_PATH}
 Environment=AGENT_CONFIG_PATH=${AGENT_CONFIG_PATH}
 WorkingDirectory=${INSTALL_DIR}/node-agent

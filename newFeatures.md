@@ -1,0 +1,1 @@
+- Some hardware nodes may have multiple available outputs. These available outputs should be selectable from the node settings in the main serever webUI. Also remember that the selected EQ must work no matter what output i have selected

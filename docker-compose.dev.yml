@@ -5,13 +5,14 @@ services:
     volumes:
       - ./server:/app
       - config:/config
-    environment:
-      DISCOVERY_CIDR: 172.20.0.0/24
+    network_mode: host
+    # DISCOVERY_CIDR is no longer hardcoded
 
   node-agent-dev:
     build: ./node-agent
     environment:
       AGENT_DRY_RUN: "true"
+      CAMILLA_ENABLED: "0"
     ports:
       - "9700:9700"
     command: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "9700"]
@@ -21,3 +22,6 @@ services:
     depends_on:
       - snapserver
     command: ["-h", "snapserver", "--player", "null"]
+
+volumes:
+  config:
