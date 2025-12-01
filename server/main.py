@@ -42,7 +42,7 @@ NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.3").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.4").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
@@ -90,8 +90,6 @@ class WebNodeOffer(BaseModel):
 
 
 class SpotifyConfig(BaseModel):
-    username: Optional[str] = ""
-    password: Optional[str] = ""
     device_name: str = Field(default="RoomCast")
     bitrate: int = Field(default=320, ge=96, le=320)
     initial_volume: int = Field(default=75, ge=0, le=100)
@@ -160,6 +158,7 @@ def public_node(node: dict) -> dict:
     else:
         data["configured"] = bool(node.get("audio_configured"))
     data["agent_version"] = node.get("agent_version")
+    data["latest_agent_version"] = AGENT_LATEST_VERSION or None
     data["volume_percent"] = int(node.get("volume_percent", 75))
     data["muted"] = bool(node.get("muted"))
     data["updating"] = bool(node.get("updating"))
@@ -1193,7 +1192,6 @@ async def get_spotify_config() -> dict:
 @app.post("/api/config/spotify")
 async def set_spotify_config(cfg: SpotifyConfig) -> dict:
     payload = cfg.model_dump()
-    # Merge with existing so blank/placeholder secrets don't erase values
     existing = {}
     if CONFIG_PATH.exists():
         try:
@@ -1201,8 +1199,6 @@ async def set_spotify_config(cfg: SpotifyConfig) -> dict:
         except json.JSONDecodeError:
             existing = {}
 
-    if not payload.get("password"):
-        payload["password"] = existing.get("password")
     if not payload.get("client_secret"):
         payload["client_secret"] = existing.get("client_secret") or os.getenv("SPOTIFY_CLIENT_SECRET")
     if not payload.get("client_id"):
@@ -1210,13 +1206,13 @@ async def set_spotify_config(cfg: SpotifyConfig) -> dict:
     if not payload.get("redirect_uri"):
         payload["redirect_uri"] = existing.get("redirect_uri") or SPOTIFY_REDIRECT_URI
 
-    # Update env-backed defaults if provided
     if payload.get("client_id"):
         os.environ["SPOTIFY_CLIENT_ID"] = payload["client_id"]
     if payload.get("client_secret"):
         os.environ["SPOTIFY_CLIENT_SECRET"] = payload["client_secret"]
     if payload.get("redirect_uri"):
         os.environ["SPOTIFY_REDIRECT_URI"] = payload["redirect_uri"]
+
     CONFIG_PATH.write_text(json.dumps(payload, indent=2))
     return {"ok": True, "config": read_spotify_config()}
 
@@ -1232,7 +1228,7 @@ async def spotify_auth_url() -> dict:
     if not (cid and secret):
         raise HTTPException(status_code=400, detail="Spotify client_id/client_secret not set")
     state = TOKEN_SIGNER.dumps({"t": time.time()})
-    scope = "user-read-playback-state user-modify-playback-state"
+    scope = "user-read-playback-state user-modify-playback-state streaming user-read-email user-read-private"
     params = {
         "client_id": cid,
         "response_type": "code",

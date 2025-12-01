@@ -9,13 +9,13 @@ import shlex
 import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.3")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.4")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -323,43 +323,56 @@ def _list_mixer_controls() -> list[str]:
     return names
 
 
-def _resolved_mixer_control() -> str:
-    global _resolved_control
+def _mixer_candidate_order() -> list[str]:
+    candidates: list[str] = []
+
+    def add(name: Optional[str]) -> None:
+        normalized = (name or "").strip()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+
     if _resolved_control:
-        return _resolved_control
+        add(_resolved_control)
 
     preferred = (MIXER_CONTROL or "Master").strip() or "Master"
-    if DRY_RUN:
-        _resolved_control = preferred
-        return preferred
+    add(preferred)
+    for fallback in MIXER_FALLBACKS:
+        add(fallback)
 
-    controls = _list_mixer_controls()
-    if not controls:
-        _resolved_control = preferred
-        return preferred
+    for detected in _list_mixer_controls():
+        add(detected)
 
-    if preferred in controls:
-        _resolved_control = preferred
-        return preferred
+    if not candidates:
+        candidates.append(preferred)
+    return candidates
 
-    for candidate in [c for c in MIXER_FALLBACKS if c]:
-        if candidate in controls:
-            log.warning(
-                "Mixer control '%s' not available, using '%s'. Set MIXER_CONTROL to override.",
-                preferred,
-                candidate,
+
+def _try_mixer_command(builder: Callable[[str], list[str]]) -> None:
+    last_error: Optional[str] = None
+    for control in _mixer_candidate_order():
+        args = builder(control)
+        try:
+            subprocess.run(
+                args,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
             )
-            _resolved_control = candidate
-            return candidate
+        except FileNotFoundError:
+            raise HTTPException(status_code=500, detail="amixer not installed")
+        except subprocess.CalledProcessError as exc:
+            detail = exc.stderr.decode(errors="ignore") or str(exc)
+            log.warning("Mixer control '%s' failed via amixer: %s", control, detail.strip() or detail)
+            last_error = detail
+            continue
+        global _resolved_control
+        _resolved_control = control
+        return
 
-    fallback = controls[0]
-    log.warning(
-        "Mixer control '%s' not available, falling back to '%s'. Set MIXER_CONTROL to override.",
-        preferred,
-        fallback,
+    raise HTTPException(
+        status_code=500,
+        detail=last_error or "Unable to control mixer. Set MIXER_CONTROL to a valid ALSA control.",
     )
-    _resolved_control = fallback
-    return fallback
 
 
 def _snapclient_args(config: dict) -> list[str]:
@@ -653,36 +666,15 @@ def _auth(request: Request) -> None:
 def _amixer_set(percent: int) -> None:
     if DRY_RUN:
         return
-    control = _resolved_mixer_control()
-    try:
-        subprocess.run(
-            ["amixer", "-M", "set", control, f"{percent}%"],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="amixer not installed")
-    except subprocess.CalledProcessError as exc:
-        raise HTTPException(status_code=500, detail=exc.stderr.decode() or str(exc))
+    clamped = max(0, min(100, int(percent)))
+    _try_mixer_command(lambda control: ["amixer", "-M", "set", control, f"{clamped}%"])
 
 
 def _amixer_mute(muted: bool) -> None:
     if DRY_RUN:
         return
     cmd = "mute" if muted else "unmute"
-    control = _resolved_mixer_control()
-    try:
-        subprocess.run(
-            ["amixer", "-M", "set", control, cmd],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        raise HTTPException(status_code=500, detail="amixer not installed")
-    except subprocess.CalledProcessError as exc:
-        raise HTTPException(status_code=500, detail=exc.stderr.decode() or str(exc))
+    _try_mixer_command(lambda control: ["amixer", "-M", "set", control, cmd])
 
 
 async def _run_maintenance_command(args: list[str], label: str) -> None:

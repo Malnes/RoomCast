@@ -1,0 +1,1 @@
+- hide "last seen". Dont need it

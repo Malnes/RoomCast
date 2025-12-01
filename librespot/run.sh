@@ -3,6 +3,7 @@ set -euo pipefail
 
 CONFIG_PATH=${CONFIG_PATH:-/config/spotify.json}
 STATUS_PATH=${STATUS_PATH:-/config/librespot-status.json}
+TOKEN_PATH=${SPOTIFY_TOKEN_PATH:-/config/spotify-token.json}
 FIFO_PATH=${FIFO_PATH:-/tmp/snapfifo}
 FALLBACK_NAME=${LIBRESPOT_FALLBACK_NAME:-RoomCast}
 LIBRESPOT_BIN=${LIBRESPOT_BIN:-/usr/bin/librespot}
@@ -24,11 +25,28 @@ write_status() {
 }
 
 hash_config() {
+  local cfg_hash=""
+  local token_hash=""
   if [ -f "$CONFIG_PATH" ]; then
-    sha1sum "$CONFIG_PATH" | awk '{print $1}'
-  else
-    echo ""
+    cfg_hash=$(sha1sum "$CONFIG_PATH" | awk '{print $1}')
   fi
+  if [ -f "$TOKEN_PATH" ]; then
+    token_hash=$(sha1sum "$TOKEN_PATH" | awk '{print $1}')
+  fi
+  echo "${cfg_hash}:${token_hash}"
+}
+
+read_access_token() {
+  if [ ! -s "$TOKEN_PATH" ]; then
+    echo ""
+    return
+  fi
+  local token
+  if ! token=$(jq -r '.access_token // empty' "$TOKEN_PATH" 2>/dev/null); then
+    echo ""
+    return
+  fi
+  echo "$token"
 }
 
 load_cfg() {
@@ -36,14 +54,13 @@ load_cfg() {
     write_status "waiting_for_config" "Waiting for config at $CONFIG_PATH"
     return 1
   fi
-  USERNAME=$(jq -r '.username // empty' "$CONFIG_PATH")
-  PASSWORD=$(jq -r '.password // empty' "$CONFIG_PATH")
   DEVICE_NAME=$(jq -r '.device_name // empty' "$CONFIG_PATH")
   BITRATE=$(jq -r '.bitrate // 320' "$CONFIG_PATH")
   INITIAL_VOLUME=$(jq -r '.initial_volume // 75' "$CONFIG_PATH")
   NORMALISATION=$(jq -r '.normalisation // true' "$CONFIG_PATH")
-  if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
-    write_status "waiting_for_config" "Config missing username/password"
+  ACCESS_TOKEN=$(read_access_token)
+  if [ -z "$ACCESS_TOKEN" ]; then
+    write_status "waiting_for_oauth" "Link Spotify in RoomCast to generate an access token"
     return 1
   fi
   return 0
@@ -61,8 +78,7 @@ start_librespot() {
     --name "${DEVICE_NAME:-$FALLBACK_NAME}" \
     --backend pipe \
     --device "$FIFO_PATH" \
-    --username "$USERNAME" \
-    --password "$PASSWORD" \
+    --access-token "$ACCESS_TOKEN" \
     --bitrate "$BITRATE" \
     --initial-volume "$INITIAL_VOLUME" \
     $( [ "$NORMALISATION" = "true" ] && echo "--enable-volume-normalisation" ) \
@@ -74,6 +90,7 @@ start_librespot() {
 LIBRESPOT_PID=""
 LAST_HASH=""
 LAST_START=0
+ACCESS_TOKEN=""
 
 while true; do
   load_cfg || { sleep 3; continue; }

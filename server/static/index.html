@@ -119,14 +119,6 @@
         <div class="muted" id="librespot-status" style="margin-bottom:8px;">Status: unknown</div>
         <div class="grid">
           <div>
-            <label>Username</label>
-            <input id="sp-username" placeholder="user@example.com" autocomplete="off">
-          </div>
-          <div>
-            <label>Password</label>
-            <input id="sp-password" type="password" placeholder="••••••••">
-          </div>
-          <div>
             <label>Spotify client ID</label>
             <input id="sp-client-id" placeholder="client id">
           </div>
@@ -165,7 +157,8 @@
           <div style="margin-top:8px;">
           <button class="small-btn" id="spotify-auth">Link Spotify account</button>
           <button class="small-btn" id="spotify-dashboard">Open Spotify developer dashboard</button>
-          <div class="muted" style="font-size:12px;">Use dashboard to create Client ID/Secret, then Save and Link.</div>
+          <div id="spotify-link-status" class="status-pill warn" style="margin-top:6px;">Account link status: unknown</div>
+          <div class="muted" style="font-size:12px;">Create Client ID/Secret in the dashboard, save them here, then click “Link Spotify account”. Password sign-ins are no longer supported.</div>
           </div>
         </div>
       </div>
@@ -203,8 +196,6 @@
     const refreshNodesBtn = document.getElementById('refresh-nodes');
     const discoverBtn = document.getElementById('discover-nodes');
     const saveSpotifyBtn = document.getElementById('save-spotify');
-    const spUsername = document.getElementById('sp-username');
-    const spPassword = document.getElementById('sp-password');
     const spClientId = document.getElementById('sp-client-id');
     const spClientSecret = document.getElementById('sp-client-secret');
     const spRedirect = document.getElementById('sp-redirect');
@@ -358,6 +349,7 @@
     }
 
     let nodesCache = [];
+    let pendingNodesRender = null;
     const eqState = {};
     const eqUpdateTimers = {};
     const camillaPendingNodes = {};
@@ -372,9 +364,54 @@
     let eqModal = null;
     const spotifyAuthBtn = document.getElementById('spotify-auth');
     const spotifyDashboardBtn = document.getElementById('spotify-dashboard');
+    const spotifyLinkStatus = document.getElementById('spotify-link-status');
+
+    function isInteractiveNodeElement(el) {
+      if (!el) return false;
+      const tag = el.tagName;
+      if (tag === 'SELECT' || tag === 'TEXTAREA') return true;
+      if (tag === 'INPUT') {
+        const type = (el.type || '').toLowerCase();
+        return type !== 'button' && type !== 'submit' && type !== 'reset';
+      }
+      return false;
+    }
+
+    function shouldDeferNodeRender() {
+      const active = document.activeElement;
+      if (!active) return false;
+      if (!nodesEl.contains(active)) return false;
+      return isInteractiveNodeElement(active);
+    }
+
+    function flushPendingNodesRender() {
+      if (!pendingNodesRender || shouldDeferNodeRender()) return;
+      const next = pendingNodesRender;
+      pendingNodesRender = null;
+      commitRenderNodes(next);
+    }
+
+    nodesEl.addEventListener('focusout', () => {
+      setTimeout(() => {
+        if (!shouldDeferNodeRender()) {
+          flushPendingNodesRender();
+        }
+      }, 0);
+    }, true);
+
+    document.addEventListener('visibilitychange', () => {
+      if (!shouldDeferNodeRender()) {
+        flushPendingNodesRender();
+      }
+    });
 
     function renderNodes(nodes) {
       nodesCache = nodes;
+      pendingNodesRender = nodes;
+      flushPendingNodesRender();
+    }
+
+    function commitRenderNodes(nodes) {
       const reopenMenuNodeId = openNodeMenuId;
       hideNodeMenu({ preserveId: true });
       nodesEl.innerHTML = '';
@@ -441,7 +478,6 @@
         const paired = !!n.paired;
         const configured = isBrowser ? true : !!n.configured;
         const online = isBrowser ? true : n.online !== false;
-        const lastSeenText = formatTimestamp(n.last_seen);
         const offlineSinceText = !online ? formatTimestamp(n.offline_since) : '';
         const restarting = !!n.restarting;
         const updateAvailable = n.update_available !== false;
@@ -475,10 +511,15 @@
           const versionMeta = document.createElement('div');
           versionMeta.className = 'label';
           if (n.agent_version) {
-            let suffix = '';
-            if (updating) suffix = ' (updating…)';
-            else if (!updateAvailable) suffix = ' (latest)';
-            versionMeta.textContent = `Agent ${n.agent_version}${suffix}`;
+            let text = `Agent ${n.agent_version}`;
+            if (updating) {
+              text += ' (updating…)';
+            } else if (updateAvailable && n.latest_agent_version) {
+              text += ` → ${n.latest_agent_version}`;
+            } else if (!updateAvailable) {
+              text += ' (latest)';
+            }
+            versionMeta.textContent = text;
           } else {
             versionMeta.textContent = 'Agent version unknown';
           }
@@ -496,19 +537,11 @@
           updatingPill.textContent = 'Updating';
           statusRow.appendChild(updatingPill);
         }
-        if (!isBrowser) {
+        if (!isBrowser && !online && offlineSinceText) {
           const meta = document.createElement('div');
           meta.className = 'label';
-          if (!online && offlineSinceText) {
-            meta.textContent = `Offline since ${offlineSinceText}`;
-          } else if (online && lastSeenText) {
-            meta.textContent = `Last seen ${lastSeenText}`;
-          } else {
-            meta.textContent = '';
-          }
-          if (meta.textContent) {
-            statusRow.appendChild(meta);
-          }
+          meta.textContent = `Offline since ${offlineSinceText}`;
+          statusRow.appendChild(meta);
         }
         wrapper.appendChild(statusRow);
 
@@ -544,8 +577,8 @@
           outputLabel.innerText = 'Audio output';
           const outputSelect = document.createElement('select');
           outputSelect.style.width = '100%';
-          outputSelect.disabled = disableAgentControls || updating || !outputOptions.length;
           const mappedOptions = [...outputOptions];
+          outputSelect.disabled = disableAgentControls || updating || !mappedOptions.length;
           if (selectedOutput && !mappedOptions.some(opt => opt.id === selectedOutput)) {
             mappedOptions.unshift({ id: selectedOutput, label: `${selectedOutput} (current)` });
           }
@@ -755,15 +788,23 @@
         const res = await fetch('/api/config/spotify');
         await ensureOk(res);
         const cfg = await res.json();
-        spUsername.value = cfg.username || '';
         spName.value = cfg.device_name || 'RoomCast';
         spBitrate.value = cfg.bitrate || 320;
         spInitVol.value = cfg.initial_volume ?? 75;
         spNormalise.checked = cfg.normalisation ?? true;
         spClientId.value = cfg.client_id || '';
         spRedirect.value = cfg.redirect_uri || '';
-        if (cfg.has_password) spPassword.placeholder = 'stored';
         if (cfg.has_client_secret) spClientSecret.placeholder = 'stored';
+        else spClientSecret.placeholder = 'client secret';
+        if (spotifyLinkStatus) {
+          if (cfg.has_oauth_token) {
+            spotifyLinkStatus.textContent = 'Spotify account linked via OAuth';
+            spotifyLinkStatus.className = 'status-pill ok';
+          } else {
+            spotifyLinkStatus.textContent = 'Spotify account not linked';
+            spotifyLinkStatus.className = 'status-pill warn';
+          }
+        }
       } catch (err) {
         showError(`Failed to load Spotify config: ${err.message}`);
       }
@@ -1537,17 +1578,14 @@
         spotifySpinner.style.display = 'block';
         saveSpotifyBtn.disabled = true;
         const payload = {
-          username: spUsername.value,
-          password: spPassword.value,
           device_name: spName.value || 'RoomCast',
-          bitrate: Number(spBitrate.value),
-          initial_volume: Number(spInitVol.value),
+          bitrate: Number(spBitrate.value) || 320,
+          initial_volume: Number(spInitVol.value) || 75,
           normalisation: spNormalise.checked,
           client_id: spClientId.value,
           client_secret: spClientSecret.value,
           redirect_uri: spRedirect.value || 'http://localhost:8000/api/spotify/callback',
         };
-        if (!payload.password) delete payload.password;
         if (!payload.client_secret) delete payload.client_secret;
         const res = await fetch('/api/config/spotify', {
           method: 'POST',
@@ -1555,7 +1593,7 @@
           body: JSON.stringify(payload),
         });
         await ensureOk(res);
-        spPassword.value = '';
+        spClientSecret.value = '';
         showSuccess('Spotify config saved. Librespot will reload and connect.');
         await pollLibrespotStatus();
       } catch (err) {
