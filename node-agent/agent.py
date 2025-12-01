@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.4")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.5")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -195,6 +195,17 @@ def _current_playback_device() -> str:
     return device or "plughw:0,0"
 
 
+def _current_playback_card() -> Optional[str]:
+    device = _current_playback_device()
+    if ":" not in device:
+        return None
+    _, suffix = device.split(":", 1)
+    if not suffix:
+        return None
+    card = suffix.split(",", 1)[0].strip()
+    return card or None
+
+
 def _list_playback_devices() -> list[dict]:
     try:
         proc = subprocess.run(
@@ -349,8 +360,12 @@ def _mixer_candidate_order() -> list[str]:
 
 def _try_mixer_command(builder: Callable[[str], list[str]]) -> None:
     last_error: Optional[str] = None
+    card = _current_playback_card()
     for control in _mixer_candidate_order():
-        args = builder(control)
+        args = ["amixer"]
+        if card:
+            args.extend(["-c", card])
+        args.extend(builder(control))
         try:
             subprocess.run(
                 args,
@@ -667,14 +682,14 @@ def _amixer_set(percent: int) -> None:
     if DRY_RUN:
         return
     clamped = max(0, min(100, int(percent)))
-    _try_mixer_command(lambda control: ["amixer", "-M", "set", control, f"{clamped}%"])
+    _try_mixer_command(lambda control: ["-M", "set", control, f"{clamped}%"])
 
 
 def _amixer_mute(muted: bool) -> None:
     if DRY_RUN:
         return
     cmd = "mute" if muted else "unmute"
-    _try_mixer_command(lambda control: ["amixer", "-M", "set", control, cmd])
+    _try_mixer_command(lambda control: ["-M", "set", control, cmd])
 
 
 async def _run_maintenance_command(args: list[str], label: str) -> None:

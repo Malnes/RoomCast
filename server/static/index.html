@@ -350,6 +350,7 @@
 
     let nodesCache = [];
     let pendingNodesRender = null;
+    let pendingNodesForce = false;
     const eqState = {};
     const eqUpdateTimers = {};
     const camillaPendingNodes = {};
@@ -385,9 +386,11 @@
     }
 
     function flushPendingNodesRender() {
-      if (!pendingNodesRender || shouldDeferNodeRender()) return;
+      if (!pendingNodesRender) return;
+      if (!pendingNodesForce && shouldDeferNodeRender()) return;
       const next = pendingNodesRender;
       pendingNodesRender = null;
+      pendingNodesForce = false;
       commitRenderNodes(next);
     }
 
@@ -405,9 +408,12 @@
       }
     });
 
-    function renderNodes(nodes) {
+    function renderNodes(nodes, options = {}) {
       nodesCache = nodes;
       pendingNodesRender = nodes;
+      if (options.force) {
+        pendingNodesForce = true;
+      }
       flushPendingNodesRender();
     }
 
@@ -772,12 +778,12 @@
       }
     }
 
-    async function fetchNodes() {
+    async function fetchNodes(options = {}) {
       try {
         const res = await fetch('/api/nodes');
         await ensureOk(res);
         const data = await res.json();
-        renderNodes(data.nodes || []);
+        renderNodes(data.nodes || [], options);
       } catch (err) {
         showError(`Failed to load nodes: ${err.message}`);
       }
@@ -1037,7 +1043,7 @@
         });
         await ensureOk(res);
         showSuccess('Audio output updated');
-        await fetchNodes();
+        await fetchNodes({ force: true });
       } catch (err) {
         showError(`Failed to set output: ${err.message}`);
         if (selectEl && originalValue !== null) {
