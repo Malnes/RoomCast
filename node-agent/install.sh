@@ -290,7 +290,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/usr/local/bin/camilladsp -c ${CAMILLA_CONFIG_PATH}
+ExecStart=/usr/local/bin/camilladsp ${CAMILLA_CONFIG_PATH}
 Restart=always
 RestartSec=3
 User=${SERVICE_USER}
