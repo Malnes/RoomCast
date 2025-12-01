@@ -408,7 +408,7 @@ def _snapclient_args(config: dict) -> list[str]:
         "--player",
         f"alsa:device={PLAYBACK_DEVICE}",
         "--sampleformat",
-        "48000:16:*",
+        "48000:32:*",
     ]
     return base
 

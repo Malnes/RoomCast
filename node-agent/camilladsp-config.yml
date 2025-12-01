@@ -5,7 +5,7 @@ devices:
     type: Alsa
     device: "hw:Loopback,1,0"
     channels: 2
-    format: S16LE
+    format: S32LE
   playback:
     type: Alsa
     device: "__PLAYBACK_DEVICE__"
