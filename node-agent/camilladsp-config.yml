@@ -16,6 +16,10 @@ pipeline:
   - type: Filter
     names:
       - peq_stack_00
+
+  control:
+    type: TcpServer
+    listen: 127.0.0.1:__CAMILLA_PORT__
       - peq_stack_01
       - peq_stack_02
       - peq_stack_03

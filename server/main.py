@@ -42,10 +42,64 @@ NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.9").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.10").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
+
+
+def _is_private_snap_host(value: str) -> bool:
+    try:
+        parsed = ipaddress.ip_address(value)
+    except ValueError:
+        return False
+    return parsed.is_loopback or parsed.is_unspecified or parsed.is_link_local
+
+
+def _detect_primary_ipv4_host() -> Optional[str]:
+    try:
+        output = subprocess.check_output(
+            ["ip", "-o", "-4", "addr", "show", "up", "scope", "global"],
+            text=True,
+        )
+    except Exception:
+        return None
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        iface_name = parts[1].rstrip(":")
+        if iface_name.startswith("docker") or iface_name.startswith("br-") or iface_name.startswith("veth"):
+            continue
+        cidr = parts[3]
+        try:
+            iface = ipaddress.ip_interface(cidr)
+        except ValueError:
+            continue
+        if iface.ip.is_loopback or iface.ip.is_link_local:
+            continue
+        return str(iface.ip)
+    return None
+
+
+def _resolve_snapserver_agent_host() -> str:
+    override = os.getenv("SNAPSERVER_AGENT_HOST", "").strip()
+    if override:
+        return override
+    candidate = (SNAPSERVER_HOST or "").strip()
+    if candidate and not _is_private_snap_host(candidate):
+        return candidate
+    detected = _detect_primary_ipv4_host()
+    if detected:
+        return detected
+    log.warning(
+        "Falling back to %s for snapclient configuration; consider setting SNAPSERVER_AGENT_HOST",
+        candidate or "127.0.0.1",
+    )
+    return candidate or "127.0.0.1"
+
+
+SNAPSERVER_AGENT_HOST = _resolve_snapserver_agent_host()
 
 
 class NodeRegistration(BaseModel):
@@ -315,7 +369,7 @@ async def configure_agent_audio(node: dict) -> dict:
     if node.get("type") != "agent":
         raise HTTPException(status_code=400, detail="Audio configuration only applies to hardware nodes")
     payload = {
-        "snapserver_host": SNAPSERVER_HOST,
+        "snapserver_host": SNAPSERVER_AGENT_HOST,
         "snapserver_port": SNAPCLIENT_PORT,
     }
     result = await _call_agent(node, "/config/snapclient", payload)

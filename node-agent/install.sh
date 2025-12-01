@@ -232,6 +232,13 @@ snd-aloop
 EOF
 }
 
+disable_snapclient_service() {
+  if systemctl list-unit-files | grep -q "^snapclient.service"; then
+    log "Disabling stock snapclient.service"
+    systemctl disable --now snapclient.service >/dev/null 2>&1 || true
+  fi
+}
+
 install_camilladsp() {
   if command -v camilladsp >/dev/null 2>&1; then
     log "CamillaDSP already installed"
@@ -349,6 +356,7 @@ main() {
   prepare_state_dir
   seed_agent_config
   install_packages
+  disable_snapclient_service
   sync_repo
   setup_venv
   configure_loopback
