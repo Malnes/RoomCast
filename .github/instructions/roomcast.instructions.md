@@ -1,3 +1,6 @@
+---
+applyTo: '**'
+---
 Here are instructions or you:
 
 - The node is running on IP: 192.168.68.131 and you can access it ssh with these credentials
