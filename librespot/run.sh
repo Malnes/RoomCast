@@ -61,6 +61,8 @@ start_librespot() {
     --name "${DEVICE_NAME:-$FALLBACK_NAME}" \
     --backend pipe \
     --device "$FIFO_PATH" \
+    --username "$USERNAME" \
+    --password "$PASSWORD" \
     --bitrate "$BITRATE" \
     --initial-volume "$INITIAL_VOLUME" \
     $( [ "$NORMALISATION" = "true" ] && echo "--enable-volume-normalisation" ) \

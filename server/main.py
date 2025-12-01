@@ -45,12 +45,14 @@ SENSITIVE_NODE_FIELDS = {"agent_secret"}
 AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.2").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
+NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
 
 
 class NodeRegistration(BaseModel):
     id: Optional[str] = None
     name: str
     url: str = Field(min_length=1)
+    fingerprint: Optional[str] = None
 
 
 class RenameNodePayload(BaseModel):
@@ -143,6 +145,7 @@ webrtc_relay: Optional[WebAudioRelay] = None
 DEFAULT_EQ_PRESET = "peq15"
 pending_restarts: Dict[str, dict] = {}
 agent_refresh_tasks: Dict[str, asyncio.Task] = {}
+node_health_task: Optional[asyncio.Task] = None
 
 
 def default_eq_state() -> dict:
@@ -160,6 +163,9 @@ def public_node(node: dict) -> dict:
     data["volume_percent"] = int(node.get("volume_percent", 75))
     data["muted"] = bool(node.get("muted"))
     data["updating"] = bool(node.get("updating"))
+    data["online"] = node.get("online", node.get("type") == "browser")
+    data["last_seen"] = node.get("last_seen")
+    data["offline_since"] = node.get("offline_since")
     if node.get("type") == "browser":
         data["update_available"] = False
     elif AGENT_LATEST_VERSION:
@@ -169,6 +175,7 @@ def public_node(node: dict) -> dict:
     data["restarting"] = bool(pending_restarts.get(node["id"]))
     data["playback_device"] = node.get("playback_device")
     data["outputs"] = node.get("outputs") or {}
+    data["fingerprint"] = node.get("fingerprint")
     return data
 
 
@@ -190,20 +197,59 @@ async def broadcast_nodes() -> None:
         node_watchers.discard(ws)
 
 
-def _register_node_internal(reg: NodeRegistration) -> dict:
-    normalized_url = str(reg.url).rstrip("/")
+def _normalize_node_url(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return value
+    if value.startswith("browser:"):
+        return value.rstrip("/")
+    if "://" not in value:
+        value = f"http://{value}"
+    return value.rstrip("/")
+
+
+def _register_node_internal(
+    reg: NodeRegistration,
+    *,
+    fingerprint: Optional[str] = None,
+    normalized_url: Optional[str] = None,
+) -> dict:
+    normalized = normalized_url or _normalize_node_url(reg.url)
+    now = time.time()
+    if reg.id and reg.id in nodes:
+        node = nodes[reg.id]
+        node["url"] = normalized
+        node["last_seen"] = now
+        if fingerprint:
+            node["fingerprint"] = fingerprint
+        node["online"] = True
+        node.pop("offline_since", None)
+        return node
+    if fingerprint:
+        for existing in nodes.values():
+            if existing.get("fingerprint") == fingerprint:
+                existing["url"] = normalized
+                existing["last_seen"] = now
+                existing["fingerprint"] = fingerprint
+                existing["online"] = True
+                existing.pop("offline_since", None)
+                return existing
     for existing in nodes.values():
-        if existing["url"].rstrip("/") == normalized_url:
-            existing["last_seen"] = time.time()
+        if existing["url"].rstrip("/") == normalized:
+            existing["last_seen"] = now
+            if fingerprint:
+                existing["fingerprint"] = fingerprint
+            existing["online"] = True
+            existing.pop("offline_since", None)
             return existing
     node_id = reg.id or str(uuid.uuid4())
     previous = nodes.get(node_id, {})
-    node_type = "browser" if normalized_url.startswith("browser:") else "agent"
+    node_type = "browser" if normalized.startswith("browser:") else "agent"
     nodes[node_id] = {
         "id": node_id,
         "name": reg.name,
-        "url": normalized_url,
-        "last_seen": time.time(),
+        "url": normalized,
+        "last_seen": now,
         "type": node_type,
         "pan": previous.get("pan", 0.0),
         "eq": default_eq_state(),
@@ -215,6 +261,9 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
         "updating": bool(previous.get("updating", False)),
         "playback_device": previous.get("playback_device"),
         "outputs": previous.get("outputs", {}),
+        "fingerprint": fingerprint or previous.get("fingerprint"),
+        "online": True,
+        "offline_since": None,
     }
     save_nodes()
     return nodes[node_id]
@@ -223,6 +272,25 @@ def _register_node_internal(reg: NodeRegistration) -> dict:
 def create_browser_node(name: str) -> dict:
     reg = NodeRegistration(id=str(uuid.uuid4()), name=name, url=f"browser:{uuid.uuid4()}")
     return public_node(_register_node_internal(reg))
+
+
+async def _fetch_agent_fingerprint(url: str) -> Optional[str]:
+    normalized = _normalize_node_url(url)
+    if not normalized or normalized.startswith("browser:"):
+        return None
+    target = f"{normalized}/health"
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(target)
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+    except Exception:
+        return None
+    fingerprint = data.get("fingerprint")
+    if isinstance(fingerprint, str) and fingerprint:
+        return fingerprint
+    return None
 
 
 async def request_agent_secret(node: dict, force: bool = False) -> str:
@@ -258,20 +326,52 @@ async def configure_agent_audio(node: dict) -> dict:
     return result
 
 
+def _mark_node_online(node: dict, *, timestamp: Optional[float] = None) -> bool:
+    now = timestamp or time.time()
+    was_online = bool(node.get("online", False))
+    node["online"] = True
+    node["last_seen"] = now
+    offline_flag = node.pop("offline_since", None)
+    return not was_online or offline_flag is not None
+
+
+def _mark_node_offline(node: dict, *, timestamp: Optional[float] = None) -> bool:
+    if node.get("type") == "browser":
+        return False
+    now = timestamp or time.time()
+    was_online = bool(node.get("online", False))
+    node["online"] = False
+    node.setdefault("offline_since", now)
+    return was_online
+
+
 async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[bool, bool]:
     if node.get("type") != "agent":
         return False, False
     url = f"{node['url'].rstrip('/')}/health"
+    now = time.time()
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.get(url)
         if resp.status_code != 200:
-            return False, False
+            changed = _mark_node_offline(node, timestamp=now)
+            if changed and persist:
+                save_nodes()
+            return False, changed
         data = resp.json()
     except Exception:
-        return False, False
+        changed = _mark_node_offline(node, timestamp=now)
+        if changed and persist:
+            save_nodes()
+        return False, changed
 
     changed = False
+    if _mark_node_online(node, timestamp=now):
+        changed = True
+    fingerprint = data.get("fingerprint")
+    if isinstance(fingerprint, str) and fingerprint and node.get("fingerprint") != fingerprint:
+        node["fingerprint"] = fingerprint
+        changed = True
     version = data.get("version")
     if version and node.get("agent_version") != version:
         node["agent_version"] = version
@@ -401,6 +501,7 @@ def load_nodes() -> None:
             eq.setdefault("band_count", len(eq["bands"]) or 15)
             eq.setdefault("preset", DEFAULT_EQ_PRESET)
             item["eq"] = eq
+            item["url"] = _normalize_node_url(item.get("url", ""))
             if item.get("type") == "browser":
                 item["audio_configured"] = True
             else:
@@ -413,6 +514,20 @@ def load_nodes() -> None:
             if not isinstance(outputs, dict):
                 outputs = {}
             item["outputs"] = outputs
+            item["fingerprint"] = item.get("fingerprint")
+            try:
+                item["last_seen"] = float(item.get("last_seen", 0)) or 0.0
+            except (TypeError, ValueError):
+                item["last_seen"] = 0.0
+            offline_since = item.get("offline_since")
+            try:
+                item["offline_since"] = float(offline_since) if offline_since is not None else None
+            except (TypeError, ValueError):
+                item["offline_since"] = None
+            if item.get("type") == "browser":
+                item["online"] = True
+            else:
+                item["online"] = bool(item.get("online", False))
             nodes[item["id"]] = item
     except Exception:
         nodes = {}
@@ -427,22 +542,31 @@ load_nodes()
 
 @app.on_event("startup")
 async def _startup_events() -> None:
-    global webrtc_relay
-    if not WEBRTC_ENABLED:
-        return
-    webrtc_relay = WebAudioRelay(
-        snap_host=SNAPSERVER_HOST,
-        snap_port=SNAPCLIENT_PORT,
-        latency_ms=WEBRTC_LATENCY_MS,
-        on_session_closed=_handle_webrtc_session_closed,
-    )
-    await webrtc_relay.start()
+    global webrtc_relay, node_health_task
+    if WEBRTC_ENABLED:
+        webrtc_relay = WebAudioRelay(
+            snap_host=SNAPSERVER_HOST,
+            snap_port=SNAPCLIENT_PORT,
+            latency_ms=WEBRTC_LATENCY_MS,
+            on_session_closed=_handle_webrtc_session_closed,
+        )
+        await webrtc_relay.start()
+    if node_health_task is None:
+        node_health_task = asyncio.create_task(_node_health_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown_events() -> None:
+    global node_health_task
     if webrtc_relay:
         await webrtc_relay.stop()
+    if node_health_task:
+        node_health_task.cancel()
+        try:
+            await node_health_task
+        except asyncio.CancelledError:
+            pass
+        node_health_task = None
 
 
 def current_spotify_creds() -> tuple[str, str, str]:
@@ -567,7 +691,10 @@ async def snapcast_volume(client_id: str, payload: VolumePayload) -> dict:
 
 @app.post("/api/nodes/register")
 async def register_node(reg: NodeRegistration) -> dict:
-    node = _register_node_internal(reg)
+    normalized_url = _normalize_node_url(reg.url)
+    reg.url = normalized_url
+    fingerprint = reg.fingerprint or await _fetch_agent_fingerprint(normalized_url)
+    node = _register_node_internal(reg, fingerprint=fingerprint, normalized_url=normalized_url)
     if node.get("type") == "agent":
         try:
             secret = await request_agent_secret(node, force=True)
@@ -805,6 +932,28 @@ async def unregister_node(node_id: str) -> dict:
     return {"ok": True, "removed": node_id}
 
 
+async def _refresh_all_agent_nodes() -> None:
+    dirty = False
+    for node in list(nodes.values()):
+        if node.get("type") != "agent":
+            continue
+        _, changed = await refresh_agent_metadata(node, persist=False)
+        if changed:
+            dirty = True
+    if dirty:
+        save_nodes()
+        await broadcast_nodes()
+
+
+async def _node_health_loop() -> None:
+    try:
+        while True:
+            await _refresh_all_agent_nodes()
+            await asyncio.sleep(max(5, NODE_HEALTH_INTERVAL))
+    except asyncio.CancelledError:
+        pass
+
+
 @app.get("/api/nodes")
 async def list_nodes() -> dict:
     return {"nodes": public_nodes()}
@@ -875,6 +1024,7 @@ async def _probe_host(host: str) -> Optional[dict]:
                 "url": f"{url}",
                 "healthy": True,
                 "version": data.get("version"),
+                "fingerprint": data.get("fingerprint"),
             }
     except Exception:
         return None

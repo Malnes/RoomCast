@@ -42,6 +42,7 @@ CAMILLA_SERVICE_NAME = os.getenv("CAMILLA_SERVICE_NAME", "roomcast-camilla.servi
 SYSTEMCTL_BIN = shutil.which("systemctl") or "/bin/systemctl"
 AGENT_SECRET_PATH = Path(os.getenv("AGENT_SECRET_PATH", "/var/lib/roomcast/agent-secret"))
 AGENT_CONFIG_PATH = Path(os.getenv("AGENT_CONFIG_PATH", "/var/lib/roomcast/agent-config.json"))
+NODE_UID_PATH = Path(os.getenv("NODE_UID_PATH", "/var/lib/roomcast/node-uid"))
 SNAPCLIENT_BIN = os.getenv("SNAPCLIENT_BIN", "snapclient")
 SNAPCLIENT_DEFAULT_PORT = int(os.getenv("SNAPCLIENT_PORT", "1704"))
 UPDATE_COMMAND = os.getenv("ROOMCAST_UPDATE_COMMAND", "sudo /usr/local/bin/roomcast-updater")
@@ -131,6 +132,25 @@ def _persist_agent_secret(value: str) -> None:
 
 
 agent_secret = _load_agent_secret()
+def _load_node_uid() -> str:
+    try:
+        raw = NODE_UID_PATH.read_text().strip()
+        if raw:
+            return raw
+    except FileNotFoundError:
+        pass
+    except OSError as exc:  # pragma: no cover - filesystem edge
+        log.warning("Failed to read node uid: %s", exc)
+    value = secrets.token_hex(16)
+    NODE_UID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    NODE_UID_PATH.write_text(value)
+    try:
+        os.chmod(NODE_UID_PATH, 0o600)
+    except OSError:
+        pass
+    return value
+
+node_uid = _load_node_uid()
 DEFAULT_AGENT_CONFIG = {
     "snapserver_host": None,
     "snapserver_port": SNAPCLIENT_DEFAULT_PORT,
@@ -708,6 +728,7 @@ async def health() -> dict:
         "camilla_pending": camilla_pending_eq,
         "playback_device": _current_playback_device(),
         "outputs": _outputs_snapshot(),
+        "fingerprint": node_uid,
     }
 
 

@@ -302,6 +302,26 @@
       enqueueToast(successEl, msg, 3000);
     }
 
+    function normalizeNodeUrl(value) {
+      let url = (value || '').trim();
+      if (!url) return '';
+      if (url.startsWith('browser:')) return url.replace(/\/+$/, '');
+      if (!url.includes('://')) url = `http://${url}`;
+      return url.replace(/\/+$/, '');
+    }
+
+    function formatTimestamp(seconds) {
+      if (typeof seconds !== 'number' || Number.isNaN(seconds) || seconds <= 0) return '';
+      const date = new Date(seconds * 1000);
+      if (Number.isNaN(date.getTime())) return '';
+      return date.toLocaleString();
+    }
+
+    function findNodeByFingerprint(fingerprint) {
+      if (!fingerprint) return null;
+      return nodesCache.find(n => n.fingerprint && n.fingerprint === fingerprint) || null;
+    }
+
     async function ensureOk(res, fallback) {
       if (res.ok) return res;
       let detail = fallback || `HTTP ${res.status}`;
@@ -420,22 +440,32 @@
         const isBrowser = n.type === 'browser';
         const paired = !!n.paired;
         const configured = isBrowser ? true : !!n.configured;
+        const online = isBrowser ? true : n.online !== false;
+        const lastSeenText = formatTimestamp(n.last_seen);
+        const offlineSinceText = !online ? formatTimestamp(n.offline_since) : '';
         const restarting = !!n.restarting;
         const updateAvailable = n.update_available !== false;
         const updating = !!n.updating;
         const outputInfo = n.outputs || {};
         const outputOptions = Array.isArray(outputInfo.options) ? outputInfo.options : [];
         const selectedOutput = outputInfo.selected || n.playback_device || '';
-        const disableAgentControls = !isBrowser && (!paired || !configured || restarting);
+        const disableAgentControls = !isBrowser && (!paired || !configured || restarting || !online);
         const typePill = document.createElement('span');
         typePill.className = `status-pill ${isBrowser || paired ? 'ok' : 'warn'}`;
         typePill.textContent = isBrowser ? 'Browser node' : paired ? 'Paired' : 'Pairing required';
         statusRow.appendChild(typePill);
         if (!isBrowser) {
           const cfgPill = document.createElement('span');
-          cfgPill.className = `status-pill ${configured ? 'ok' : 'warn'}`;
-          cfgPill.textContent = configured ? 'Audio ready' : 'Needs config';
+          const cfgOk = configured && online;
+          cfgPill.className = `status-pill ${cfgOk ? 'ok' : 'warn'}`;
+          if (!configured) cfgPill.textContent = 'Needs config';
+          else if (!online) cfgPill.textContent = 'Configured (offline)';
+          else cfgPill.textContent = 'Audio ready';
           statusRow.appendChild(cfgPill);
+          const onlinePill = document.createElement('span');
+          onlinePill.className = `status-pill ${online ? 'ok' : 'warn'}`;
+          onlinePill.textContent = online ? 'Online' : 'Offline';
+          statusRow.appendChild(onlinePill);
         }
         const urlMeta = document.createElement('div');
         urlMeta.className = 'muted';
@@ -465,6 +495,20 @@
           updatingPill.className = 'status-pill warn';
           updatingPill.textContent = 'Updating';
           statusRow.appendChild(updatingPill);
+        }
+        if (!isBrowser) {
+          const meta = document.createElement('div');
+          meta.className = 'label';
+          if (!online && offlineSinceText) {
+            meta.textContent = `Offline since ${offlineSinceText}`;
+          } else if (online && lastSeenText) {
+            meta.textContent = `Last seen ${lastSeenText}`;
+          } else {
+            meta.textContent = '';
+          }
+          if (meta.textContent) {
+            statusRow.appendChild(meta);
+          }
         }
         wrapper.appendChild(statusRow);
 
@@ -565,7 +609,7 @@
         const eqBtn = document.createElement('button');
         eqBtn.className = 'small-btn';
         eqBtn.textContent = 'EQ';
-        eqBtn.disabled = n.type !== 'browser' && (!paired || !configured || restarting);
+        eqBtn.disabled = n.type !== 'browser' && (!paired || !configured || restarting || !online);
         eqBtn.addEventListener('click', () => openEqModal(n.id, n.name));
         actions.appendChild(eqBtn);
         if (n.type !== 'browser') {
@@ -651,15 +695,33 @@
         const versionLabel = item.version ? `Agent ${item.version}` : 'Version unknown';
         title.innerHTML = `<strong>${item.host}</strong> <span class="muted">${item.url}</span><div class="label">${versionLabel}</div>`;
         const nameInput = document.createElement('input');
-        nameInput.value = `Node ${item.host}`;
+        const existing = findNodeByFingerprint(item.fingerprint);
+        if (existing) {
+          nameInput.value = existing.name || existing.id || `Node ${item.host}`;
+          nameInput.disabled = true;
+        } else {
+          nameInput.value = `Node ${item.host}`;
+        }
         nameInput.style.marginTop = '6px';
         const btn = document.createElement('button');
         btn.className = 'small-btn';
-        btn.textContent = 'Register';
+        btn.textContent = existing ? 'Relink node' : 'Register';
         btn.style.marginTop = '6px';
-        btn.addEventListener('click', () => registerNodeWithName(nameInput.value, item.url, btn));
+        btn.addEventListener('click', () => registerNodeWithName(
+          existing ? existing.name : nameInput.value,
+          item.url,
+          btn,
+          existing ? existing.id : undefined,
+          item.fingerprint,
+        ));
         row.appendChild(title);
         row.appendChild(nameInput);
+        if (existing) {
+          const hint = document.createElement('div');
+          hint.className = 'label';
+          hint.textContent = `Matches registered node “${existing.name || existing.id}”`;
+          row.appendChild(hint);
+        }
         row.appendChild(btn);
         discoverList.appendChild(row);
       });
@@ -1442,18 +1504,20 @@
       }
     }
 
-    async function registerNodeWithName(name, url, btn) {
-      const normalizedUrl = (url || '').replace(/\/+$/, '');
+    async function registerNodeWithName(name, url, btn, nodeId, fingerprint) {
+      const normalizedUrl = normalizeNodeUrl(url);
       if (!normalizedUrl) {
         showError('Agent URL is required');
         return;
       }
-      if (nodesCache.some(n => n.url === normalizedUrl)) {
+      if (!nodeId && nodesCache.some(n => n.url === normalizedUrl)) {
         showSuccess('Node already registered');
         return;
       }
       if (btn) btn.disabled = true;
       const payload = { name, url: normalizedUrl };
+      if (nodeId) payload.id = nodeId;
+      if (fingerprint) payload.fingerprint = fingerprint;
       try {
         const res = await fetch('/api/nodes/register', {
           method: 'POST',
@@ -1461,7 +1525,7 @@
           body: JSON.stringify(payload),
         });
         await ensureOk(res);
-        showSuccess('Node registered');
+        showSuccess(nodeId ? 'Node relinked' : 'Node registered');
         await fetchNodes();
       } finally {
         if (btn) btn.disabled = false;
