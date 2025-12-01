@@ -13,10 +13,6 @@ devices:
     format: S16LE
 
 pipeline:
-  - type: Filter
-    names:
-      - peq_stack_00
-      - peq_stack_01
       - peq_stack_02
       - peq_stack_03
       - peq_stack_04
