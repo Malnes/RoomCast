@@ -37,6 +37,7 @@ CAMILLA_MAX_BANDS = int(os.getenv("CAMILLA_MAX_BANDS", "31"))
 CAMILLA_RETRY_INTERVAL = int(os.getenv("CAMILLA_RETRY_INTERVAL", "5"))
 CAMILLA_CONFIG_PATH = Path(os.getenv("CAMILLA_CONFIG_PATH", "/etc/roomcast/camilladsp.yml"))
 CAMILLA_TEMPLATE_PATH = Path(os.getenv("CAMILLA_TEMPLATE_PATH", Path(__file__).resolve().parent / "camilladsp-config.yml"))
+PACKAGED_CAMILLA_TEMPLATE_PATH = Path(__file__).resolve().parent / "camilladsp-config.yml"
 CAMILLA_SERVICE_NAME = os.getenv("CAMILLA_SERVICE_NAME", "roomcast-camilla.service")
 SYSTEMCTL_BIN = shutil.which("systemctl") or "/bin/systemctl"
 AGENT_SECRET_PATH = Path(os.getenv("AGENT_SECRET_PATH", "/var/lib/roomcast/agent-secret"))
@@ -60,6 +61,53 @@ agent_secret: str | None = None
 agent_config: dict = {}
 snapclient_process: Optional[asyncio.subprocess.Process] = None
 snapclient_lock = asyncio.Lock()
+
+
+def _read_text_safely(path: Path) -> str:
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return ""
+    except OSError as exc:  # pragma: no cover - filesystem edge
+        log.warning("Failed to read %s: %s", path, exc)
+        return ""
+
+
+def _needs_camilla_schema_migration(content: str) -> bool:
+    stripped = (content or "").strip()
+    if not stripped:
+        return True
+    return "peq_stack_00" not in stripped
+
+
+def _load_packaged_camilla_template() -> str:
+    try:
+        return PACKAGED_CAMILLA_TEMPLATE_PATH.read_text()
+    except OSError as exc:  # pragma: no cover - deployment issue
+        raise RuntimeError(f"Packaged Camilla template missing: {exc}") from exc
+
+
+def _ensure_camilla_template_latest() -> str:
+    packaged = _load_packaged_camilla_template()
+    on_disk = _read_text_safely(CAMILLA_TEMPLATE_PATH)
+    if _needs_camilla_schema_migration(on_disk):
+        try:
+            CAMILLA_TEMPLATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CAMILLA_TEMPLATE_PATH.write_text(packaged)
+            try:
+                os.chmod(CAMILLA_TEMPLATE_PATH, 0o640)
+            except OSError:
+                pass
+            log.info("Updated Camilla template at %s", CAMILLA_TEMPLATE_PATH)
+        except OSError as exc:  # pragma: no cover - filesystem edge
+            log.warning("Failed to update Camilla template %s: %s", CAMILLA_TEMPLATE_PATH, exc)
+            return packaged
+        return packaged
+    return on_disk or packaged
+
+
+def _camilla_config_requires_migration() -> bool:
+    return _needs_camilla_schema_migration(_read_text_safely(CAMILLA_CONFIG_PATH))
 
 
 def _load_agent_secret() -> str | None:
@@ -172,10 +220,7 @@ def _outputs_snapshot() -> dict:
 
 
 def _render_camilla_config(playback_device: str) -> str:
-    if CAMILLA_TEMPLATE_PATH.exists():
-        template = CAMILLA_TEMPLATE_PATH.read_text()
-    else:
-        template = CAMILLA_CONFIG_PATH.read_text() if CAMILLA_CONFIG_PATH.exists() else ""
+    template = _ensure_camilla_template_latest()
     if not template:
         raise RuntimeError("CamillaDSP template not found")
     rendered = template.replace("__PLAYBACK_DEVICE__", playback_device)
@@ -550,6 +595,34 @@ def _schedule_camilla_retry() -> None:
     camilla_retry_task = asyncio.create_task(_runner())
 
 
+async def _ensure_camilla_config_current() -> None:
+    if not CAMILLA_ENABLED or not _camilla_config_requires_migration():
+        return
+    playback_device = _current_playback_device()
+    loop = asyncio.get_running_loop()
+    try:
+        await loop.run_in_executor(None, _write_camilla_config, playback_device)
+    except Exception as exc:  # pragma: no cover - filesystem edge
+        log.warning("Failed to rewrite Camilla config during migration: %s", exc)
+        return
+    try:
+        await _restart_camilla_service()
+    except HTTPException as exc:
+        log.warning("Unable to restart Camilla after config migration: %s", exc.detail)
+        return
+    global camilla_pending_eq
+    try:
+        await _apply_camilla_eq()
+        camilla_pending_eq = False
+    except Exception as exc:  # pragma: no cover - hardware path
+        if _is_connection_error(exc):
+            camilla_pending_eq = True
+            log.warning("CamillaDSP not ready after config migration (%s); retry scheduled", exc)
+            _schedule_camilla_retry()
+        else:
+            log.warning("Failed to reapply EQ after config migration: %s", exc)
+
+
 def _auth(request: Request) -> None:
     if not agent_secret:
         raise HTTPException(status_code=409, detail="Node is not paired yet")
@@ -747,6 +820,7 @@ async def trigger_restart(request: Request) -> dict:
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    await _ensure_camilla_config_current()
     await _reconcile_snapclient()
 
 
