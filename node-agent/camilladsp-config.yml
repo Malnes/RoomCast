@@ -481,7 +481,3 @@ filters:
       freq: 20000.0
       gain: 0.0
       q: 1.0
-
-control:
-  type: TcpServer
-  port: __CAMILLA_PORT__

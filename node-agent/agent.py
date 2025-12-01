@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.7")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.8")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -260,7 +260,6 @@ def _render_camilla_config(playback_device: str) -> str:
     if not template:
         raise RuntimeError("CamillaDSP template not found")
     rendered = template.replace("__PLAYBACK_DEVICE__", playback_device)
-    rendered = rendered.replace("__CAMILLA_PORT__", str(CAMILLA_PORT))
     return rendered
 
 
