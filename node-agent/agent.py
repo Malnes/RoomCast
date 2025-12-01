@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.6")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.7")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -78,7 +78,8 @@ def _needs_camilla_schema_migration(content: str) -> bool:
     stripped = (content or "").strip()
     if not stripped:
         return True
-    if "peq_stack_00" not in stripped:
+    markers = ["peq_stack_00", "names:", "- type: Filter"]
+    if any(marker not in stripped for marker in markers):
         return True
     if "control:" in stripped:
         return True
