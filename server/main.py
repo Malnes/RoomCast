@@ -867,6 +867,27 @@ async def configure_node(node_id: str) -> dict:
     return {"ok": True, "result": result}
 
 
+@app.post("/api/nodes/{node_id}/outputs")
+async def set_node_output(node_id: str, payload: OutputSelectionPayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "browser":
+        raise HTTPException(status_code=400, detail="Browser nodes do not support hardware outputs")
+    result = await _call_agent(node, "/outputs", payload.model_dump())
+    outputs = result.get("outputs") if isinstance(result, dict) else None
+    if isinstance(outputs, dict):
+        node["outputs"] = outputs
+        selected = outputs.get("selected")
+        if isinstance(selected, str) and selected:
+            node["playback_device"] = selected
+    else:
+        node["playback_device"] = payload.device
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True, "result": result}
+
+
 @app.post("/api/nodes/{node_id}/check-updates")
 async def check_node_updates(node_id: str) -> dict:
     node = nodes.get(node_id)
