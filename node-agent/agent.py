@@ -11,11 +11,16 @@ import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional
 
+try:  # Camilla v3 exposes JSON-RPC over WebSocket
+    import websockets
+except ImportError:  # pragma: no cover - optional dependency
+    websockets = None  # type: ignore
+
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.12")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.13")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -571,23 +576,49 @@ class CamillaController:
             }
             await self._call("SetFilter", payload)
 
-    async def _call(self, method: str, params: dict | None = None) -> dict | None:
-        reader, writer = await asyncio.open_connection(self.host, self.port)
-        request = {"jsonrpc": "2.0", "method": method, "id": next(self._ids)}
-        if params is not None:
-            request["params"] = params
-        wire = json.dumps(request) + "\n"
-        writer.write(wire.encode())
-        await writer.drain()
-        response_line = await reader.readline()
-        writer.close()
-        await writer.wait_closed()
-        if not response_line:
+    def _parse_response(self, payload: str | bytes | bytearray) -> dict | None:
+        if isinstance(payload, (bytes, bytearray)):
+            payload = payload.decode()
+        text = (payload or "").strip()
+        if not text:
             raise RuntimeError("No response from CamillaDSP")
-        response = json.loads(response_line.decode())
+        response = json.loads(text)
         if "error" in response:
             raise RuntimeError(str(response["error"]))
         return response.get("result")
+
+    async def _call(self, method: str, params: dict | None = None) -> dict | None:
+        request = {"jsonrpc": "2.0", "method": method, "id": next(self._ids)}
+        if params is not None:
+            request["params"] = params
+        message = json.dumps(request)
+
+        last_error: Exception | None = None
+        if websockets is not None:
+            ws_uri = f"ws://{self.host}:{self.port}"
+            try:
+                async with websockets.connect(ws_uri, ping_interval=None) as ws:
+                    await ws.send(message)
+                    response_line = await ws.recv()
+                return self._parse_response(response_line)
+            except Exception as exc:  # pragma: no cover - network path
+                last_error = exc
+                log.debug("WebSocket call to Camilla failed (%s); falling back", exc)
+
+        reader, writer = await asyncio.open_connection(self.host, self.port)
+        try:
+            wire = message + "\n"
+            writer.write(wire.encode())
+            await writer.drain()
+            response_line = await reader.readline()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        if not response_line:
+            if last_error:
+                raise last_error
+            raise RuntimeError("No response from CamillaDSP")
+        return self._parse_response(response_line)
 
 
 camilla = CamillaController(CAMILLA_HOST, CAMILLA_PORT, CAMILLA_FILTER_PATH)

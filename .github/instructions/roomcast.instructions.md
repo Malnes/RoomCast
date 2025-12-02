@@ -3,7 +3,7 @@ applyTo: '**'
 ---
 Here are instructions or you:
 
-- The node is running on IP: 192.168.68.131 and you can access it ssh with these credentials
+- The node is accessible from rcn.local and you can access it ssh with these credentials
     - Username: malnes
     - Password: open4ola
 

@@ -37,15 +37,19 @@ SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8000/api/spotify/callback")
 SPOTIFY_TOKEN_PATH = Path(os.getenv("SPOTIFY_TOKEN_PATH", "/config/spotify-token.json"))
+SPOTIFY_REFRESH_CHECK_INTERVAL = int(os.getenv("SPOTIFY_REFRESH_CHECK_INTERVAL", "60"))
+SPOTIFY_REFRESH_LEEWAY = int(os.getenv("SPOTIFY_REFRESH_LEEWAY", "180"))
+SPOTIFY_REFRESH_FAILURE_BACKOFF = int(os.getenv("SPOTIFY_REFRESH_FAILURE_BACKOFF", "120"))
 TOKEN_SIGNER = URLSafeSerializer(os.getenv("SPOTIFY_STATE_SECRET", "changeme"))
 NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.12").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.13").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
+NODE_REDISCOVERY_INTERVAL = int(os.getenv("NODE_REDISCOVERY_INTERVAL", "90"))
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -115,6 +119,14 @@ class RenameNodePayload(BaseModel):
 
 class VolumePayload(BaseModel):
     percent: int = Field(ge=0, le=100)
+
+
+class ShufflePayload(BaseModel):
+    state: bool = Field(description="Enable shuffle when true")
+
+
+class RepeatPayload(BaseModel):
+    mode: str = Field(regex="^(off|track|context)$", description="Repeat mode")
 
 
 class EqBand(BaseModel):
@@ -198,6 +210,8 @@ DEFAULT_EQ_PRESET = "peq15"
 pending_restarts: Dict[str, dict] = {}
 agent_refresh_tasks: Dict[str, asyncio.Task] = {}
 node_health_task: Optional[asyncio.Task] = None
+spotify_refresh_task: Optional[asyncio.Task] = None
+node_rediscovery_tasks: Dict[str, asyncio.Task] = {}
 
 
 def default_eq_state() -> dict:
@@ -398,6 +412,27 @@ def _mark_node_offline(node: dict, *, timestamp: Optional[float] = None) -> bool
     return was_online
 
 
+def cancel_node_rediscovery(node_id: Optional[str]) -> None:
+    if not node_id:
+        return
+    task = node_rediscovery_tasks.pop(node_id, None)
+    if task:
+        task.cancel()
+
+
+def schedule_node_rediscovery(node: dict) -> None:
+    if not node or node.get("type") != "agent":
+        return
+    node_id = node.get("id")
+    fingerprint = node.get("fingerprint")
+    if not node_id or not fingerprint:
+        return
+    if node_id in node_rediscovery_tasks:
+        return
+    log.info("Scheduling rediscovery for node %s (fingerprint %s)", node_id, fingerprint[:8])
+    node_rediscovery_tasks[node_id] = asyncio.create_task(_rediscover_node(node_id, fingerprint))
+
+
 async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[bool, bool]:
     if node.get("type") != "agent":
         return False, False
@@ -410,12 +445,14 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[b
             changed = _mark_node_offline(node, timestamp=now)
             if changed and persist:
                 save_nodes()
+            schedule_node_rediscovery(node)
             return False, changed
         data = resp.json()
     except Exception:
         changed = _mark_node_offline(node, timestamp=now)
         if changed and persist:
             save_nodes()
+        schedule_node_rediscovery(node)
         return False, changed
 
     changed = False
@@ -593,9 +630,33 @@ def save_nodes() -> None:
 load_nodes()
 
 
+async def _spotify_refresh_loop() -> None:
+    while True:
+        try:
+            await asyncio.sleep(max(SPOTIFY_REFRESH_CHECK_INTERVAL, 5))
+            token = load_token()
+            if not token or "refresh_token" not in token:
+                continue
+            seconds_left = _token_seconds_until_expiry(token)
+            if seconds_left is None:
+                seconds_left = -1
+            if seconds_left > SPOTIFY_REFRESH_LEEWAY:
+                continue
+            try:
+                await spotify_refresh(token)
+            except HTTPException as exc:
+                log.warning("Background Spotify refresh failed: %s", exc.detail)
+                await asyncio.sleep(SPOTIFY_REFRESH_FAILURE_BACKOFF)
+        except asyncio.CancelledError:
+            break
+        except Exception:  # pragma: no cover - defensive
+            log.exception("Spotify refresh loop crashed")
+            await asyncio.sleep(SPOTIFY_REFRESH_FAILURE_BACKOFF)
+
+
 @app.on_event("startup")
 async def _startup_events() -> None:
-    global webrtc_relay, node_health_task
+    global webrtc_relay, node_health_task, spotify_refresh_task
     if WEBRTC_ENABLED:
         webrtc_relay = WebAudioRelay(
             snap_host=SNAPSERVER_HOST,
@@ -606,11 +667,13 @@ async def _startup_events() -> None:
         await webrtc_relay.start()
     if node_health_task is None:
         node_health_task = asyncio.create_task(_node_health_loop())
+    if spotify_refresh_task is None:
+        spotify_refresh_task = asyncio.create_task(_spotify_refresh_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown_events() -> None:
-    global node_health_task
+    global node_health_task, spotify_refresh_task
     if webrtc_relay:
         await webrtc_relay.stop()
     if node_health_task:
@@ -620,6 +683,13 @@ async def _shutdown_events() -> None:
         except asyncio.CancelledError:
             pass
         node_health_task = None
+    if spotify_refresh_task:
+        spotify_refresh_task.cancel()
+        try:
+            await spotify_refresh_task
+        except asyncio.CancelledError:
+            pass
+        spotify_refresh_task = None
 
 
 def current_spotify_creds() -> tuple[str, str, str]:
@@ -631,6 +701,8 @@ def current_spotify_creds() -> tuple[str, str, str]:
 
 
 def read_spotify_config() -> dict:
+    token = load_token()
+    has_token = bool(token and token.get("access_token"))
     if not CONFIG_PATH.exists():
         return {
             "username": "",
@@ -641,7 +713,9 @@ def read_spotify_config() -> dict:
             "has_password": False,
             "client_id": SPOTIFY_CLIENT_ID,
             "client_secret": "***" if SPOTIFY_CLIENT_SECRET else "",
+            "has_client_secret": bool(SPOTIFY_CLIENT_SECRET),
             "redirect_uri": SPOTIFY_REDIRECT_URI,
+            "has_oauth_token": has_token,
         }
     try:
         data = json.loads(CONFIG_PATH.read_text())
@@ -657,6 +731,7 @@ def read_spotify_config() -> dict:
         "client_id": data.get("client_id", SPOTIFY_CLIENT_ID),
         "has_client_secret": bool(data.get("client_secret") or SPOTIFY_CLIENT_SECRET),
         "redirect_uri": data.get("redirect_uri", SPOTIFY_REDIRECT_URI),
+        "has_oauth_token": has_token,
     }
 
 
@@ -679,7 +754,37 @@ def load_token() -> Optional[dict]:
 
 
 def save_token(data: dict) -> None:
+    if not data:
+        return
+    expires_at: Optional[float] = None
+    expires_in = data.get("expires_in")
+    if expires_in is not None:
+        try:
+            expires_at = time.time() + max(int(expires_in), 60)
+        except (TypeError, ValueError):
+            expires_at = None
+    if expires_at is not None:
+        data["expires_at"] = expires_at
+    SPOTIFY_TOKEN_PATH.parent.mkdir(parents=True, exist_ok=True)
     SPOTIFY_TOKEN_PATH.write_text(json.dumps(data, indent=2))
+
+
+def _token_seconds_until_expiry(token: Optional[dict]) -> Optional[float]:
+    if not token:
+        return None
+    expires_at = token.get("expires_at")
+    if expires_at is not None:
+        try:
+            return float(expires_at) - time.time()
+        except (TypeError, ValueError):
+            return None
+    expires_in = token.get("expires_in")
+    if expires_in is not None:
+        try:
+            return float(expires_in)
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return None
+    return None
 
 
 async def spotify_refresh(token: dict) -> dict:
@@ -996,6 +1101,7 @@ async def unregister_node(node_id: str) -> dict:
     node = nodes.pop(node_id, None)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
+    cancel_node_rediscovery(node_id)
     save_nodes()
     await broadcast_nodes()
     if node.get("type") == "browser":
@@ -1204,6 +1310,48 @@ async def _stream_host_probes(hosts: list[str]) -> AsyncIterator[dict]:
             await asyncio.gather(*tasks, return_exceptions=True)
 
 
+async def _find_node_by_fingerprint(fingerprint: str) -> Optional[dict]:
+    if not fingerprint:
+        return None
+    networks = _detect_discovery_networks()
+    if not networks:
+        return None
+    hosts = _hosts_for_networks(networks)
+    if not hosts:
+        return None
+    async for result in _stream_host_probes(hosts):
+        if not result:
+            continue
+        if result.get("fingerprint") == fingerprint:
+            return result
+    return None
+
+
+async def _rediscover_node(node_id: str, fingerprint: str) -> None:
+    try:
+        interval = max(10, NODE_REDISCOVERY_INTERVAL)
+        while True:
+            node = nodes.get(node_id)
+            if not node or node.get("online"):
+                return
+            match = await _find_node_by_fingerprint(fingerprint)
+            if match and match.get("url"):
+                new_url = _normalize_node_url(match["url"])
+                if new_url:
+                    node["url"] = new_url
+                    save_nodes()
+                    reachable, _ = await refresh_agent_metadata(node)
+                    if reachable:
+                        log.info("Node %s rediscovered at %s", node_id, new_url)
+                        await broadcast_nodes()
+                        return
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        node_rediscovery_tasks.pop(node_id, None)
+
+
 @app.get("/api/nodes/discover")
 async def discover_nodes() -> StreamingResponse:
     networks = _detect_discovery_networks()
@@ -1325,18 +1473,21 @@ async def spotify_player_status() -> dict:
     token = load_token()
     if not token or not token.get("access_token"):
         raise HTTPException(status_code=401, detail="Spotify not authorized")
-    resp = await spotify_request("GET", "/me/player/currently-playing", token)
+    resp = await spotify_request("GET", "/me/player", token)
     if resp.status_code == 204:
         return {"active": False}
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     data = resp.json()
+    active = bool(data.get("device"))
     return {
-        "active": True,
+        "active": active,
         "is_playing": data.get("is_playing", False),
         "progress_ms": data.get("progress_ms"),
         "device": data.get("device", {}),
         "item": data.get("item", {}),
+        "shuffle_state": data.get("shuffle_state", False),
+        "repeat_state": data.get("repeat_state", "off"),
     }
 
 
@@ -1381,6 +1532,18 @@ async def spotify_seek(payload: dict = Body(...)) -> dict:
 @app.post("/api/spotify/player/volume")
 async def spotify_volume(payload: VolumePayload) -> dict:
     return await _spotify_control(f"/me/player/volume?volume_percent={payload.percent}", "PUT")
+
+
+@app.post("/api/spotify/player/shuffle")
+async def spotify_shuffle(payload: ShufflePayload) -> dict:
+    state = "true" if payload.state else "false"
+    return await _spotify_control(f"/me/player/shuffle?state={state}", "PUT")
+
+
+@app.post("/api/spotify/player/repeat")
+async def spotify_repeat(payload: RepeatPayload) -> dict:
+    mode = payload.mode.lower()
+    return await _spotify_control(f"/me/player/repeat?state={mode}", "PUT")
 
 
 @app.exception_handler(HTTPException)
