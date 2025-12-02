@@ -19,8 +19,15 @@ services:
   snapserver:
     image: saiyato/snapserver:latest
     network_mode: host
-    environment:
-      SNAPSERVER_OPTS: "--stream pipe:///tmp/snapfifo?name=Spotify --http-cors *"
+    command:
+      - --stream.source
+      - pipe:///tmp/snapfifo?name=Spotify
+      - --stream.sampleformat
+      - 44100:16:2
+      - --stream.codec
+      - pcm
+      - --http-cors
+      - '*'
     volumes:
       - snapfifo:/tmp
       - ./snapserver.json:/root/.config/snapserver/server.json

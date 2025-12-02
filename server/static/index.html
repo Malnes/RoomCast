@@ -26,6 +26,9 @@
     .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
     label { display: block; font-size: 13px; color: #cbd5e1; margin-bottom: 6px; }
     input, select, textarea { width: 100%; border-radius: 12px; border: 1px solid rgba(255,255,255,0.12); background: rgba(255,255,255,0.06); color: #e2e8f0; padding: 10px 12px; font-size: 14px; }
+    input[type=range] { -webkit-appearance: none; appearance: none; padding: 0; border: none; background: rgba(255,255,255,0.12); height: 4px; border-radius: 999px; }
+    input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: none; box-shadow: 0 0 12px rgba(34,197,94,0.35); cursor: pointer; }
+    input[type=range]::-moz-range-thumb { width: 14px; height: 14px; border-radius: 50%; background: var(--accent); border: none; box-shadow: 0 0 12px rgba(34,197,94,0.35); cursor: pointer; }
     select {
       appearance: none;
       -webkit-appearance: none;
@@ -58,7 +61,7 @@
     .small-btn { width: auto; padding: 8px 12px; }
     .icon-only-btn { width: 42px; height: 42px; border-radius: 999px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.08); color: #f8fafc; }
     .node-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-    .node-gear { position: relative; }
+    .node-gear { position: relative; display: flex; gap: 8px; align-items: center; }
     .node-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
     .node-mute-btn { width: 42px; height: 42px; border-radius: 12px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.14); background: rgba(15,23,42,0.8); color: #e2e8f0; }
     .node-mute-btn svg { width: 18px; height: 18px; }
@@ -86,7 +89,7 @@
     .node-meta-value { font-size: 14px; color: #e2e8f0; word-break: break-word; }
     .modal-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
     .modal-actions button { width: 100%; }
-    #player-panel { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(6,10,20,0.95); backdrop-filter: blur(18px); border-top: 1px solid rgba(148,163,184,0.12); box-shadow: 0 -30px 60px rgba(0,0,0,0.6); padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 14px; z-index: 50; }
+    #player-panel { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(6,10,20,0.25); backdrop-filter: blur(28px); border-top: 1px solid rgba(148,163,184,0.2); box-shadow: 0 -24px 60px rgba(0,0,0,0.35); padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 14px; z-index: 50; }
     .player-top { display: flex; flex-wrap: nowrap; gap: 16px; justify-content: space-between; align-items: center; }
     .player-meta { display: flex; align-items: center; gap: 12px; flex: 1 1 auto; min-width: 0; }
     #player-art { width: 44px; height: 44px; border-radius: 8px; object-fit: cover; background: rgba(255,255,255,0.05); box-shadow: 0 6px 16px rgba(0,0,0,0.45); }
@@ -135,7 +138,6 @@
     <header>
       <h1>RoomCast</h1>
       <div style="display:flex; gap:8px;">
-        <button id="refresh" class="icon-btn">⟳</button>
         <button id="new-web-node" class="icon-btn">New web node</button>
         <button id="open-settings" class="icon-btn gear-btn" aria-label="Settings">⚙︎</button>
       </div>
@@ -270,7 +272,6 @@
     const clientsSettingsEl = document.getElementById('clients-settings');
     const errorEl = document.getElementById('error');
     const successEl = document.getElementById('success');
-    const refreshBtn = document.getElementById('refresh');
     const discoverBtn = document.getElementById('discover-nodes');
     const saveSpotifyBtn = document.getElementById('save-spotify');
     const spClientId = document.getElementById('sp-client-id');
@@ -279,6 +280,7 @@
     const spName = document.getElementById('sp-name');
     const spBitrate = document.getElementById('sp-bitrate');
     const spInitVol = document.getElementById('sp-initvol');
+    setRangeProgress(spInitVol, spInitVol?.value || 0, spInitVol?.max || 100);
     const spNormalise = document.getElementById('sp-normalise');
     const nodeName = document.getElementById('node-name');
     const nodeUrl = document.getElementById('node-url');
@@ -442,10 +444,27 @@
       return num > 0 ? `Right ${pct}%` : `Left ${pct}%`;
     }
 
-    function setRangeProgress(el, value, max) {
+    function hasAgentUpdate(node) {
+      if (!node) return false;
+      if (node.update_available === true) return true;
+      if (node.update_available === false) return false;
+      const latest = node.latest_agent_version;
+      const current = node.agent_version;
+      if (latest && current) return latest !== current;
+      return !!latest && !current;
+    }
+
+    function setRangeProgress(el, value, maxOverride) {
       if (!el) return;
-      const safeMax = Math.max(1, Number(max) || 1);
-      const percent = Math.max(0, Math.min(100, (Number(value) || 0) / safeMax * 100));
+      const min = Number(el.min ?? 0);
+      const rawMax = maxOverride !== undefined ? Number(maxOverride) : Number(el.max);
+      const safeMin = Number.isFinite(min) ? min : 0;
+      const safeMax = Number.isFinite(rawMax) ? rawMax : safeMin + 1;
+      const span = Math.max(0.0001, safeMax - safeMin);
+      const rawValue = value !== undefined ? Number(value) : Number(el.value);
+      const safeValue = Number.isFinite(rawValue) ? rawValue : safeMin;
+      const ratio = (safeValue - safeMin) / span;
+      const percent = Math.max(0, Math.min(100, ratio * 100));
       el.style.background = `linear-gradient(90deg, var(--accent) 0%, var(--accent) ${percent}%, rgba(255,255,255,0.12) ${percent}%, rgba(255,255,255,0.12) 100%)`;
     }
 
@@ -641,9 +660,20 @@
         const configured = isBrowser ? true : !!n.configured;
         const online = isBrowser ? true : n.online !== false;
         const restarting = !!n.restarting;
-        const updateAvailable = n.update_available !== false;
+        const updateAvailable = hasAgentUpdate(n);
         const updating = !!n.updating;
         const disableAgentControls = !isBrowser && (!paired || !configured || restarting || !online);
+        const eqBtn = document.createElement('button');
+        eqBtn.className = 'icon-btn small-btn';
+        eqBtn.innerHTML = EQ_ICON_SVG;
+        eqBtn.setAttribute('aria-label', 'Equalizer');
+        eqBtn.title = 'Equalizer';
+        eqBtn.disabled = n.type !== 'browser' && (!paired || !configured || restarting || !online);
+        eqBtn.addEventListener('click', (event) => {
+          event.stopPropagation();
+          openEqModal(n.id, n.name);
+        });
+        gearWrap.insertBefore(eqBtn, gearBtn);
         if (!isBrowser) {
           const onlinePill = document.createElement('span');
           onlinePill.className = `status-pill ${online ? 'ok' : 'warn'}`;
@@ -669,23 +699,23 @@
             statusRow.appendChild(cfgPill);
           }
         }
-        if (!isBrowser) {
+        if (!isBrowser && (updateAvailable || updating)) {
           const versionMeta = document.createElement('div');
           versionMeta.className = 'label';
-          if (n.agent_version) {
-            let text = `Agent ${n.agent_version}`;
-            if (updating) {
-              text += ' (updating…)';
-            } else if (updateAvailable && n.latest_agent_version) {
-              text += ` → ${n.latest_agent_version}`;
-            } else if (!updateAvailable) {
-              text += ' (latest)';
+          let text = n.agent_version ? `Agent ${n.agent_version}` : 'Agent version unknown';
+          if (updating) {
+            text += ' (updating…)';
+          } else if (updateAvailable) {
+            if (n.latest_agent_version) {
+              text = n.agent_version
+                ? `Agent ${n.agent_version} → ${n.latest_agent_version}`
+                : `Update ${n.latest_agent_version} available`;
+            } else {
+              text += ' – update available';
             }
-            versionMeta.textContent = text;
-          } else {
-            versionMeta.textContent = 'Agent version unknown';
           }
           statusRow.appendChild(versionMeta);
+          versionMeta.textContent = text;
         }
         if (restarting) {
           const restartPill = document.createElement('span');
@@ -720,16 +750,10 @@
         volInput.value = Number.isFinite(parsedVolume) ? parsedVolume : 75;
         volInput.disabled = disableAgentControls;
         volInput.style.width = '100%';
+        setRangeProgress(volInput, volInput.value, volInput.max || 100);
+        volInput.addEventListener('input', () => setRangeProgress(volInput, volInput.value, volInput.max || 100));
         volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
         volRow.appendChild(volInput);
-        const eqBtn = document.createElement('button');
-        eqBtn.className = 'icon-btn small-btn';
-        eqBtn.innerHTML = EQ_ICON_SVG;
-        eqBtn.setAttribute('aria-label', 'Equalizer');
-        eqBtn.title = 'Equalizer';
-        eqBtn.disabled = n.type !== 'browser' && (!paired || !configured || restarting || !online);
-        eqBtn.addEventListener('click', () => openEqModal(n.id, n.name));
-        volRow.appendChild(eqBtn);
         wrapper.appendChild(volRow);
 
         if (n.type === 'browser') {
@@ -745,9 +769,11 @@
           panInput.max = 100;
           panInput.step = 2;
           panInput.value = Math.round(currentPan * 100);
+          setRangeProgress(panInput, panInput.value, panInput.max || 100);
           panInput.addEventListener('input', () => {
             const nextPan = Number(panInput.value) / 100;
             panLabel.innerText = `Pan – ${describePan(nextPan)}`;
+            setRangeProgress(panInput, panInput.value, panInput.max || 100);
           });
           panInput.addEventListener('change', async () => {
             const nextPan = Math.max(-1, Math.min(1, Number(panInput.value) / 100));
@@ -758,6 +784,7 @@
               panInput.value = Math.round(currentPan * 100);
               panLabel.innerText = `Pan – ${describePan(currentPan)}`;
             }
+            setRangeProgress(panInput, panInput.value, panInput.max || 100);
           });
           wrapper.appendChild(panInput);
         }
@@ -804,6 +831,8 @@
           input.min = 0;
           input.max = 100;
           input.value = c.config?.volume?.percent ?? 50;
+          setRangeProgress(input, input.value, input.max || 100);
+          input.addEventListener('input', () => setRangeProgress(input, input.value, input.max || 100));
           input.addEventListener('change', () => setVolume(c.id, input.value));
           row.appendChild(label);
           row.appendChild(input);
@@ -890,6 +919,7 @@
         spName.value = cfg.device_name || 'RoomCast';
         spBitrate.value = cfg.bitrate || 320;
         spInitVol.value = cfg.initial_volume ?? 75;
+        setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100);
         spNormalise.checked = cfg.normalisation ?? true;
         spClientId.value = cfg.client_id || '';
         spRedirect.value = cfg.redirect_uri || '';
@@ -1291,7 +1321,7 @@
       const online = isBrowser ? true : node.online !== false;
       const restarting = !!node.restarting;
       const updating = !!node.updating;
-      const updateAvailable = node.update_available !== false;
+      const updateAvailable = hasAgentUpdate(node);
       const outputs = node.outputs || {};
       const outputOptions = Array.isArray(outputs.options) ? outputs.options : [];
       const selectedOutput = outputs.selected || node.playback_device || '';
@@ -1581,6 +1611,7 @@
         freqInput.addEventListener('change', () => {
           band.freq = clampValue(Number(freqInput.value) || band.freq, 20, 20000);
           freqSlider.value = freqToSlider(band.freq);
+          setRangeProgress(freqSlider, freqSlider.value, freqSlider.max || 1000);
           scheduleEqPush(nodeId);
         });
         const freqSlider = document.createElement('input');
@@ -1588,9 +1619,11 @@
         freqSlider.min = 0;
         freqSlider.max = 1000;
         freqSlider.value = freqToSlider(band.freq);
+        setRangeProgress(freqSlider, freqSlider.value, freqSlider.max || 1000);
         freqSlider.addEventListener('input', () => {
           band.freq = clampValue(sliderToFreq(Number(freqSlider.value)), 20, 20000);
           freqInput.value = Math.round(band.freq);
+          setRangeProgress(freqSlider, freqSlider.value, freqSlider.max || 1000);
           scheduleEqPush(nodeId);
         });
         freqCell.appendChild(freqLabel);
@@ -1608,12 +1641,14 @@
         gainSlider.max = EQ_GAIN_RANGE.max;
         gainSlider.step = 0.5;
         gainSlider.value = band.gain;
+        setRangeProgress(gainSlider, gainSlider.value, gainSlider.max || 1);
         const gainValue = document.createElement('div');
         gainValue.className = 'muted';
         gainValue.textContent = `${band.gain.toFixed(1)} dB`;
         gainSlider.addEventListener('input', () => {
           band.gain = clampValue(Number(gainSlider.value), EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
           gainValue.textContent = `${band.gain.toFixed(1)} dB`;
+          setRangeProgress(gainSlider, gainSlider.value, gainSlider.max || 1);
           scheduleEqPush(nodeId);
         });
         gainCell.appendChild(gainLabel);
@@ -1991,10 +2026,12 @@
       discoverOverlay.style.display = 'none';
     }
 
-    refreshBtn.addEventListener('click', () => { fetchNodes(); fetchStatus(); });
     discoverBtn.addEventListener('click', openDiscover);
     startDiscoverBtn.addEventListener('click', discoverNodes);
     saveSpotifyBtn.addEventListener('click', saveSpotify);
+    if (spInitVol) {
+      spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
+    }
     openSettingsBtn.addEventListener('click', openSettings);
     closeSettingsBtn.addEventListener('click', closeSettings);
     closeDiscoverBtn.addEventListener('click', closeDiscover);
