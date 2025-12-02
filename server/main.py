@@ -7,11 +7,12 @@ import subprocess
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlencode
 from typing import Dict, Optional, AsyncIterator
 
 import httpx
 import websockets
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request
+from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer
@@ -123,10 +124,12 @@ class VolumePayload(BaseModel):
 
 class ShufflePayload(BaseModel):
     state: bool = Field(description="Enable shuffle when true")
+    device_id: Optional[str] = Field(default=None, description="Target device ID")
 
 
 class RepeatPayload(BaseModel):
-    mode: str = Field(regex="^(off|track|context)$", description="Repeat mode")
+    mode: str = Field(pattern="^(off|track|context)$", description="Repeat mode")
+    device_id: Optional[str] = Field(default=None, description="Target device ID")
 
 
 class EqBand(BaseModel):
@@ -1438,7 +1441,6 @@ async def spotify_auth_url() -> dict:
         "scope": scope,
         "state": state,
     }
-    from urllib.parse import urlencode
 
     return {"url": f"https://accounts.spotify.com/authorize?{urlencode(params)}"}
 
@@ -1491,59 +1493,79 @@ async def spotify_player_status() -> dict:
     }
 
 
-async def _spotify_control(path: str, method: str = "POST", body: Optional[dict] = None):
+def _with_query(path: str, params: Optional[dict] = None) -> str:
+    if not params:
+        return path
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    if not clean:
+        return path
+    separator = "&" if "?" in path else "?"
+    return f"{path}{separator}{urlencode(clean)}"
+
+
+async def _spotify_control(
+    path: str,
+    method: str = "POST",
+    body: Optional[dict] = None,
+    params: Optional[dict] = None,
+):
     token = load_token()
     if not token:
         raise HTTPException(status_code=401, detail="Spotify not authorized")
-    resp = await spotify_request(method, path, token, json=body or {})
+    target = _with_query(path, params)
+    resp = await spotify_request(method, target, token, json=body or {})
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return {"ok": True}
 
 
 @app.post("/api/spotify/player/play")
-async def spotify_play() -> dict:
-    return await _spotify_control("/me/player/play", "PUT")
+async def spotify_play(device_id: Optional[str] = Query(default=None)) -> dict:
+    return await _spotify_control("/me/player/play", "PUT", params={"device_id": device_id})
 
 
 @app.post("/api/spotify/player/pause")
-async def spotify_pause() -> dict:
-    return await _spotify_control("/me/player/pause", "PUT")
+async def spotify_pause(device_id: Optional[str] = Query(default=None)) -> dict:
+    return await _spotify_control("/me/player/pause", "PUT", params={"device_id": device_id})
 
 
 @app.post("/api/spotify/player/next")
-async def spotify_next() -> dict:
-    return await _spotify_control("/me/player/next", "POST")
+async def spotify_next(device_id: Optional[str] = Query(default=None)) -> dict:
+    return await _spotify_control("/me/player/next", "POST", params={"device_id": device_id})
 
 
 @app.post("/api/spotify/player/previous")
-async def spotify_prev() -> dict:
-    return await _spotify_control("/me/player/previous", "POST")
+async def spotify_prev(device_id: Optional[str] = Query(default=None)) -> dict:
+    return await _spotify_control("/me/player/previous", "POST", params={"device_id": device_id})
 
 
 @app.post("/api/spotify/player/seek")
-async def spotify_seek(payload: dict = Body(...)) -> dict:
+async def spotify_seek(payload: dict = Body(...), device_id: Optional[str] = Query(default=None)) -> dict:
     pos = payload.get("position_ms")
     if pos is None:
         raise HTTPException(status_code=400, detail="position_ms required")
-    return await _spotify_control(f"/me/player/seek?position_ms={int(pos)}", "PUT")
+    params = {"position_ms": int(pos), "device_id": device_id}
+    return await _spotify_control("/me/player/seek", "PUT", params=params)
 
 
 @app.post("/api/spotify/player/volume")
-async def spotify_volume(payload: VolumePayload) -> dict:
-    return await _spotify_control(f"/me/player/volume?volume_percent={payload.percent}", "PUT")
+async def spotify_volume(payload: VolumePayload, device_id: Optional[str] = Query(default=None)) -> dict:
+    params = {"volume_percent": payload.percent, "device_id": device_id}
+    return await _spotify_control("/me/player/volume", "PUT", params=params)
 
 
 @app.post("/api/spotify/player/shuffle")
 async def spotify_shuffle(payload: ShufflePayload) -> dict:
     state = "true" if payload.state else "false"
-    return await _spotify_control(f"/me/player/shuffle?state={state}", "PUT")
+    params = {"state": state, "device_id": payload.device_id}
+    return await _spotify_control("/me/player/shuffle", "PUT", params=params)
 
 
 @app.post("/api/spotify/player/repeat")
 async def spotify_repeat(payload: RepeatPayload) -> dict:
     mode = payload.mode.lower()
-    return await _spotify_control(f"/me/player/repeat?state={mode}", "PUT")
+    params = {"state": mode, "device_id": payload.device_id}
+    return await _spotify_control("/me/player/repeat", "PUT", params=params)
 
 
 @app.exception_handler(HTTPException)
