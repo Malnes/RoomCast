@@ -929,46 +929,51 @@ async def _shutdown_events() -> None:
 
 
 def current_spotify_creds() -> tuple[str, str, str]:
-    cfg = read_spotify_config()
+    cfg = read_spotify_config(include_secret=True)
     cid = (cfg.get("client_id") or os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
     secret = cfg.get("client_secret") or os.getenv("SPOTIFY_CLIENT_SECRET") or ""
     redirect = cfg.get("redirect_uri") or os.getenv("SPOTIFY_REDIRECT_URI") or SPOTIFY_REDIRECT_URI
     return cid, secret, redirect
 
 
-def read_spotify_config() -> dict:
+def read_spotify_config(include_secret: bool = False) -> dict:
     token = load_token()
     has_token = bool(token and token.get("access_token"))
-    if not CONFIG_PATH.exists():
-        return {
-            "username": "",
-            "device_name": "RoomCast",
-            "bitrate": 320,
-            "initial_volume": 75,
-            "normalisation": True,
-            "has_password": False,
-            "client_id": SPOTIFY_CLIENT_ID,
-            "client_secret": "***" if SPOTIFY_CLIENT_SECRET else "",
-            "has_client_secret": bool(SPOTIFY_CLIENT_SECRET),
-            "redirect_uri": SPOTIFY_REDIRECT_URI,
-            "has_oauth_token": has_token,
-        }
+    config_exists = CONFIG_PATH.exists()
     try:
-        data = json.loads(CONFIG_PATH.read_text())
+        data = json.loads(CONFIG_PATH.read_text()) if config_exists else {}
     except json.JSONDecodeError:
         data = {}
-    return {
+
+    stored_client_id = (data.get("client_id")
+                        or os.getenv("SPOTIFY_CLIENT_ID")
+                        or SPOTIFY_CLIENT_ID
+                        or "").strip()
+    stored_client_secret = (data.get("client_secret")
+                            or os.getenv("SPOTIFY_CLIENT_SECRET")
+                            or SPOTIFY_CLIENT_SECRET
+                            or "")
+    stored_redirect = (data.get("redirect_uri")
+                       or os.getenv("SPOTIFY_REDIRECT_URI")
+                       or SPOTIFY_REDIRECT_URI)
+
+    cfg = {
         "username": data.get("username", ""),
         "device_name": data.get("device_name", "RoomCast"),
         "bitrate": data.get("bitrate", 320),
         "initial_volume": data.get("initial_volume", 75),
         "normalisation": data.get("normalisation", True),
         "has_password": bool(data.get("password")),
-        "client_id": data.get("client_id", SPOTIFY_CLIENT_ID),
-        "has_client_secret": bool(data.get("client_secret") or SPOTIFY_CLIENT_SECRET),
-        "redirect_uri": data.get("redirect_uri", SPOTIFY_REDIRECT_URI),
+        "client_id": stored_client_id,
+        "has_client_secret": bool(stored_client_secret),
+        "redirect_uri": stored_redirect,
         "has_oauth_token": has_token,
     }
+    if include_secret:
+        cfg["client_secret"] = stored_client_secret
+    elif not config_exists:
+        cfg["client_secret"] = "***" if stored_client_secret else ""
+    return cfg
 
 
 def read_librespot_status() -> dict:
