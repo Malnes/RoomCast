@@ -1744,6 +1744,7 @@ async def spotify_player_status() -> dict:
         "item": data.get("item", {}),
         "shuffle_state": data.get("shuffle_state", False),
         "repeat_state": data.get("repeat_state", "off"),
+        "context": data.get("context"),
     }
 
 
@@ -1862,6 +1863,52 @@ async def spotify_playlist_tracks(playlist_id: str, limit: int = Query(default=1
         "total": data.get("total", len(tracks)),
         "next": bool(data.get("next")),
         "previous": bool(data.get("previous")),
+    }
+
+
+@app.get("/api/spotify/playlists/{playlist_id}/summary")
+async def spotify_playlist_summary(playlist_id: str) -> dict:
+    token = _ensure_spotify_token()
+    total_duration = 0
+    total_tracks = None
+    offset = 0
+    limit = 100
+    while True:
+        params = {
+            "limit": limit,
+            "offset": offset,
+            "fields": "items(track(duration_ms,is_local)),total,next,offset,limit",
+        }
+        path = _with_query(f"/playlists/{playlist_id}/tracks", params)
+        resp = await spotify_request("GET", path, token)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json()
+        items = data.get("items") or []
+        for item in items:
+            track = item.get("track") if isinstance(item, dict) else None
+            if not isinstance(track, dict):
+                continue
+            if track.get("is_local") is True:
+                continue
+            duration = track.get("duration_ms")
+            if isinstance(duration, (int, float)):
+                total_duration += max(0, int(duration))
+        if isinstance(data.get("total"), int):
+            total_tracks = data.get("total")
+        next_url = data.get("next")
+        offset_value = data.get("offset", offset)
+        limit_value = data.get("limit", limit)
+        if not isinstance(limit_value, int) or limit_value <= 0:
+            break
+        offset = offset_value + limit_value
+        if not next_url:
+            break
+        if isinstance(total_tracks, int) and offset >= total_tracks:
+            break
+    return {
+        "tracks_total": total_tracks,
+        "duration_ms_total": total_duration,
     }
 
 

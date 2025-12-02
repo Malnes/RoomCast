@@ -113,11 +113,22 @@
           <div class="playlist-tracks-header">
             <button id="playlist-back" class="playlist-back-btn" type="button">← All playlists</button>
             <div class="playlist-selected-meta">
-              <div id="playlist-selected-name" class="playlist-selected-name">Playlist</div>
-              <div id="playlist-selected-owner" class="playlist-selected-owner muted">Owner</div>
+              <div class="playlist-selected-top">
+                <div id="playlist-selected-name" class="playlist-selected-name">Playlist</div>
+                <div id="playlist-selected-owner" class="playlist-selected-owner muted">Owner</div>
+              </div>
+              <div id="playlist-summary" class="playlist-summary muted">Select a playlist to see details.</div>
             </div>
           </div>
+          <div class="playlist-track-filter">
+            <label for="playlist-track-filter" class="sr-only">Filter songs</label>
+            <input type="search" id="playlist-track-filter" placeholder="Filter songs in this playlist" autocomplete="off" spellcheck="false">
+          </div>
           <div class="playlist-tracklist" id="playlist-tracklist" role="list"></div>
+          <div class="playlist-tracklist-footer">
+            <div id="playlist-track-progress" class="playlist-track-progress muted"></div>
+            <button id="playlist-load-more" class="playlist-load-more small-btn" type="button" hidden>Load more songs</button>
+          </div>
         </div>
       </div>
     </div>
