@@ -15,8 +15,11 @@
       --panel: rgba(15,23,42,0.92);
     }
     * { box-sizing: border-box; }
-    body { margin: 0; padding: 0; background: radial-gradient(circle at 20% 20%, rgba(34,197,94,0.08), transparent 30%), radial-gradient(circle at 80% 0%, rgba(59,130,246,0.08), transparent 25%), #0b1020; }
-    .shell { max-width: 960px; margin: 0 auto; padding: 16px 16px 200px; }
+    body { margin: 0; padding: 0; background: radial-gradient(circle at 20% 20%, rgba(34,197,94,0.08), transparent 30%), radial-gradient(circle at 80% 0%, rgba(59,130,246,0.08), transparent 25%), #0b1020; min-height: 100vh; position: relative; overflow-x: hidden; }
+    body.use-cover-art-background { background: #020617; }
+    #cover-art-backdrop { position: fixed; inset: -40px; background: #020617; background-size: cover; background-position: center; filter: blur(40px); opacity: 0; transition: opacity 0.35s ease; z-index: 0; pointer-events: none; }
+    body.use-cover-art-background #cover-art-backdrop { opacity: 1; }
+    .shell { max-width: 960px; margin: 0 auto; padding: 16px 16px 220px; position: relative; z-index: 1; }
     header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
     h1 { margin: 0; font-size: 22px; letter-spacing: -0.4px; }
     .icon-btn { background: rgba(255,255,255,0.07); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.12); padding: 8px 10px; border-radius: 12px; cursor: pointer; font-weight: 700; min-width: 44px; width: auto; display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
@@ -71,6 +74,12 @@
     .add-node-menu button:hover { background: rgba(34,197,94,0.15); color: #bbf7d0; }
     .node-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
     .node-gear { position: relative; display: flex; gap: 8px; align-items: center; }
+    .node-icon-btn { width: 48px; height: 48px; border: none; background: transparent; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; color: #e2e8f0; cursor: pointer; transition: color 0.15s ease, transform 0.1s ease; font-size: 22px; }
+    .node-icon-btn svg { width: 28px; height: 28px; display: block; }
+    .node-icon-btn:focus-visible { outline: 2px solid rgba(34,197,94,0.6); outline-offset: 2px; }
+    .node-icon-btn:hover:not(:disabled) { color: #a5f3fc; }
+    .node-icon-btn:active:not(:disabled) { transform: scale(0.96); }
+    .node-icon-btn:disabled { opacity: 0.35; cursor: default; }
     .node-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
     .node-mute-btn { width: 42px; height: 42px; border-radius: 12px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.14); background: rgba(15,23,42,0.8); color: #e2e8f0; }
     .node-mute-btn svg { width: 18px; height: 18px; }
@@ -86,7 +95,7 @@
     .eq-band-cell label { font-size: 11px; text-transform: uppercase; display: block; margin-bottom: 4px; color: rgba(255,255,255,0.5); }
     .eq-band-cell input[type="number"] { width: 100%; margin-bottom: 4px; }
     .eq-band-cell input[type="range"] { width: 100%; }
-    .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 24px 12px; }
+    .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 24px 12px; z-index: 200; }
     .settings-card { background: #0f172a; border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 16px; width: min(960px, 95vw); box-shadow: 0 18px 40px rgba(0,0,0,0.35); }
     .settings-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
     .spinner { width: 18px; height: 18px; border: 3px solid rgba(255,255,255,0.2); border-top-color: #22c55e; border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; vertical-align: middle; }
@@ -98,6 +107,16 @@
     .node-meta-value { font-size: 14px; color: #e2e8f0; word-break: break-word; }
     .modal-actions { display: flex; flex-direction: column; gap: 8px; margin-top: 8px; }
     .modal-actions button { width: 100%; }
+    .nodes-section { margin: 8px 0 24px; }
+    .nodes-section #nodes { margin-top: 12px; }
+    .collapsible-panel { padding: 0; overflow: hidden; }
+    .collapsible-header { width: 100%; padding: 18px 20px; background: transparent; border: none; color: #e2e8f0; display: flex; justify-content: space-between; align-items: center; gap: 12px; cursor: pointer; font-size: 14px; letter-spacing: 0.8px; text-transform: uppercase; }
+    .collapsible-header .section-title { margin: 0; }
+    .collapsible-header:focus-visible { outline: 2px solid rgba(34,197,94,0.6); outline-offset: 2px; }
+    .collapsible-icon { font-size: 18px; transition: transform 0.2s ease; color: #94a3b8; }
+    .collapsible-panel[data-open="true"] .collapsible-icon { transform: rotate(180deg); }
+    .collapsible-content { display: none; padding: 0 20px 20px 20px; border-top: 1px solid rgba(255,255,255,0.08); }
+    .collapsible-panel[data-open="true"] .collapsible-content { display: block; }
     #player-panel { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(6,10,20,0.25); backdrop-filter: blur(28px); border-top: 1px solid rgba(148,163,184,0.2); box-shadow: 0 -24px 60px rgba(0,0,0,0.35); padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 14px; z-index: 50; }
     .player-top { display: flex; flex-wrap: nowrap; gap: 16px; justify-content: space-between; align-items: center; }
     .player-meta { display: flex; align-items: center; gap: 12px; flex: 1 1 auto; min-width: 0; }
@@ -143,6 +162,7 @@
   </style>
 </head>
 <body>
+  <div id="cover-art-backdrop" aria-hidden="true"></div>
   <div class="shell">
     <header>
       <h1>RoomCast</h1>
@@ -161,11 +181,9 @@
     <div id="error" class="toast error" style="display:none; opacity:0;"></div>
     <div id="success" class="toast success" style="display:none; opacity:0;"></div>
 
-    <div class="panel">
-      <div class="panel-heading">
-        <div class="section-title">Nodes</div>
-      </div>
-      <div id="nodes" style="margin-top:12px;"></div>
+    <div class="nodes-section">
+      <div class="section-title">Nodes</div>
+      <div id="nodes"></div>
     </div>
 
   </div>
@@ -208,58 +226,84 @@
         <div class="section-title" style="margin:0;">Settings</div>
         <button id="close-settings" class="icon-btn">✕</button>
       </div>
-      <div class="panel">
-        <div class="section-title">Spotify setup</div>
-        <div class="muted" id="librespot-status" style="margin-bottom:8px;">Status: unknown</div>
-        <div class="grid">
-          <div>
-            <label>Spotify client ID</label>
-            <input id="sp-client-id" placeholder="client id">
-          </div>
-          <div>
-            <label>Spotify client secret</label>
-            <input id="sp-client-secret" type="password" placeholder="client secret">
-          </div>
-          <div>
-            <label>Redirect URI</label>
-            <input id="sp-redirect" placeholder="http://localhost:8000/api/spotify/callback">
-          </div>
-          <div>
-            <label>Device name</label>
-            <input id="sp-name" placeholder="RoomCast">
-          </div>
-          <div>
-            <label>Bitrate</label>
-            <select id="sp-bitrate">
-              <option value="96">96 kbps</option>
-              <option value="160">160 kbps</option>
-              <option value="320" selected>320 kbps</option>
-            </select>
-          </div>
-          <div>
-            <label>Initial volume</label>
-            <input id="sp-initvol" type="range" min="0" max="100" value="75">
-          </div>
-          <div style="display:flex; align-items:center; gap:6px;">
-            <label style="margin:0;">Volume normalisation</label>
-            <input id="sp-normalise" type="checkbox" style="width:auto;">
-          </div>
-      </div>
-        <div style="margin-top:12px;">
-          <button id="save-spotify">Save Spotify config</button>
-          <div id="spotify-spinner" style="display:none; margin-top:8px;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
-          <div style="margin-top:8px;">
-          <button class="small-btn" id="spotify-auth">Link Spotify account</button>
-          <button class="small-btn" id="spotify-dashboard">Open Spotify developer dashboard</button>
-          <div id="spotify-link-status" class="status-pill warn" style="margin-top:6px;">Account link status: unknown</div>
-          <div class="muted" style="font-size:12px;">Create Client ID/Secret in the dashboard, save them here, then click “Link Spotify account”. Password sign-ins are no longer supported.</div>
+      <div class="panel collapsible-panel" data-collapsible>
+        <button class="collapsible-header" type="button" aria-expanded="false">
+          <span class="section-title" style="margin:0;">General</span>
+          <span class="collapsible-icon" aria-hidden="true">▾</span>
+        </button>
+        <div class="collapsible-content" aria-hidden="true">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+            <div>
+              <div class="label" style="margin:0;">Use cover art as background</div>
+              <div class="muted" style="font-size:12px;">Applies the current track art as a blurred backdrop across the app.</div>
+            </div>
+            <input id="cover-art-background" type="checkbox" style="width:auto;" checked>
           </div>
         </div>
       </div>
 
-      <div class="panel">
-        <div class="section-title">Snapcast clients (view)</div>
-        <div id="clients-settings"></div>
+      <div class="panel collapsible-panel" data-collapsible>
+        <button class="collapsible-header" type="button" aria-expanded="false">
+          <span class="section-title" style="margin:0;">Spotify setup</span>
+          <span class="collapsible-icon" aria-hidden="true">▾</span>
+        </button>
+        <div class="collapsible-content" aria-hidden="true">
+          <div class="muted" id="librespot-status" style="margin-bottom:8px;">Status: unknown</div>
+          <div class="grid">
+            <div>
+              <label>Spotify client ID</label>
+              <input id="sp-client-id" placeholder="client id">
+            </div>
+            <div>
+              <label>Spotify client secret</label>
+              <input id="sp-client-secret" type="password" placeholder="client secret">
+            </div>
+            <div>
+              <label>Redirect URI</label>
+              <input id="sp-redirect" placeholder="http://localhost:8000/api/spotify/callback">
+            </div>
+            <div>
+              <label>Device name</label>
+              <input id="sp-name" placeholder="RoomCast">
+            </div>
+            <div>
+              <label>Bitrate</label>
+              <select id="sp-bitrate">
+                <option value="96">96 kbps</option>
+                <option value="160">160 kbps</option>
+                <option value="320" selected>320 kbps</option>
+              </select>
+            </div>
+            <div>
+              <label>Initial volume</label>
+              <input id="sp-initvol" type="range" min="0" max="100" value="75">
+            </div>
+            <div style="display:flex; align-items:center; gap:6px;">
+              <label style="margin:0;">Volume normalisation</label>
+              <input id="sp-normalise" type="checkbox" style="width:auto;">
+            </div>
+        </div>
+          <div style="margin-top:12px;">
+            <button id="save-spotify">Save Spotify config</button>
+            <div id="spotify-spinner" style="display:none; margin-top:8px;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
+            <div style="margin-top:8px;">
+            <button class="small-btn" id="spotify-auth">Link Spotify account</button>
+            <button class="small-btn" id="spotify-dashboard">Open Spotify developer dashboard</button>
+            <div id="spotify-link-status" class="status-pill warn" style="margin-top:6px;">Account link status: unknown</div>
+            <div class="muted" style="font-size:12px;">Create Client ID/Secret in the dashboard, save them here, then click “Link Spotify account”. Password sign-ins are no longer supported.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel collapsible-panel" data-collapsible>
+        <button class="collapsible-header" type="button" aria-expanded="false">
+          <span class="section-title" style="margin:0;">Snapcast clients (view)</span>
+          <span class="collapsible-icon" aria-hidden="true">▾</span>
+        </button>
+        <div class="collapsible-content" aria-hidden="true">
+          <div id="clients-settings"></div>
+        </div>
       </div>
 
     </div>
@@ -330,6 +374,9 @@
     const playerArt = document.getElementById('player-art');
     const playerTitle = document.getElementById('player-title');
     const playerArtist = document.getElementById('player-artist');
+    const coverArtBackdrop = document.getElementById('cover-art-backdrop');
+    const coverArtBackgroundToggle = document.getElementById('cover-art-background');
+    const collapsiblePanels = Array.from(document.querySelectorAll('[data-collapsible]'));
     let playerStatus = null;
     let activeDeviceId = null;
     let playerTick = null;
@@ -339,6 +386,8 @@
     let nodeSettingsContent = null;
     let nodeSettingsTitle = null;
     let nodeSettingsNodeId = null;
+    let useCoverArtBackground = true;
+    let lastCoverArtUrl = null;
 
 
 
@@ -541,6 +590,59 @@
       addNodeToggle.setAttribute('aria-expanded', next ? 'true' : 'false');
     }
 
+    function setCollapsiblePanelState(panel, open) {
+      if (!panel) return;
+      const trigger = panel.querySelector('.collapsible-header');
+      const content = panel.querySelector('.collapsible-content');
+      const next = !!open;
+      panel.dataset.open = next ? 'true' : 'false';
+      if (trigger) trigger.setAttribute('aria-expanded', next ? 'true' : 'false');
+      if (content) content.setAttribute('aria-hidden', next ? 'false' : 'true');
+    }
+
+    function initCollapsiblePanels() {
+      collapsiblePanels.forEach(panel => {
+        const trigger = panel.querySelector('.collapsible-header');
+        if (!trigger) return;
+        trigger.addEventListener('click', () => {
+          const isOpen = panel.dataset.open === 'true';
+          setCollapsiblePanelState(panel, !isOpen);
+        });
+        setCollapsiblePanelState(panel, false);
+      });
+    }
+
+    function collapseAllPanels() {
+      collapsiblePanels.forEach(panel => setCollapsiblePanelState(panel, false));
+    }
+
+    function applyCoverArtBackground() {
+      if (!coverArtBackdrop) return;
+      if (useCoverArtBackground && lastCoverArtUrl) {
+        const safeUrl = lastCoverArtUrl.replace(/"/g, '\"');
+        coverArtBackdrop.style.backgroundImage = `${COVER_ART_BACKDROP_OVERLAY}, url("${safeUrl}")`;
+      } else {
+        coverArtBackdrop.style.backgroundImage = '';
+      }
+      document.body.classList.toggle('use-cover-art-background', useCoverArtBackground && !!lastCoverArtUrl);
+    }
+
+    function setCoverArtBackgroundEnabled(enabled) {
+      const next = !!enabled;
+      if (useCoverArtBackground === next) {
+        applyCoverArtBackground();
+        return;
+      }
+      useCoverArtBackground = next;
+      applyCoverArtBackground();
+    }
+
+    function syncGeneralSettingsUI() {
+      if (coverArtBackgroundToggle) {
+        coverArtBackgroundToggle.checked = useCoverArtBackground;
+      }
+    }
+
     function applyMuteButtonState(btn, muted) {
       const active = !!muted;
       btn.dataset.muted = active ? 'true' : 'false';
@@ -592,7 +694,9 @@
     const ICON_PLAY = `<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="8,5 20,12 8,19"/></svg>`;
     const ICON_PAUSE = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="5" width="4" height="14" rx="1"/><rect x="13" y="5" width="4" height="14" rx="1"/></svg>`;
     const ICON_REPEAT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 014-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>`;
+    const COVER_ART_BACKDROP_OVERLAY = 'linear-gradient(135deg, rgba(2,6,23,0.92), rgba(2,6,23,0.65))';
     initializePlayerButtons();
+    initCollapsiblePanels();
     let eqModal = null;
     const spotifyAuthBtn = document.getElementById('spotify-auth');
     const spotifyDashboardBtn = document.getElementById('spotify-dashboard');
@@ -674,7 +778,7 @@
         const gearWrap = document.createElement('div');
         gearWrap.className = 'node-gear';
         const gearBtn = document.createElement('button');
-        gearBtn.className = 'icon-btn gear-btn';
+        gearBtn.className = 'node-icon-btn';
         gearBtn.textContent = '⚙︎';
         gearBtn.setAttribute('aria-label', `Settings for ${n.name}`);
         gearBtn.addEventListener('click', (event) => {
@@ -696,7 +800,7 @@
         const updating = !!n.updating;
         const disableAgentControls = !isBrowser && (!paired || !configured || restarting || !online);
         const eqBtn = document.createElement('button');
-        eqBtn.className = 'icon-btn small-btn';
+        eqBtn.className = 'node-icon-btn';
         eqBtn.innerHTML = EQ_ICON_SVG;
         eqBtn.setAttribute('aria-label', 'Equalizer');
         eqBtn.title = 'Equalizer';
@@ -1888,6 +1992,8 @@
       } else {
         playerArt.style.display = 'none';
       }
+      lastCoverArtUrl = art || null;
+      applyCoverArtBackground();
       const duration = item.duration_ms || 0;
       const progress = status?.progress_ms || 0;
       playerSeek.max = duration || 1;
@@ -2043,6 +2149,8 @@
 
     function openSettings() {
       settingsOverlay.style.display = 'flex';
+      collapseAllPanels();
+      syncGeneralSettingsUI();
       fetchSpotifyConfig();
       fetchLibrespotStatus();
       fetchStatus();
@@ -2077,6 +2185,11 @@
     openSettingsBtn.addEventListener('click', openSettings);
     closeSettingsBtn.addEventListener('click', closeSettings);
     closeDiscoverBtn.addEventListener('click', closeDiscover);
+    if (coverArtBackgroundToggle) {
+      coverArtBackgroundToggle.addEventListener('change', () => {
+        setCoverArtBackgroundEnabled(coverArtBackgroundToggle.checked);
+      });
+    }
     const handleAddNodeKey = evt => {
       if (evt.key === 'Escape') {
         setAddNodeMenuOpen(false);
