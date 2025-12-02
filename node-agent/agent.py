@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.15")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.16")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -62,6 +62,7 @@ update_task: asyncio.Task | None = None
 
 eq_state: dict = {"preset": "peq15", "band_count": 15, "bands": []}
 muted_state: bool = False
+pre_mute_volume: Optional[int] = None
 log = logging.getLogger("roomcast-agent")
 agent_secret: str | None = None
 agent_config: dict = {}
@@ -755,10 +756,32 @@ def _amixer_set(percent: int) -> None:
 
 
 def _amixer_mute(muted: bool) -> None:
+    global pre_mute_volume
     if DRY_RUN:
+        if muted:
+            pre_mute_volume = _effective_volume(last_requested_volume)
+        else:
+            pre_mute_volume = None
         return
     cmd = "mute" if muted else "unmute"
-    _try_mixer_command(lambda control: ["-M", "set", control, cmd])
+    try:
+        _try_mixer_command(lambda control: ["-M", "set", control, cmd])
+        if muted:
+            pre_mute_volume = _effective_volume(last_requested_volume)
+        else:
+            pre_mute_volume = None
+        return
+    except HTTPException as exc:
+        log.info("Mute switch not available via amixer; falling back to volume control: %s", exc.detail)
+
+    target = _effective_volume(last_requested_volume)
+    if muted:
+        pre_mute_volume = target
+        _amixer_set(0)
+    else:
+        restored = pre_mute_volume if pre_mute_volume is not None else target
+        pre_mute_volume = None
+        _amixer_set(restored)
 
 
 async def _run_maintenance_command(args: list[str], label: str) -> None:
