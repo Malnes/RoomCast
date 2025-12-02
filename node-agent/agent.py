@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.13")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.14")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -165,6 +165,7 @@ DEFAULT_AGENT_CONFIG = {
     "snapserver_host": None,
     "snapserver_port": SNAPCLIENT_DEFAULT_PORT,
     "playback_device": PLAYBACK_DEVICE,
+    "max_volume_percent": 100,
 }
 
 
@@ -198,6 +199,25 @@ def _persist_agent_config(data: dict) -> None:
 agent_config = _load_agent_config()
 snapclient_process = None
 _resolved_control: Optional[str] = None
+last_requested_volume: int = 75
+
+
+def _max_volume_percent() -> int:
+    raw = agent_config.get("max_volume_percent", 100)
+    try:
+        percent = int(raw)
+    except (TypeError, ValueError):
+        return 100
+    return max(0, min(100, percent))
+
+
+def _effective_volume(percent: int) -> int:
+    try:
+        requested = int(percent)
+    except (TypeError, ValueError):
+        requested = 0
+    requested = max(0, min(100, requested))
+    return (requested * _max_volume_percent()) // 100
 
 
 def _current_playback_device() -> str:
@@ -771,6 +791,7 @@ async def health() -> dict:
         "playback_device": _current_playback_device(),
         "outputs": _outputs_snapshot(),
         "fingerprint": node_uid,
+        "max_volume_percent": _max_volume_percent(),
     }
 
 
@@ -810,6 +831,17 @@ async def set_snapclient_config(payload: SnapclientConfigPayload, request: Reque
     return {"ok": True, "configured": bool(host)}
 
 
+@app.post("/config/max-volume")
+async def set_max_volume_limit(payload: VolumePayload, request: Request) -> dict:
+    _auth(request)
+    value = max(0, min(100, int(payload.percent)))
+    agent_config["max_volume_percent"] = value
+    _persist_agent_config(agent_config)
+    effective = _effective_volume(last_requested_volume)
+    _amixer_set(effective)
+    return {"ok": True, "max_volume_percent": value, "applied_volume": effective}
+
+
 @app.get("/outputs")
 async def list_outputs(request: Request) -> dict:
     _auth(request)
@@ -826,8 +858,17 @@ async def set_output(payload: OutputSelectionPayload, request: Request) -> dict:
 @app.post("/volume")
 async def set_volume(payload: VolumePayload, request: Request) -> dict:
     _auth(request)
-    _amixer_set(payload.percent)
-    return {"ok": True, "volume": payload.percent}
+    global last_requested_volume
+    requested = max(0, min(100, int(payload.percent)))
+    last_requested_volume = requested
+    effective = _effective_volume(requested)
+    _amixer_set(effective)
+    return {
+        "ok": True,
+        "requested": requested,
+        "volume": effective,
+        "max_volume_percent": _max_volume_percent(),
+    }
 
 
 @app.post("/mute")

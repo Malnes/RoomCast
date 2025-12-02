@@ -246,11 +246,46 @@ def public_node(node: dict) -> dict:
     data["playback_device"] = node.get("playback_device")
     data["outputs"] = node.get("outputs") or {}
     data["fingerprint"] = node.get("fingerprint")
+    data["max_volume_percent"] = _get_node_max_volume(node)
     return data
 
 
 def public_nodes() -> list[dict]:
     return [public_node(node) for node in nodes.values()]
+
+
+def _normalize_percent(value, *, default: int) -> int:
+    try:
+        percent = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, min(100, percent))
+
+
+def _get_node_max_volume(node: dict) -> int:
+    return _normalize_percent(node.get("max_volume_percent", 100), default=100)
+
+
+def _apply_volume_limit(node: dict, requested_percent: int) -> int:
+    requested = _normalize_percent(requested_percent, default=0)
+    limit = _get_node_max_volume(node)
+    return (requested * limit) // 100
+
+
+async def _send_browser_volume(node: dict, requested_percent: int) -> None:
+    ws = browser_ws.get(node.get("id"))
+    if not ws:
+        return
+    effective = _apply_volume_limit(node, requested_percent)
+    await ws.send_json({"type": "volume", "percent": effective})
+
+
+async def _sync_node_max_volume(node: dict, *, percent: Optional[int] = None) -> None:
+    if node.get("type") != "agent":
+        return
+    value = _get_node_max_volume(node) if percent is None else _normalize_percent(percent, default=_get_node_max_volume(node))
+    payload = {"percent": value}
+    await _call_agent(node, "/config/max-volume", payload)
 
 
 async def broadcast_nodes() -> None:
@@ -326,7 +361,8 @@ def _register_node_internal(
         "agent_secret": previous.get("agent_secret"),
         "audio_configured": True if node_type == "browser" else previous.get("audio_configured", False),
         "agent_version": previous.get("agent_version"),
-        "volume_percent": previous.get("volume_percent", 75),
+        "volume_percent": _normalize_percent(previous.get("volume_percent", 75), default=75),
+        "max_volume_percent": _normalize_percent(previous.get("max_volume_percent", 100), default=100),
         "muted": previous.get("muted", False),
         "updating": bool(previous.get("updating", False)),
         "playback_device": previous.get("playback_device"),
@@ -489,6 +525,11 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[b
         if node.get("outputs") != outputs:
             node["outputs"] = outputs
             changed = True
+    if "max_volume_percent" in data:
+        max_vol = _normalize_percent(data.get("max_volume_percent"), default=_get_node_max_volume(node))
+        if node.get("max_volume_percent") != max_vol:
+            node["max_volume_percent"] = max_vol
+            changed = True
     if persist and changed:
         save_nodes()
     return True, changed
@@ -599,7 +640,8 @@ def load_nodes() -> None:
                 item["audio_configured"] = True
             else:
                 item["audio_configured"] = bool(item.get("audio_configured"))
-            item["volume_percent"] = int(item.get("volume_percent", 75))
+            item["volume_percent"] = _normalize_percent(item.get("volume_percent", 75), default=75)
+            item["max_volume_percent"] = _normalize_percent(item.get("max_volume_percent", 100), default=100)
             item["muted"] = bool(item.get("muted", False))
             item["updating"] = bool(item.get("updating", False))
             item["playback_device"] = item.get("playback_device")
@@ -861,6 +903,7 @@ async def register_node(reg: NodeRegistration) -> dict:
             secret = await request_agent_secret(node, force=True)
             node["agent_secret"] = secret
             await configure_agent_audio(node)
+            await _sync_node_max_volume(node)
         except Exception:
             nodes.pop(node["id"], None)
             save_nodes()
@@ -901,18 +944,35 @@ async def set_node_volume(node_id: str, payload: VolumePayload) -> dict:
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
+    requested = _normalize_percent(payload.percent, default=node.get("volume_percent", 75))
     if node.get("type") == "browser":
         ws = browser_ws.get(node_id)
         if not ws:
             raise HTTPException(status_code=503, detail="Browser node not connected")
-        await ws.send_json({"type": "volume", "percent": payload.percent})
+        await _send_browser_volume(node, requested)
         result = {"sent": True}
     else:
-        result = await _call_agent(node, "/volume", payload.model_dump())
-    node["volume_percent"] = int(payload.percent)
+        result = await _call_agent(node, "/volume", {"percent": requested})
+    node["volume_percent"] = requested
     save_nodes()
     await broadcast_nodes()
     return {"ok": True, "result": result}
+
+
+@app.post("/api/nodes/{node_id}/max-volume")
+async def set_node_max_volume(node_id: str, payload: VolumePayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    percent = _normalize_percent(payload.percent, default=_get_node_max_volume(node))
+    if node.get("type") == "agent":
+        await _sync_node_max_volume(node, percent=percent)
+    node["max_volume_percent"] = percent
+    save_nodes()
+    if node.get("type") == "browser":
+        await _send_browser_volume(node, node.get("volume_percent", 75))
+    await broadcast_nodes()
+    return {"ok": True, "max_volume_percent": percent}
 
 
 @app.post("/api/nodes/{node_id}/mute")
