@@ -791,12 +791,21 @@ function renderSearchTracks(bucket = {}) {
     return;
   }
   items.forEach(track => {
-    const row = document.createElement('div');
+    const row = document.createElement('button');
+    row.type = 'button';
     row.className = 'search-track';
+    row.addEventListener('click', () => playSearchTrack(track));
+    const coverWrap = document.createElement('div');
+    coverWrap.className = 'search-track-cover-wrap';
     const cover = document.createElement('img');
     cover.className = 'search-track-cover';
     cover.alt = '';
     cover.src = track?.image?.url || PLAYLIST_FALLBACK_COVER;
+    const playOverlay = document.createElement('div');
+    playOverlay.className = 'search-track-play';
+    playOverlay.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor" role="img" aria-hidden="true"><polygon points="9,6 19,12 9,18"/></svg>';
+    coverWrap.appendChild(cover);
+    coverWrap.appendChild(playOverlay);
     const meta = document.createElement('div');
     meta.className = 'search-track-meta';
     const title = document.createElement('div');
@@ -816,14 +825,8 @@ function renderSearchTracks(bucket = {}) {
       duration.textContent = msToTime(track.duration_ms);
       meta.appendChild(duration);
     }
-    const playBtn = document.createElement('button');
-    playBtn.className = 'search-play-btn';
-    playBtn.type = 'button';
-    playBtn.textContent = 'Play';
-    playBtn.addEventListener('click', () => playSearchTrack(track));
-    row.appendChild(cover);
+    row.appendChild(coverWrap);
     row.appendChild(meta);
-    row.appendChild(playBtn);
     pane.appendChild(row);
   });
 }
