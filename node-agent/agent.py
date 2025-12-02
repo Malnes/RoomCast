@@ -20,7 +20,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.14")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.15")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -230,10 +230,19 @@ def _current_playback_card() -> Optional[str]:
     if ":" not in device:
         return None
     _, suffix = device.split(":", 1)
+    suffix = suffix.strip()
     if not suffix:
         return None
-    card = suffix.split(",", 1)[0].strip()
-    return card or None
+    primary = suffix.split(",", 1)[0].strip()
+    if not primary:
+        return None
+    if "=" in primary:
+        key, _, value = primary.partition("=")
+        if key.strip().lower() == "card":
+            primary = value.strip()
+    if primary.lower().startswith("hw:"):
+        primary = primary.split(":", 1)[1].strip() or primary
+    return primary or None
 
 
 def _list_playback_devices() -> list[dict]:
@@ -336,9 +345,14 @@ async def _set_playback_device(device: str) -> dict:
 def _list_mixer_controls() -> list[str]:
     if DRY_RUN:
         return [MIXER_CONTROL]
+    card = _current_playback_card()
     try:
+        args = ["amixer"]
+        if card:
+            args.extend(["-c", card])
+        args.append("scontrols")
         proc = subprocess.run(
-            ["amixer", "scontrols"],
+            args,
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,

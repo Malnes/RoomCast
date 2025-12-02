@@ -40,6 +40,14 @@
           <div id="player-artist" class="player-artist">—</div>
         </div>
       </div>
+      <button class="player-icon-btn player-playlists-btn" id="player-playlists" type="button" aria-label="Browse playlists">
+        <svg viewBox="0 0 24 24" role="img" aria-hidden="true" focusable="false">
+          <path d="M4 6h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
+          <path d="M4 12h12" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
+          <path d="M4 18h7" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"></path>
+          <path d="M17 6v8.5a2.5 2.5 0 10-1.5 2.3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></path>
+        </svg>
+      </button>
       <div class="player-volume-inline" id="player-volume-inline">
         <button class="player-volume-toggle player-icon-btn" id="player-volume-toggle" type="button" aria-label="Adjust master volume" aria-expanded="false"></button>
         <div class="player-volume-slider" aria-hidden="true">
@@ -60,6 +68,52 @@
       <button class="player-icon-btn play" id="player-play" aria-label="Play/Pause"></button>
       <button class="player-icon-btn" id="player-next" aria-label="Next"></button>
       <button class="player-icon-btn" id="player-repeat" aria-label="Repeat"></button>
+    </div>
+  </div>
+
+  <div id="playlist-overlay" class="playlist-overlay" aria-hidden="true">
+    <div class="playlist-modal" role="dialog" aria-modal="true" aria-labelledby="playlist-modal-title">
+      <div class="playlist-header">
+        <div>
+          <div class="section-title" id="playlist-modal-title">Playlists</div>
+          <div class="muted" id="playlist-modal-subtitle">Pick a playlist to browse tracks.</div>
+        </div>
+        <button id="playlist-close" class="icon-btn small-btn" type="button" aria-label="Close playlists">✕</button>
+      </div>
+      <div class="playlist-body">
+        <div class="playlist-toolbar" id="playlist-toolbar">
+          <div class="playlist-search-group">
+            <label for="playlist-search" class="sr-only">Search playlists</label>
+            <input type="search" id="playlist-search" placeholder="Search playlists" autocomplete="off" spellcheck="false">
+          </div>
+          <div class="playlist-sort-group">
+            <label for="playlist-sort" class="sr-only">Sort playlists</label>
+            <select id="playlist-sort">
+              <option value="recent">Recently added</option>
+              <option value="name">Name (A–Z)</option>
+            </select>
+          </div>
+        </div>
+        <div id="playlist-loading" class="playlist-loading" role="status" aria-live="polite">
+          <span class="spinner"></span>
+          <span>Loading playlists…</span>
+        </div>
+        <div id="playlist-error" class="playlist-error" role="alert" hidden></div>
+        <div id="playlist-empty" class="playlist-empty muted" hidden>No playlists available.</div>
+        <div class="playlist-grid-view" data-view="playlists">
+          <div class="playlist-grid" id="playlist-grid" role="list"></div>
+        </div>
+        <div class="playlist-tracks-view" data-view="tracks" hidden>
+          <div class="playlist-tracks-header">
+            <button id="playlist-back" class="playlist-back-btn" type="button">← All playlists</button>
+            <div class="playlist-selected-meta">
+              <div id="playlist-selected-name" class="playlist-selected-name">Playlist</div>
+              <div id="playlist-selected-owner" class="playlist-selected-owner muted">Owner</div>
+            </div>
+          </div>
+          <div class="playlist-tracklist" id="playlist-tracklist" role="list"></div>
+        </div>
+      </div>
     </div>
   </div>
 

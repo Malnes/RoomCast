@@ -46,6 +46,23 @@ const playerTimeTotal = document.getElementById('player-time-total');
 const playerArt = document.getElementById('player-art');
 const playerTitle = document.getElementById('player-title');
 const playerArtist = document.getElementById('player-artist');
+const playerPlaylistsBtn = document.getElementById('player-playlists');
+const playlistOverlay = document.getElementById('playlist-overlay');
+const playlistCloseBtn = document.getElementById('playlist-close');
+const playlistGrid = document.getElementById('playlist-grid');
+const playlistTracklist = document.getElementById('playlist-tracklist');
+const playlistToolbar = document.getElementById('playlist-toolbar');
+const playlistLoading = document.getElementById('playlist-loading');
+const playlistError = document.getElementById('playlist-error');
+const playlistEmpty = document.getElementById('playlist-empty');
+const playlistBackBtn = document.getElementById('playlist-back');
+const playlistSelectedName = document.getElementById('playlist-selected-name');
+const playlistSelectedOwner = document.getElementById('playlist-selected-owner');
+const playlistGridView = document.querySelector('.playlist-grid-view');
+const playlistTracksView = document.querySelector('.playlist-tracks-view');
+const playlistSubtitle = document.getElementById('playlist-modal-subtitle');
+const playlistSearchInput = document.getElementById('playlist-search');
+const playlistSortSelect = document.getElementById('playlist-sort');
 const coverArtBackdrop = document.getElementById('cover-art-backdrop');
 const coverArtBackgroundToggle = document.getElementById('cover-art-background');
 const collapsiblePanels = Array.from(document.querySelectorAll('[data-collapsible]'));
@@ -60,6 +77,20 @@ let nodeSettingsTitle = null;
 let nodeSettingsNodeId = null;
 let useCoverArtBackground = true;
 let lastCoverArtUrl = null;
+const PLAYLIST_PAGE_LIMIT = 50;
+let playlistsCache = [];
+let playlistSelected = null;
+const playlistTrackCache = new Map();
+let playlistAbortController = null;
+let playlistTracksAbortController = null;
+let playlistSearchTerm = '';
+let playlistSortOrder = 'recent';
+const playlistNameCollator = typeof Intl !== 'undefined' && typeof Intl.Collator === 'function'
+  ? new Intl.Collator(undefined, { sensitivity: 'base' })
+  : { compare: (a, b) => {
+      if (a === b) return 0;
+      return a > b ? 1 : -1;
+    } };
 
 
 
@@ -176,6 +207,28 @@ async function ensureOk(res, fallback) {
   throw new Error(detail);
 }
 
+async function readResponseDetail(res, fallback) {
+  let detail = fallback || `HTTP ${res.status}`;
+  try {
+    const text = await res.text();
+    if (text) {
+      try {
+        const parsed = JSON.parse(text);
+        if (typeof parsed === 'string') detail = parsed;
+        else if (parsed?.detail) detail = parsed.detail;
+        else if (parsed?.message) detail = parsed.message;
+        else if (parsed?.error?.message) detail = parsed.error.message;
+        else detail = text;
+      } catch (_) {
+        detail = text;
+      }
+    }
+  } catch (_) {
+    /* ignore body parse errors */
+  }
+  return detail;
+}
+
 function describePan(value) {
   const num = typeof value === 'number' ? value : Number(value);
   if (Number.isNaN(num) || Math.abs(num) < 0.01) return 'Center';
@@ -265,6 +318,332 @@ function setVolumeSliderOpen(open) {
   if (next && masterVolume) {
     setTimeout(() => masterVolume.focus({ preventScroll: true }), 0);
   }
+}
+
+function setPlaylistOverlayOpen(open) {
+  if (!playlistOverlay) return;
+  const next = !!open;
+  playlistOverlay.classList.toggle('is-open', next);
+  playlistOverlay.setAttribute('aria-hidden', next ? 'false' : 'true');
+  if (playerPlaylistsBtn) playerPlaylistsBtn.setAttribute('aria-expanded', next ? 'true' : 'false');
+  if (next) document.addEventListener('keydown', handlePlaylistOverlayKey, true);
+  else document.removeEventListener('keydown', handlePlaylistOverlayKey, true);
+}
+
+function setPlaylistView(mode) {
+  const isTracks = mode === 'tracks';
+  if (playlistGridView) playlistGridView.hidden = isTracks;
+  if (playlistTracksView) playlistTracksView.hidden = !isTracks;
+  if (playlistBackBtn) playlistBackBtn.hidden = !isTracks;
+  if (playlistToolbar) playlistToolbar.hidden = isTracks;
+  if (!isTracks) {
+    if (playlistSelectedName) playlistSelectedName.textContent = '';
+    if (playlistSelectedOwner) {
+      playlistSelectedOwner.textContent = '';
+      playlistSelectedOwner.hidden = true;
+    }
+  }
+}
+
+function setPlaylistLoadingState(isLoading, message) {
+  if (!playlistLoading) return;
+  const next = !!isLoading;
+  playlistLoading.hidden = !next;
+  playlistLoading.setAttribute('aria-hidden', next ? 'false' : 'true');
+  const textEl = playlistLoading.querySelector('span:last-child');
+  if (textEl && message) textEl.textContent = message;
+}
+
+function setPlaylistErrorMessage(message) {
+  if (!playlistError) return;
+  const text = (message || '').trim();
+  playlistError.textContent = text;
+  playlistError.hidden = !text;
+  playlistError.setAttribute('aria-hidden', text ? 'false' : 'true');
+}
+
+function handlePlaylistOverlayKey(evt) {
+  if (evt.key === 'Escape' && playlistOverlay?.classList.contains('is-open')) {
+    evt.stopPropagation();
+    closePlaylistOverlay();
+    playerPlaylistsBtn?.focus({ preventScroll: true });
+  }
+}
+
+function renderPlaylistGrid(items) {
+  if (!playlistGrid) return;
+  playlistGrid.innerHTML = '';
+  const list = Array.isArray(items) ? items : [];
+  const filtered = list.filter(item => {
+    if (!playlistSearchTerm) return true;
+    const haystack = `${item?.name || ''} ${item?.owner || ''} ${item?.description || ''}`.toLowerCase();
+    return haystack.includes(playlistSearchTerm);
+  });
+  const sorted = sortPlaylists(filtered);
+  sorted.forEach(item => {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'playlist-card';
+    card.setAttribute('role', 'listitem');
+    const cover = document.createElement('img');
+    cover.className = 'playlist-cover';
+    cover.alt = item?.name || 'Playlist cover';
+    const fallbackCover = PLAYLIST_FALLBACK_COVER;
+    cover.src = item?.image?.url || fallbackCover;
+    cover.loading = 'lazy';
+    const title = document.createElement('div');
+    title.className = 'playlist-card-title';
+    title.textContent = item?.name || 'Untitled playlist';
+    const ownerText = item?.owner ? `by ${item.owner}` : '';
+    const tracksText = typeof item?.tracks_total === 'number' ? `${item.tracks_total} tracks` : '';
+    card.appendChild(cover);
+    card.appendChild(title);
+    if (ownerText) {
+      const owner = document.createElement('div');
+      owner.className = 'playlist-card-owner';
+      owner.textContent = ownerText;
+      card.appendChild(owner);
+    }
+    if (tracksText) {
+      const counts = document.createElement('div');
+      counts.className = 'playlist-card-owner';
+      counts.textContent = tracksText;
+      card.appendChild(counts);
+    }
+
+    card.addEventListener('click', () => selectPlaylist(item));
+    playlistGrid.appendChild(card);
+  });
+  if (playlistEmpty) {
+    if (!list.length) {
+      playlistEmpty.hidden = false;
+      playlistEmpty.textContent = 'No playlists available.';
+    } else if (!sorted.length) {
+      playlistEmpty.hidden = false;
+      playlistEmpty.textContent = 'No playlists match your search.';
+    } else {
+      playlistEmpty.hidden = true;
+      playlistEmpty.textContent = '';
+    }
+  }
+}
+
+function sortPlaylists(items) {
+  if (!Array.isArray(items)) return [];
+  const sorted = [...items];
+  if (playlistSortOrder === 'name') {
+    sorted.sort((a, b) => {
+      const result = playlistNameCollator.compare(a?.name || '', b?.name || '');
+      if (result !== 0) return result;
+      return (a?._order ?? 0) - (b?._order ?? 0);
+    });
+    return sorted;
+  }
+  sorted.sort((a, b) => (a?._order ?? 0) - (b?._order ?? 0));
+  return sorted;
+}
+function renderPlaylistTracks(tracks) {
+  if (!playlistTracklist) return;
+  playlistTracklist.innerHTML = '';
+  const list = Array.isArray(tracks) ? tracks : [];
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'playlist-empty muted';
+    empty.textContent = 'No tracks in this playlist yet.';
+    playlistTracklist.appendChild(empty);
+    return;
+  }
+  list.forEach(track => {
+    const row = document.createElement('div');
+    row.className = 'playlist-track-row';
+    row.setAttribute('role', 'listitem');
+
+    const index = document.createElement('div');
+    index.className = 'playlist-track-index';
+    const position = typeof track.position === 'number' ? track.position + 1 : null;
+    index.textContent = position ? String(position).padStart(2, '0') : '—';
+
+    const meta = document.createElement('div');
+    meta.className = 'playlist-track-meta';
+    const title = document.createElement('div');
+    title.className = 'playlist-track-title';
+    title.textContent = track.name || 'Untitled track';
+    const artist = document.createElement('div');
+    artist.className = 'playlist-track-artist';
+    artist.textContent = track.artists || track.album || '';
+    meta.appendChild(title);
+    meta.appendChild(artist);
+
+    const controls = document.createElement('div');
+    controls.className = 'playlist-track-controls';
+    const duration = document.createElement('div');
+    duration.className = 'playlist-track-duration';
+    duration.textContent = track.duration_ms ? msToTime(track.duration_ms) : '';
+    const playBtn = document.createElement('button');
+    playBtn.className = 'playlist-track-play';
+    playBtn.textContent = 'Play';
+    playBtn.addEventListener('click', evt => {
+      evt.stopPropagation();
+      playPlaylistTrack(track);
+    });
+    controls.appendChild(duration);
+    controls.appendChild(playBtn);
+
+    row.appendChild(index);
+    row.appendChild(meta);
+    row.appendChild(controls);
+    playlistTracklist.appendChild(row);
+  });
+}
+
+function resetPlaylistFilters() {
+  playlistSearchTerm = '';
+  playlistSortOrder = 'recent';
+  if (playlistSearchInput) playlistSearchInput.value = '';
+  if (playlistSortSelect) playlistSortSelect.value = 'recent';
+}
+
+async function fetchPlaylists() {
+  if (!playlistOverlay) return;
+  playlistAbortController?.abort();
+  playlistAbortController = new AbortController();
+  setPlaylistErrorMessage('');
+  setPlaylistLoadingState(true, 'Loading playlists…');
+  if (playlistEmpty) playlistEmpty.hidden = true;
+  try {
+    const collected = [];
+    let offset = 0;
+    let hasNext = true;
+    let reportedTotal = null;
+    while (hasNext) {
+      const params = new URLSearchParams({ limit: String(PLAYLIST_PAGE_LIMIT), offset: String(offset) });
+      const res = await fetch(`/api/spotify/playlists?${params.toString()}`, { signal: playlistAbortController.signal });
+      await ensureOk(res);
+      const data = await res.json();
+      const items = Array.isArray(data?.items) ? data.items : [];
+      collected.push(...items);
+      if (typeof data?.total === 'number') reportedTotal = data.total;
+      const fetchedCount = collected.length;
+      if (playlistLoading && (reportedTotal || fetchedCount)) {
+        if (typeof reportedTotal === 'number' && reportedTotal > 0 && fetchedCount < reportedTotal) {
+          setPlaylistLoadingState(true, `Loading playlists (${Math.min(fetchedCount, reportedTotal)} of ${reportedTotal})…`);
+        } else if (!reportedTotal) {
+          setPlaylistLoadingState(true, `Loading playlists (${fetchedCount})…`);
+        }
+      }
+      const limitValue = typeof data?.limit === 'number' ? data.limit : PLAYLIST_PAGE_LIMIT;
+      const offsetValue = typeof data?.offset === 'number' ? data.offset : offset;
+      offset = offsetValue + limitValue;
+      const serverHasNext = !!data?.next;
+      hasNext = serverHasNext && (typeof reportedTotal === 'number' ? fetchedCount < reportedTotal : true);
+      if (!hasNext) break;
+    }
+    playlistsCache = collected.map((item, idx) => ({ ...item, _order: idx }));
+    renderPlaylistGrid(playlistsCache);
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    playlistsCache = [];
+    if (playlistGrid) playlistGrid.innerHTML = '';
+    if (playlistEmpty) {
+      playlistEmpty.hidden = false;
+      playlistEmpty.textContent = 'Unable to load playlists right now.';
+    }
+    setPlaylistErrorMessage(`Failed to load playlists: ${err.message}`);
+  } finally {
+    setPlaylistLoadingState(false);
+  }
+}
+
+async function fetchPlaylistTracks(playlist) {
+  if (!playlist?.id) return;
+  const cached = playlistTrackCache.get(playlist.id);
+  if (cached) {
+    renderPlaylistTracks(cached);
+    return;
+  }
+  playlistTracksAbortController?.abort();
+  playlistTracksAbortController = new AbortController();
+  setPlaylistErrorMessage('');
+  setPlaylistLoadingState(true, 'Loading tracks…');
+  try {
+    const res = await fetch(`/api/spotify/playlists/${encodeURIComponent(playlist.id)}/tracks`, { signal: playlistTracksAbortController.signal });
+    await ensureOk(res);
+    const data = await res.json();
+    const tracks = Array.isArray(data?.items) ? data.items : [];
+    playlistTrackCache.set(playlist.id, tracks);
+    renderPlaylistTracks(tracks);
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    setPlaylistErrorMessage(`Failed to load tracks: ${err.message}`);
+  } finally {
+    setPlaylistLoadingState(false);
+  }
+}
+
+function openPlaylistOverlay() {
+  if (!playlistOverlay) return;
+  resetPlaylistFilters();
+  playlistSelected = null;
+  playlistsCache = [];
+  if (playlistGrid) playlistGrid.innerHTML = '';
+  if (playlistEmpty) {
+    playlistEmpty.hidden = true;
+    playlistEmpty.textContent = '';
+  }
+  setPlaylistView('playlists');
+  setPlaylistOverlayOpen(true);
+  if (playlistSubtitle) playlistSubtitle.textContent = 'Pick a playlist to browse tracks.';
+  setPlaylistErrorMessage('');
+  setPlaylistLoadingState(true, 'Loading playlists…');
+  fetchPlaylists();
+}
+
+function closePlaylistOverlay() {
+  setPlaylistOverlayOpen(false);
+  playlistAbortController?.abort();
+  playlistTracksAbortController?.abort();
+  playlistSelected = null;
+  resetPlaylistFilters();
+}
+
+function handlePlaylistBack() {
+  playlistSelected = null;
+  if (playlistSubtitle) playlistSubtitle.textContent = 'Pick a playlist to browse tracks.';
+  setPlaylistErrorMessage('');
+  setPlaylistView('playlists');
+  if (playlistsCache.length) renderPlaylistGrid(playlistsCache);
+  else fetchPlaylists();
+}
+
+function selectPlaylist(playlist) {
+  if (!playlist?.id) {
+    showError('Unable to open this playlist.');
+    return;
+  }
+  playlistSelected = playlist;
+  if (playlistSelectedName) playlistSelectedName.textContent = playlist?.name || 'Playlist';
+  if (playlistSelectedOwner) {
+    playlistSelectedOwner.textContent = playlist?.owner ? `by ${playlist.owner}` : '';
+    playlistSelectedOwner.hidden = !playlist?.owner;
+  }
+  if (playlistSubtitle) playlistSubtitle.textContent = 'Choose a track to play';
+  setPlaylistView('tracks');
+  const cached = playlistTrackCache.get(playlist.id);
+  if (cached) renderPlaylistTracks(cached);
+  else if (playlistTracklist) playlistTracklist.innerHTML = '';
+  fetchPlaylistTracks(playlist);
+}
+
+function playPlaylistTrack(track) {
+  if (!playlistSelected || !track?.uri || !playlistSelected?.uri) {
+    showError('Unable to start playback for this track.');
+    return;
+  }
+  const body = { context_uri: playlistSelected.uri };
+  if (typeof track.position === 'number') body.offset = { position: track.position };
+  else if (track.uri) body.offset = { uri: track.uri };
+  playerAction('/api/spotify/player/play', body);
+  closePlaylistOverlay();
 }
 
 function setAddNodeMenuOpen(open) {
@@ -398,6 +777,7 @@ const ICON_NEXT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const ICON_PLAY = `<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="8,5 20,12 8,19"/></svg>`;
 const ICON_PAUSE = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="5" width="4" height="14" rx="1"/><rect x="13" y="5" width="4" height="14" rx="1"/></svg>`;
 const ICON_REPEAT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 014-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>`;
+const PLAYLIST_FALLBACK_COVER = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="%2322c55e" stop-opacity="0.35"/><stop offset="100%" stop-color="%230f172a"/></linearGradient></defs><rect width="300" height="300" fill="url(%23g)"/><text x="150" y="160" text-anchor="middle" font-size="90" fill="%23f8fafc">&#9835;</text></svg>';
 const COVER_ART_BACKDROP_OVERLAY = 'linear-gradient(135deg, rgba(2,6,23,0.92), rgba(2,6,23,0.65))';
 initializePlayerButtons();
 initCollapsiblePanels();
@@ -543,9 +923,7 @@ function commitRenderNodes(nodes) {
       const versionMeta = document.createElement('div');
       versionMeta.className = 'label';
       let text = n.agent_version ? `Agent ${n.agent_version}` : 'Agent version unknown';
-      if (updating) {
-        text += ' (updating…)';
-      } else if (updateAvailable) {
+      if (updateAvailable) {
         if (n.latest_agent_version) {
           text = n.agent_version
             ? `Agent ${n.agent_version} → ${n.latest_agent_version}`
@@ -554,8 +932,8 @@ function commitRenderNodes(nodes) {
           text += ' – update available';
         }
       }
-      statusRow.appendChild(versionMeta);
       versionMeta.textContent = text;
+      statusRow.appendChild(versionMeta);
     }
     if (restarting) {
       const restartPill = document.createElement('span');
@@ -1126,6 +1504,10 @@ async function restartNode(nodeId, btn) {
 }
 
 async function unregisterNode(nodeId) {
+  const node = nodesCache.find(n => n.id === nodeId);
+  const name = node?.name ? `"${node.name}"` : 'this node';
+  const confirmed = window.confirm(`Are you sure you want to unregister ${name}?`);
+  if (!confirmed) return;
   try {
     const res = await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' });
     await ensureOk(res);
@@ -2068,14 +2450,51 @@ function buildPlayerActionPath(path, body) {
   return `${path}${separator}device_id=${encodeURIComponent(deviceId)}`;
 }
 
-async function playerAction(path, body) {
-  try {
-    const targetPath = buildPlayerActionPath(path, body);
-    const res = await fetch(targetPath, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
-    await ensureOk(res);
-    setTimeout(fetchPlayerStatus, 500);
-  } catch (err) {
-    showError(`Player action failed: ${err.message}`);
+async function activateRoomcastDevice(play = false) {
+  const payload = { play: !!play };
+  const res = await fetch('/api/spotify/player/activate-roomcast', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  await ensureOk(res);
+  const data = await res.json();
+  if (data?.device_id) activeDeviceId = data.device_id;
+  setTimeout(fetchPlayerStatus, 400);
+  return data;
+}
+
+async function playerAction(path, body, options = {}) {
+  const allowRoomcastFallback = options.roomcastFallback !== false;
+  let attemptedRoomcastActivation = false;
+  while (true) {
+    try {
+      const targetPath = buildPlayerActionPath(path, body);
+      const res = await fetch(targetPath, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (res.ok) {
+        setTimeout(fetchPlayerStatus, 500);
+        return;
+      }
+      const detail = await readResponseDetail(res);
+      const normalizedDetail = (detail || '').toLowerCase();
+      const canActivateRoomcast = allowRoomcastFallback
+        && !attemptedRoomcastActivation
+        && res.status === 404
+        && normalizedDetail.includes('no active device');
+      if (canActivateRoomcast) {
+        await activateRoomcastDevice(false);
+        attemptedRoomcastActivation = true;
+        continue;
+      }
+      throw new Error(detail);
+    } catch (err) {
+      showError(`Player action failed: ${err.message}`);
+      return;
+    }
   }
 }
 
@@ -2272,6 +2691,29 @@ document.addEventListener('click', evt => {
     setAddNodeMenuOpen(false);
   }
 });
+if (playlistOverlay) {
+  playlistOverlay.addEventListener('click', evt => {
+    if (evt.target === playlistOverlay) closePlaylistOverlay();
+  });
+}
+if (playerPlaylistsBtn) playerPlaylistsBtn.setAttribute('aria-expanded', 'false');
+if (playerPlaylistsBtn) playerPlaylistsBtn.addEventListener('click', openPlaylistOverlay);
+if (playlistCloseBtn) playlistCloseBtn.addEventListener('click', closePlaylistOverlay);
+if (playlistBackBtn) playlistBackBtn.addEventListener('click', handlePlaylistBack);
+if (playlistSearchInput) {
+  playlistSearchInput.addEventListener('input', evt => {
+    playlistSearchTerm = (evt.target.value || '').trim().toLowerCase();
+    renderPlaylistGrid(playlistsCache);
+  });
+}
+if (playlistSortSelect) {
+  playlistSortSelect.addEventListener('change', evt => {
+    const value = (evt.target.value || '').toLowerCase();
+    playlistSortOrder = value === 'name' ? 'name' : 'recent';
+    renderPlaylistGrid(playlistsCache);
+  });
+}
+
 playerPrev.addEventListener('click', () => {
   if (playerPrev.disabled) return;
   playerAction('/api/spotify/player/previous');

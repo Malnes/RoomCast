@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode
-from typing import Dict, Optional, AsyncIterator
+from typing import Dict, Optional, AsyncIterator, List
 
 import httpx
 import websockets
@@ -46,11 +46,12 @@ NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.13").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.15").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
 NODE_REDISCOVERY_INTERVAL = int(os.getenv("NODE_REDISCOVERY_INTERVAL", "90"))
+LIBRESPOT_FALLBACK_NAME = os.getenv("LIBRESPOT_FALLBACK_NAME", "RoomCast").strip() or "RoomCast"
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -130,6 +131,10 @@ class ShufflePayload(BaseModel):
 class RepeatPayload(BaseModel):
     mode: str = Field(pattern="^(off|track|context)$", description="Repeat mode")
     device_id: Optional[str] = Field(default=None, description="Target device ID")
+
+
+class ActivateRoomcastPayload(BaseModel):
+    play: bool = Field(default=False, description="Start playback immediately after transfer")
 
 
 class EqBand(BaseModel):
@@ -286,6 +291,101 @@ async def _sync_node_max_volume(node: dict, *, percent: Optional[int] = None) ->
     value = _get_node_max_volume(node) if percent is None else _normalize_percent(percent, default=_get_node_max_volume(node))
     payload = {"percent": value}
     await _call_agent(node, "/config/max-volume", payload)
+
+
+def _ensure_spotify_token() -> dict:
+    token = load_token()
+    if not token or not token.get("access_token"):
+        raise HTTPException(status_code=401, detail="Spotify not authorized")
+    return token
+
+
+def _preferred_roomcast_device_names() -> List[str]:
+    cfg = read_spotify_config()
+    candidates = [
+        (cfg.get("device_name") or "").strip(),
+        LIBRESPOT_FALLBACK_NAME.strip(),
+        "RoomCast",
+    ]
+    seen = set()
+    preferred: List[str] = []
+    for name in candidates:
+        if not name:
+            continue
+        lowered = name.lower()
+        if lowered in seen:
+            continue
+        seen.add(lowered)
+        preferred.append(name)
+    return preferred
+
+
+async def _find_roomcast_device(token: dict) -> Optional[dict]:
+    resp = await spotify_request("GET", "/me/player/devices", token)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    devices = data.get("devices") or []
+    preferred_names = [name.lower() for name in _preferred_roomcast_device_names()]
+    for target in preferred_names:
+        for device in devices:
+            if not isinstance(device, dict):
+                continue
+            name = (device.get("name") or "").strip().lower()
+            if name == target and device.get("id"):
+                return device
+    return None
+
+
+def _map_spotify_image(images: Optional[list]) -> Optional[dict]:
+    if not images:
+        return None
+    for image in images:
+        if isinstance(image, dict) and image.get("url"):
+            return {"url": image.get("url"), "width": image.get("width"), "height": image.get("height")}
+    return None
+
+
+def _map_spotify_playlist(item: dict) -> dict:
+    images = item.get("images") if isinstance(item, dict) else None
+    cover = _map_spotify_image(images if isinstance(images, list) else None)
+    tracks = item.get("tracks") if isinstance(item, dict) else None
+    owner = item.get("owner") if isinstance(item, dict) else None
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "description": item.get("description") or "",
+        "uri": item.get("uri"),
+        "tracks_total": tracks.get("total") if isinstance(tracks, dict) else None,
+        "owner": owner.get("display_name") if isinstance(owner, dict) else None,
+        "image": cover,
+    }
+
+
+def _map_spotify_track(item: dict, position: int) -> Optional[dict]:
+    track = item.get("track") if isinstance(item, dict) else None
+    if not isinstance(track, dict):
+        return None
+    if track.get("is_local") is True:
+        return None
+    artists = track.get("artists") or []
+    artist_names = ", ".join(a.get("name") for a in artists if isinstance(a, dict) and a.get("name"))
+    album = track.get("album") if isinstance(track.get("album"), dict) else track.get("album")
+    album_name = album.get("name") if isinstance(album, dict) else None
+    cover = None
+    if isinstance(album, dict):
+        cover = _map_spotify_image(album.get("images"))
+    return {
+        "id": track.get("id"),
+        "name": track.get("name") or "Untitled",
+        "uri": track.get("uri"),
+        "duration_ms": track.get("duration_ms"),
+        "explicit": bool(track.get("explicit")),
+        "artists": artist_names,
+        "album": album_name,
+        "image": cover,
+        "position": position,
+    }
 
 
 async def broadcast_nodes() -> None:
@@ -505,11 +605,14 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[b
     if version and node.get("agent_version") != version:
         node["agent_version"] = version
         changed = True
-    if "configured" in data:
-        configured = bool(data.get("configured"))
-        if node.get("audio_configured") != configured:
-            node["audio_configured"] = configured
-            changed = True
+    configured = bool(data.get("configured"))
+    if node.get("audio_configured") != configured:
+        node["audio_configured"] = configured
+        changed = True
+        if configured:
+            node.setdefault("_needs_reconfig", False)
+        else:
+            node["_needs_reconfig"] = True
     if "updating" in data:
         updating = bool(data.get("updating"))
         if node.get("updating") != updating:
@@ -529,6 +632,17 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[b
         max_vol = _normalize_percent(data.get("max_volume_percent"), default=_get_node_max_volume(node))
         if node.get("max_volume_percent") != max_vol:
             node["max_volume_percent"] = max_vol
+            changed = True
+    needs_reconfig = bool(node.pop("_needs_reconfig", False))
+    if configured and needs_reconfig:
+        try:
+            await configure_agent_audio(node)
+            await _sync_node_max_volume(node)
+        except Exception:
+            node["audio_configured"] = False
+            node["_needs_reconfig"] = True
+        else:
+            node["audio_configured"] = True
             changed = True
     if persist and changed:
         save_nodes()
@@ -1084,6 +1198,7 @@ async def configure_node(node_id: str) -> dict:
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes do not require configuration")
     result = await configure_agent_audio(node)
+    await _sync_node_max_volume(node)
     await broadcast_nodes()
     return {"ok": True, "result": result}
 
@@ -1140,6 +1255,8 @@ async def update_agent_node(node_id: str) -> dict:
         raise HTTPException(status_code=400, detail="Browser nodes cannot be updated from the controller")
     result = await _call_agent(node, "/update", {})
     node["updating"] = True
+    node["audio_configured"] = False
+    node["_needs_reconfig"] = True
     save_nodes()
     await broadcast_nodes()
     schedule_agent_refresh(node_id, delay=20.0, repeat=True, attempts=12)
@@ -1579,9 +1696,77 @@ async def _spotify_control(
     return {"ok": True}
 
 
+@app.post("/api/spotify/player/activate-roomcast")
+async def spotify_activate_roomcast(payload: ActivateRoomcastPayload = Body(default=ActivateRoomcastPayload())) -> dict:
+    token = _ensure_spotify_token()
+    device = await _find_roomcast_device(token)
+    if not device or not device.get("id"):
+        raise HTTPException(status_code=404, detail="RoomCast device is not available. Make sure Librespot is running and linked to Spotify.")
+    body = {"device_ids": [device["id"]], "play": payload.play}
+    resp = await spotify_request("PUT", "/me/player", token, json=body)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    return {
+        "device_id": device.get("id"),
+        "device_name": device.get("name"),
+        "volume_percent": device.get("volume_percent"),
+        "is_active": True,
+    }
+
+
+@app.get("/api/spotify/playlists")
+async def spotify_playlists(limit: int = Query(default=24, ge=1, le=50), offset: int = Query(default=0, ge=0)) -> dict:
+    token = _ensure_spotify_token()
+    params = {"limit": min(limit, 50), "offset": max(0, offset)}
+    path = _with_query("/me/playlists", params)
+    resp = await spotify_request("GET", path, token)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    items = []
+    for item in data.get("items", []):
+        if isinstance(item, dict):
+            items.append(_map_spotify_playlist(item))
+    return {
+        "items": items,
+        "total": data.get("total", len(items)),
+        "limit": data.get("limit", params["limit"]),
+        "offset": data.get("offset", params["offset"]),
+        "next": bool(data.get("next")),
+        "previous": bool(data.get("previous")),
+    }
+
+
+@app.get("/api/spotify/playlists/{playlist_id}/tracks")
+async def spotify_playlist_tracks(playlist_id: str, limit: int = Query(default=100, ge=1, le=100), offset: int = Query(default=0, ge=0)) -> dict:
+    token = _ensure_spotify_token()
+    params = {"limit": min(limit, 100), "offset": max(0, offset)}
+    path = _with_query(f"/playlists/{playlist_id}/tracks", params)
+    resp = await spotify_request("GET", path, token)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    tracks: list[dict] = []
+    base_position = data.get("offset", params["offset"])
+    for idx, item in enumerate(data.get("items", [])):
+        mapped = _map_spotify_track(item, position=base_position + idx)
+        if mapped:
+            tracks.append(mapped)
+    return {
+        "items": tracks,
+        "limit": data.get("limit", params["limit"]),
+        "offset": data.get("offset", params["offset"]),
+        "total": data.get("total", len(tracks)),
+        "next": bool(data.get("next")),
+        "previous": bool(data.get("previous")),
+    }
+
+
 @app.post("/api/spotify/player/play")
-async def spotify_play(device_id: Optional[str] = Query(default=None)) -> dict:
-    return await _spotify_control("/me/player/play", "PUT", params={"device_id": device_id})
+async def spotify_play(payload: Optional[dict] = Body(default=None), device_id: Optional[str] = Query(default=None)) -> dict:
+    params = {"device_id": device_id} if device_id else None
+    body = payload or None
+    return await _spotify_control("/me/player/play", "PUT", body=body, params=params)
 
 
 @app.post("/api/spotify/player/pause")
