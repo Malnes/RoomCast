@@ -2014,6 +2014,15 @@
         if (event.button !== 0 && event.pointerType === 'mouse') return;
         event.preventDefault();
         slider.focus();
+        if (event.ctrlKey || event.metaKey) {
+          wrap.classList.remove('is-dragging');
+          const resetValue = formatSliderValue(0, slider);
+          if (slider.value !== resetValue) {
+            slider.value = resetValue;
+            slider.dispatchEvent(new Event('input', { bubbles: true }));
+          }
+          return;
+        }
         wrap.classList.add('is-dragging');
         wrap.setPointerCapture?.(event.pointerId);
         updateSliderValueFromPointer(event, wrap, slider);
