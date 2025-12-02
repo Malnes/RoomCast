@@ -47,6 +47,7 @@ const playerArt = document.getElementById('player-art');
 const playerTitle = document.getElementById('player-title');
 const playerArtist = document.getElementById('player-artist');
 const playerPlaylistsBtn = document.getElementById('player-playlists');
+const playerSearchBtn = document.getElementById('player-search');
 const playlistOverlay = document.getElementById('playlist-overlay');
 const playlistCloseBtn = document.getElementById('playlist-close');
 const playlistGrid = document.getElementById('playlist-grid');
@@ -63,6 +64,20 @@ const playlistTracksView = document.querySelector('.playlist-tracks-view');
 const playlistSubtitle = document.getElementById('playlist-modal-subtitle');
 const playlistSearchInput = document.getElementById('playlist-search');
 const playlistSortSelect = document.getElementById('playlist-sort');
+const searchOverlay = document.getElementById('search-overlay');
+const searchCloseBtn = document.getElementById('search-close');
+const searchForm = document.getElementById('spotify-search-form');
+const searchInput = document.getElementById('spotify-search-input');
+const searchTabs = Array.from(document.querySelectorAll('.search-tab'));
+const searchPanes = Array.from(document.querySelectorAll('[data-search-pane]'));
+const searchPaneMap = searchPanes.reduce((acc, pane) => {
+  const key = pane?.dataset?.searchPane;
+  if (key) acc[key] = pane;
+  return acc;
+}, {});
+const searchLoading = document.getElementById('search-loading');
+const searchError = document.getElementById('search-error');
+const searchSubtitle = document.getElementById('search-modal-subtitle');
 const coverArtBackdrop = document.getElementById('cover-art-backdrop');
 const coverArtBackgroundToggle = document.getElementById('cover-art-background');
 const collapsiblePanels = Array.from(document.querySelectorAll('[data-collapsible]'));
@@ -85,6 +100,12 @@ let playlistAbortController = null;
 let playlistTracksAbortController = null;
 let playlistSearchTerm = '';
 let playlistSortOrder = 'recent';
+const SEARCH_TABS = ['tracks', 'albums', 'artists', 'playlists'];
+let searchActiveTab = 'tracks';
+let lastSearchQuery = '';
+let searchHasAttempted = false;
+let searchResultsState = defaultSearchBuckets();
+let searchAbortController = null;
 const playlistNameCollator = typeof Intl !== 'undefined' && typeof Intl.Collator === 'function'
   ? new Intl.Collator(undefined, { sensitivity: 'base' })
   : { compare: (a, b) => {
@@ -644,6 +665,392 @@ function playPlaylistTrack(track) {
   else if (track.uri) body.offset = { uri: track.uri };
   playerAction('/api/spotify/player/play', body);
   closePlaylistOverlay();
+}
+
+function defaultSearchBuckets() {
+  return {
+    tracks: { items: [] },
+    albums: { items: [] },
+    artists: { items: [] },
+    playlists: { items: [] },
+  };
+}
+
+function setSearchOverlayOpen(open) {
+  if (!searchOverlay) return;
+  const next = !!open;
+  searchOverlay.classList.toggle('is-open', next);
+  searchOverlay.setAttribute('aria-hidden', next ? 'false' : 'true');
+  if (playerSearchBtn) playerSearchBtn.setAttribute('aria-expanded', next ? 'true' : 'false');
+  if (next) {
+    document.addEventListener('keydown', handleSearchOverlayKey, true);
+    setTimeout(() => {
+      if (searchInput) searchInput.focus({ preventScroll: true });
+    }, 50);
+  } else {
+    document.removeEventListener('keydown', handleSearchOverlayKey, true);
+    searchAbortController?.abort();
+    searchAbortController = null;
+    searchHasAttempted = false;
+    lastSearchQuery = '';
+    searchResultsState = defaultSearchBuckets();
+    setSearchLoading(false);
+    setSearchError('');
+    if (searchSubtitle) searchSubtitle.textContent = 'Find songs, albums, artists, and playlists.';
+    if (searchInput) searchInput.value = '';
+    SEARCH_TABS.forEach(tab => renderSearchPane(tab));
+  }
+}
+
+function handleSearchOverlayKey(event) {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeSearchOverlay();
+  }
+}
+
+function openSearchOverlay() {
+  setSearchOverlayOpen(true);
+  setSearchActiveTab('tracks');
+  if (!searchHasAttempted) renderSearchPane(searchActiveTab);
+}
+
+function closeSearchOverlay() {
+  setSearchOverlayOpen(false);
+  if (playerSearchBtn) playerSearchBtn.focus({ preventScroll: true });
+}
+
+function setSearchLoading(isLoading, message) {
+  if (!searchLoading) return;
+  const next = !!isLoading;
+  searchLoading.hidden = !next;
+  searchLoading.setAttribute('aria-hidden', next ? 'false' : 'true');
+  const label = searchLoading.querySelector('span:last-child');
+  if (label && message) label.textContent = message;
+  if (searchForm) {
+    const submitBtn = searchForm.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = next;
+  }
+}
+
+function setSearchError(message) {
+  if (!searchError) return;
+  const text = (message || '').trim();
+  searchError.textContent = text;
+  const hasText = !!text;
+  searchError.hidden = !hasText;
+  searchError.setAttribute('aria-hidden', hasText ? 'false' : 'true');
+}
+
+function setSearchActiveTab(tab) {
+  if (!SEARCH_TABS.includes(tab)) return;
+  searchActiveTab = tab;
+  searchTabs.forEach(btn => {
+    if (!btn || !btn.dataset.searchTab) return;
+    const isActive = btn.dataset.searchTab === tab;
+    btn.classList.toggle('is-active', isActive);
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+  searchPanes.forEach(pane => {
+    const key = pane?.dataset?.searchPane;
+    if (!key) return;
+    pane.hidden = key !== tab;
+  });
+  renderSearchPane(tab);
+}
+
+function renderSearchPane(tab) {
+  switch (tab) {
+    case 'albums':
+      renderSearchAlbums(searchResultsState.albums);
+      break;
+    case 'artists':
+      renderSearchArtists(searchResultsState.artists);
+      break;
+    case 'playlists':
+      renderSearchPlaylists(searchResultsState.playlists);
+      break;
+    case 'tracks':
+    default:
+      renderSearchTracks(searchResultsState.tracks);
+      break;
+  }
+}
+
+function renderSearchTracks(bucket = {}) {
+  const pane = searchPaneMap.tracks;
+  if (!pane) return;
+  pane.innerHTML = '';
+  if (!searchHasAttempted) {
+    pane.appendChild(createSearchHint('Enter a search term to get started.'));
+    return;
+  }
+  const items = Array.isArray(bucket?.items) ? bucket.items : [];
+  if (!items.length) {
+    pane.appendChild(createSearchEmpty('No songs found.'));
+    return;
+  }
+  items.forEach(track => {
+    const row = document.createElement('div');
+    row.className = 'search-track';
+    const cover = document.createElement('img');
+    cover.className = 'search-track-cover';
+    cover.alt = '';
+    cover.src = track?.image?.url || PLAYLIST_FALLBACK_COVER;
+    const meta = document.createElement('div');
+    meta.className = 'search-track-meta';
+    const title = document.createElement('div');
+    title.className = 'search-track-title';
+    title.textContent = track?.name || 'Track';
+    const subtitle = document.createElement('div');
+    subtitle.className = 'search-track-subtitle';
+    const infoParts = [];
+    if (track?.artists) infoParts.push(track.artists);
+    if (track?.album) infoParts.push(track.album);
+    subtitle.textContent = infoParts.join(' • ');
+    meta.appendChild(title);
+    meta.appendChild(subtitle);
+    if (track?.duration_ms) {
+      const duration = document.createElement('div');
+      duration.className = 'search-track-subtitle';
+      duration.textContent = msToTime(track.duration_ms);
+      meta.appendChild(duration);
+    }
+    const playBtn = document.createElement('button');
+    playBtn.className = 'search-play-btn';
+    playBtn.type = 'button';
+    playBtn.textContent = 'Play';
+    playBtn.addEventListener('click', () => playSearchTrack(track));
+    row.appendChild(cover);
+    row.appendChild(meta);
+    row.appendChild(playBtn);
+    pane.appendChild(row);
+  });
+}
+
+function renderSearchAlbums(bucket = {}) {
+  const pane = searchPaneMap.albums;
+  if (!pane) return;
+  pane.innerHTML = '';
+  if (!searchHasAttempted) {
+    pane.appendChild(createSearchHint('Search for any album title.'));
+    return;
+  }
+  const items = Array.isArray(bucket?.items) ? bucket.items : [];
+  if (!items.length) {
+    pane.appendChild(createSearchEmpty('No albums found.'));
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'search-grid';
+  items.forEach(album => {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'search-card search-album-card';
+    card.addEventListener('click', () => playSearchAlbum(album));
+    const img = document.createElement('img');
+    img.alt = '';
+    img.src = album?.image?.url || PLAYLIST_FALLBACK_COVER;
+    const title = document.createElement('div');
+    title.className = 'search-card-title';
+    title.textContent = album?.name || 'Album';
+    const subtitle = document.createElement('div');
+    subtitle.className = 'search-card-subtitle';
+    subtitle.textContent = album?.artists || '';
+    card.appendChild(img);
+    card.appendChild(title);
+    if (subtitle.textContent) card.appendChild(subtitle);
+    if (album?.release_date) {
+      const release = document.createElement('div');
+      release.className = 'search-card-subtitle';
+      release.textContent = `Released ${album.release_date}`;
+      card.appendChild(release);
+    }
+    grid.appendChild(card);
+  });
+  pane.appendChild(grid);
+}
+
+function renderSearchArtists(bucket = {}) {
+  const pane = searchPaneMap.artists;
+  if (!pane) return;
+  pane.innerHTML = '';
+  if (!searchHasAttempted) {
+    pane.appendChild(createSearchHint('Search for any artist name.'));
+    return;
+  }
+  const items = Array.isArray(bucket?.items) ? bucket.items : [];
+  if (!items.length) {
+    pane.appendChild(createSearchEmpty('No artists found.'));
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'search-grid';
+  items.forEach(artist => {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'search-card search-artist-card';
+    card.addEventListener('click', () => playSearchArtist(artist));
+    const img = document.createElement('img');
+    img.alt = '';
+    img.src = artist?.image?.url || PLAYLIST_FALLBACK_COVER;
+    const title = document.createElement('div');
+    title.className = 'search-card-title';
+    title.textContent = artist?.name || 'Artist';
+    const subtitle = document.createElement('div');
+    subtitle.className = 'search-card-subtitle';
+    subtitle.textContent = artist?.genres || '';
+    const followers = document.createElement('div');
+    followers.className = 'search-artist-followers';
+    followers.textContent = formatFollowerCount(artist?.followers);
+    card.appendChild(img);
+    card.appendChild(title);
+    if (subtitle.textContent) card.appendChild(subtitle);
+    if (followers.textContent) card.appendChild(followers);
+    grid.appendChild(card);
+  });
+  pane.appendChild(grid);
+}
+
+function renderSearchPlaylists(bucket = {}) {
+  const pane = searchPaneMap.playlists;
+  if (!pane) return;
+  pane.innerHTML = '';
+  if (!searchHasAttempted) {
+    pane.appendChild(createSearchHint('Search for collaborative or saved playlists.'));
+    return;
+  }
+  const items = Array.isArray(bucket?.items) ? bucket.items : [];
+  if (!items.length) {
+    pane.appendChild(createSearchEmpty('No playlists found.'));
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'search-grid';
+  items.forEach(list => {
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'search-card playlist-card';
+    card.addEventListener('click', () => playSearchPlaylist(list));
+    const img = document.createElement('img');
+    img.alt = '';
+    img.src = list?.image?.url || PLAYLIST_FALLBACK_COVER;
+    const title = document.createElement('div');
+    title.className = 'search-card-title';
+    title.textContent = list?.name || 'Playlist';
+    const subtitle = document.createElement('div');
+    subtitle.className = 'search-card-subtitle';
+    const owner = list?.owner ? `by ${list.owner}` : '';
+    const tracks = typeof list?.tracks_total === 'number' ? `${list.tracks_total} tracks` : '';
+    subtitle.textContent = [owner, tracks].filter(Boolean).join(' • ');
+    card.appendChild(img);
+    card.appendChild(title);
+    if (subtitle.textContent) card.appendChild(subtitle);
+    grid.appendChild(card);
+  });
+  pane.appendChild(grid);
+}
+
+function updateSearchTabCounts() {
+  searchTabs.forEach(btn => {
+    if (!btn || !btn.dataset.searchTab) return;
+    const base = btn.dataset.baseLabel || btn.textContent.trim();
+    btn.dataset.baseLabel = base;
+    const bucket = searchResultsState[btn.dataset.searchTab] || {};
+    const count = Array.isArray(bucket.items) ? bucket.items.length : 0;
+    btn.textContent = searchHasAttempted && count ? `${base} (${count})` : base;
+  });
+}
+
+function createSearchHint(message) {
+  const div = document.createElement('div');
+  div.className = 'search-hint';
+  div.textContent = message;
+  return div;
+}
+
+function createSearchEmpty(message) {
+  const div = document.createElement('div');
+  div.className = 'search-empty';
+  div.textContent = message;
+  return div;
+}
+
+function formatFollowerCount(value) {
+  if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return '';
+  if (value >= 1_000_000) return `${(value / 1_000_000).toFixed(1).replace(/\.0$/, '')}M followers`;
+  if (value >= 1_000) return `${(value / 1_000).toFixed(1).replace(/\.0$/, '')}K followers`;
+  return `${value} followers`;
+}
+
+function playSearchTrack(track) {
+  if (!track?.uri) {
+    showError('Unable to play that track right now.');
+    return;
+  }
+  playerAction('/api/spotify/player/play', { uris: [track.uri] });
+  closeSearchOverlay();
+}
+
+function playSearchAlbum(album) {
+  if (!album?.uri) {
+    showError('Unable to play that album right now.');
+    return;
+  }
+  playerAction('/api/spotify/player/play', { context_uri: album.uri });
+  closeSearchOverlay();
+}
+
+function playSearchPlaylist(list) {
+  if (!list?.uri) {
+    showError('Unable to play that playlist right now.');
+    return;
+  }
+  playerAction('/api/spotify/player/play', { context_uri: list.uri });
+  closeSearchOverlay();
+}
+
+function playSearchArtist(artist) {
+  if (!artist?.uri) {
+    showError('Unable to play that artist right now.');
+    return;
+  }
+  playerAction('/api/spotify/player/play', { context_uri: artist.uri });
+  closeSearchOverlay();
+}
+
+async function runSpotifySearch(query) {
+  const term = (query || '').trim();
+  if (!term) {
+    if (searchInput) searchInput.focus();
+    return;
+  }
+  searchHasAttempted = true;
+  setSearchError('');
+  setSearchLoading(true, `Searching Spotify for "${term}"…`);
+  searchAbortController?.abort();
+  searchAbortController = new AbortController();
+  try {
+    const params = new URLSearchParams({ q: term, limit: '10' });
+    const res = await fetch(`/api/spotify/search?${params.toString()}`, { signal: searchAbortController.signal });
+    await ensureOk(res);
+    const data = await res.json();
+    searchResultsState = {
+      tracks: data?.tracks || { items: [] },
+      albums: data?.albums || { items: [] },
+      artists: data?.artists || { items: [] },
+      playlists: data?.playlists || { items: [] },
+    };
+    lastSearchQuery = data?.query || term;
+    if (searchSubtitle && lastSearchQuery) searchSubtitle.textContent = `Results for "${lastSearchQuery}"`;
+    updateSearchTabCounts();
+    renderSearchPane(searchActiveTab);
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    setSearchError(`Failed to search Spotify: ${err.message}`);
+  } finally {
+    setSearchLoading(false);
+  }
 }
 
 function setAddNodeMenuOpen(open) {
@@ -2713,6 +3120,33 @@ if (playlistSortSelect) {
     renderPlaylistGrid(playlistsCache);
   });
 }
+
+if (playerSearchBtn) playerSearchBtn.setAttribute('aria-expanded', 'false');
+if (playerSearchBtn) {
+  playerSearchBtn.addEventListener('click', () => {
+    setVolumeSliderOpen(false);
+    openSearchOverlay();
+  });
+}
+if (searchCloseBtn) searchCloseBtn.addEventListener('click', closeSearchOverlay);
+if (searchOverlay) {
+  searchOverlay.addEventListener('click', evt => {
+    if (evt.target === searchOverlay) closeSearchOverlay();
+  });
+}
+if (searchForm) {
+  searchForm.addEventListener('submit', evt => {
+    evt.preventDefault();
+    runSpotifySearch(searchInput?.value || '');
+  });
+}
+searchTabs.forEach(btn => {
+  if (!btn || !btn.dataset.searchTab) return;
+  if (!btn.dataset.baseLabel) btn.dataset.baseLabel = btn.textContent.trim();
+  btn.addEventListener('click', () => setSearchActiveTab(btn.dataset.searchTab));
+});
+SEARCH_TABS.forEach(tab => renderSearchPane(tab));
+updateSearchTabCounts();
 
 playerPrev.addEventListener('click', () => {
   if (playerPrev.disabled) return;

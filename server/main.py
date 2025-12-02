@@ -8,7 +8,7 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode
-from typing import Dict, Optional, AsyncIterator, List
+from typing import Dict, Optional, AsyncIterator, List, Callable
 
 import httpx
 import websockets
@@ -52,6 +52,7 @@ NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
 NODE_REDISCOVERY_INTERVAL = int(os.getenv("NODE_REDISCOVERY_INTERVAL", "90"))
 LIBRESPOT_FALLBACK_NAME = os.getenv("LIBRESPOT_FALLBACK_NAME", "RoomCast").strip() or "RoomCast"
+SPOTIFY_SEARCH_TYPES = ("album", "track", "artist", "playlist")
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -362,8 +363,7 @@ def _map_spotify_playlist(item: dict) -> dict:
     }
 
 
-def _map_spotify_track(item: dict, position: int) -> Optional[dict]:
-    track = item.get("track") if isinstance(item, dict) else None
+def _map_spotify_track_core(track: Optional[dict], *, position: Optional[int] = None) -> Optional[dict]:
     if not isinstance(track, dict):
         return None
     if track.get("is_local") is True:
@@ -375,7 +375,7 @@ def _map_spotify_track(item: dict, position: int) -> Optional[dict]:
     cover = None
     if isinstance(album, dict):
         cover = _map_spotify_image(album.get("images"))
-    return {
+    mapped = {
         "id": track.get("id"),
         "name": track.get("name") or "Untitled",
         "uri": track.get("uri"),
@@ -384,7 +384,84 @@ def _map_spotify_track(item: dict, position: int) -> Optional[dict]:
         "artists": artist_names,
         "album": album_name,
         "image": cover,
-        "position": position,
+    }
+    if position is not None:
+        mapped["position"] = position
+    return mapped
+
+
+def _map_spotify_track(item: dict, position: int) -> Optional[dict]:
+    track = item.get("track") if isinstance(item, dict) else None
+    return _map_spotify_track_core(track, position=position)
+
+
+def _map_spotify_track_simple(track: dict) -> Optional[dict]:
+    return _map_spotify_track_core(track)
+
+
+def _map_spotify_album(item: dict) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+    artists = item.get("artists") or []
+    artist_names = ", ".join(a.get("name") for a in artists if isinstance(a, dict) and a.get("name"))
+    cover = _map_spotify_image(item.get("images"))
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "uri": item.get("uri"),
+        "artists": artist_names,
+        "total_tracks": item.get("total_tracks"),
+        "release_date": item.get("release_date"),
+        "image": cover,
+    }
+
+
+def _map_spotify_artist(item: dict) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+    cover = _map_spotify_image(item.get("images"))
+    genres = item.get("genres") or []
+    top_genres = ", ".join(g for g in genres[:3] if g)
+    followers = item.get("followers") if isinstance(item.get("followers"), dict) else None
+    follower_total = followers.get("total") if isinstance(followers, dict) else None
+    return {
+        "id": item.get("id"),
+        "name": item.get("name"),
+        "uri": item.get("uri"),
+        "genres": top_genres,
+        "followers": follower_total,
+        "image": cover,
+    }
+
+
+def _map_spotify_search_bucket(payload: Optional[dict], mapper: Callable[[dict], Optional[dict]]) -> dict:
+    items: List[dict] = []
+    limit = None
+    offset = None
+    total = None
+    has_next = False
+    source_items = []
+    if isinstance(payload, dict):
+        limit = payload.get("limit")
+        offset = payload.get("offset")
+        total = payload.get("total")
+        has_next = bool(payload.get("next"))
+        raw_items = payload.get("items")
+        if isinstance(raw_items, list):
+            source_items = raw_items
+    for entry in source_items or []:
+        if not isinstance(entry, dict):
+            continue
+        mapped = mapper(entry)
+        if mapped:
+            items.append(mapped)
+    resolved_total = total if isinstance(total, int) else len(items)
+    return {
+        "items": items,
+        "total": resolved_total,
+        "limit": limit if isinstance(limit, int) else None,
+        "offset": offset if isinstance(offset, int) else None,
+        "next": has_next,
     }
 
 
@@ -1711,6 +1788,32 @@ async def spotify_activate_roomcast(payload: ActivateRoomcastPayload = Body(defa
         "device_name": device.get("name"),
         "volume_percent": device.get("volume_percent"),
         "is_active": True,
+    }
+
+
+@app.get("/api/spotify/search")
+async def spotify_search(q: str = Query(min_length=1, max_length=200), limit: int = Query(default=10, ge=1, le=20)) -> dict:
+    query = (q or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Query cannot be empty")
+    token = _ensure_spotify_token()
+    params = {
+        "q": query,
+        "type": ",".join(SPOTIFY_SEARCH_TYPES),
+        "limit": limit,
+    }
+    path = _with_query("/search", params)
+    resp = await spotify_request("GET", path, token)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    return {
+        "query": query,
+        "limit": limit,
+        "albums": _map_spotify_search_bucket(data.get("albums"), _map_spotify_album),
+        "tracks": _map_spotify_search_bucket(data.get("tracks"), _map_spotify_track_simple),
+        "artists": _map_spotify_search_bucket(data.get("artists"), _map_spotify_artist),
+        "playlists": _map_spotify_search_bucket(data.get("playlists"), _map_spotify_playlist),
     }
 
 

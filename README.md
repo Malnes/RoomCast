@@ -14,6 +14,7 @@ What exists here
 - `server/` FastAPI + static web UI; all config (Spotify creds, node registration, per-node EQ/volume) is via the UI.
 - `node-agent/` minimal agent to run on each speaker node (volume hook + health).
 - Controller UI shows per-node agent versions and can trigger remote self-updates so you always know which Raspberry Pis run the latest bits.
+- Built-in Spotify search palette (click the magnifying glass beside playlists) that queries albums, songs, artists, and playlists without leaving the app — results play instantly on the active RoomCast session.
 - Built-in WebRTC “web nodes” reachable via the UI; the controller relays Snapcast audio through an internal snapclient + WebRTC bridge so any browser can join in sync without extra installs.
 - Documentation for wiring Spotify and registering nodes; EQ support is stubbed but the hook is there so you can plug in ALSA LADSPA/pipewire effects.
 
