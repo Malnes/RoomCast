@@ -1,0 +1,47 @@
+services:
+  controller:
+    image: ${ROOMCAST_CONTROLLER_IMAGE:-ghcr.io/malnes/roomcast-controller:latest}
+    network_mode: host
+    environment:
+      SNAPSERVER_HOST: ${SNAPSERVER_HOST:-127.0.0.1}
+      SNAPSERVER_PORT: ${SNAPSERVER_PORT:-1780}
+      CONFIG_PATH: ${CONFIG_PATH:-/config/spotify.json}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:8000/api/spotify/callback}
+    depends_on:
+      - snapserver
+      - librespot
+    volumes:
+      - config:/config
+
+  snapserver:
+    image: saiyato/snapserver:latest
+    network_mode: host
+    command:
+      - --stream.source
+      - pipe:///tmp/snapfifo?name=Spotify
+      - --stream.sampleformat
+      - 44100:16:2
+      - --stream.codec
+      - pcm
+      - --http-cors
+      - '*'
+    volumes:
+      - snapfifo:/tmp
+      - ./snapserver.json:/root/.config/snapserver/server.json
+
+  librespot:
+    image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
+    network_mode: host
+    depends_on:
+      - snapserver
+    volumes:
+      - snapfifo:/tmp
+      - config:/config
+    environment:
+      LIBRESPOT_FALLBACK_NAME: ${LIBRESPOT_NAME:-RoomCast}
+
+volumes:
+  snapfifo:
+  config:

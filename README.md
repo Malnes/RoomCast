@@ -45,6 +45,21 @@ Prereqs: Docker, Docker Compose, Spotify Premium (Librespot needs it), open TCP 
 5) Use the UI to set per-node EQ (bands JSON) and volume; adjust Snapcast client volumes in the “Snapcast clients” section.
 Optional: if your host participates in multiple VLANs/subnets and you want to scan additional ranges beyond whatever interfaces the OS exposes, set `DISCOVERY_CIDR` to a comma/semicolon separated list (e.g. `192.168.1.0/24;10.10.0.0/24`). Those ranges will be scanned in addition to the interfaces that host networking already reveals.
 
+Deploy from GHCR (Dockge/Portainer friendly)
+-------------------------------------------
+The repository ships a GitHub Actions workflow (`.github/workflows/publish-controller.yml`) that builds and pushes two images to GHCR whenever `main` changes:
+
+- `ghcr.io/<owner>/roomcast-controller` – FastAPI web UI + API server with static assets baked in.
+- `ghcr.io/<owner>/roomcast-librespot` – Librespot wrapper with the helper script used in development.
+
+Once the workflow succeeds you can deploy on any host (or via Dockge/Portainer) with the production compose file:
+
+1) Copy `docker-compose.deploy.yml` to the server (or paste it into Dockge). No Spotify secrets are required in advance—the controller stores them under `/config` and the UI prompts for them on first launch.
+2) Optionally create a `.env` next to the compose file to override images (`ROOMCAST_CONTROLLER_IMAGE`, `ROOMCAST_LIBRESPOT_IMAGE`), device name (`LIBRESPOT_NAME`), or Snapserver host/port. Defaults point at GHCR `latest` tags.
+3) Run `docker compose -f docker-compose.deploy.yml up -d` (Dockge will do the equivalent). The controller immediately serves the UI on port 8000; open it and use the ⚙︎ panel to enter Spotify Client ID/secret, device name, and other runtime settings. Credentials are persisted inside the mounted `config` volume, so containers can be rebuilt without re-entering secrets.
+
+Because the controller image already contains the compiled UI, no bind mounts or build arguments are necessary—the compose stack works with only Docker + an internet connection to fetch the GHCR images.
+
 Caveats / next steps
 --------------------
 - EQ: implement your chosen pipeline on the nodes (PipeWire filter chain or ALSA LADSPA) and update `node-agent/agent.py` in `set_eq`.  
