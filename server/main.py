@@ -417,6 +417,10 @@ class WebNodeOffer(BaseModel):
     type: str
 
 
+class NodeChannelPayload(BaseModel):
+    channel_id: str = Field(min_length=1, max_length=120)
+
+
 class SpotifyConfig(BaseModel):
     device_name: str = Field(default="RoomCast")
     bitrate: int = Field(default=320, ge=96, le=320)
@@ -489,14 +493,41 @@ class SnapcastClient:
         status = await self.status()
         clients = []
         for group in status.get("server", {}).get("groups", []):
+            group_id = group.get("id")
+            stream_id = group.get("stream_id")
             for client in group.get("clients", []):
-                clients.append(client)
+                enriched = dict(client)
+                enriched["_group_id"] = group_id
+                enriched["_stream_id"] = stream_id
+                clients.append(enriched)
         return clients
+
+    async def set_client_stream(self, client_id: str, stream_id: str) -> dict:
+        params = {"id": client_id, "stream_id": stream_id}
+        return await self._rpc("Client.SetStream", params)
+
+    async def set_group_stream(self, group_id: str, stream_id: str) -> dict:
+        params = {"id": group_id, "stream_id": stream_id}
+        return await self._rpc("Group.SetStream", params)
 
 
 snapcast = SnapcastClient(SNAPSERVER_HOST, SNAPSERVER_PORT)
 app = FastAPI(title="RoomCast Controller", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def _is_rpc_method_not_found_error(exc: Exception) -> bool:
+    if isinstance(exc, RuntimeError):
+        payload = exc.args[0] if exc.args else None
+        if isinstance(payload, dict):
+            message = str(payload.get("message") or "").lower()
+            code = payload.get("code")
+            if code == -32601 or "method not found" in message:
+                return True
+        text = str(payload).lower() if payload is not None else ""
+        if "method not found" in text:
+            return True
+    return "method not found" in str(exc).lower()
 
 PUBLIC_API_PATHS = {
     "/api/auth/status",
@@ -504,6 +535,7 @@ PUBLIC_API_PATHS = {
     "/api/auth/logout",
     "/api/auth/initialize",
     "/api/health",
+    "/api/spotify/callback",
 }
 
 
@@ -550,6 +582,22 @@ def default_eq_state() -> dict:
     return {"preset": DEFAULT_EQ_PRESET, "band_count": 15, "bands": []}
 
 
+def _select_initial_channel_id(preferred: Optional[str] = None) -> str:
+    candidate = (preferred or "").strip().lower()
+    if candidate in channels_by_id:
+        return candidate
+    return _primary_channel_id()
+
+
+def resolve_node_channel_id(node: dict) -> str:
+    channel_id = (node.get("channel_id") or "").strip().lower()
+    if channel_id in channels_by_id:
+        return channel_id
+    fallback = _primary_channel_id()
+    node["channel_id"] = fallback
+    return fallback
+
+
 def public_node(node: dict) -> dict:
     data = {k: v for k, v in node.items() if k not in SENSITIVE_NODE_FIELDS}
     data["paired"] = bool(node.get("agent_secret"))
@@ -576,6 +624,7 @@ def public_node(node: dict) -> dict:
     data["outputs"] = node.get("outputs") or {}
     data["fingerprint"] = node.get("fingerprint")
     data["max_volume_percent"] = _get_node_max_volume(node)
+    data["channel_id"] = resolve_node_channel_id(node)
     return data
 
 
@@ -1079,6 +1128,45 @@ def _normalize_node_url(raw: str) -> str:
     return value.rstrip("/")
 
 
+def _node_host_from_url(url: Optional[str]) -> Optional[str]:
+    if not url or url.startswith("browser:"):
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    return parsed.hostname
+
+
+def _match_snapclient_for_node(node: dict, clients: list[dict]) -> Optional[dict]:
+    if not clients:
+        return None
+    stored_id = (node.get("snapclient_id") or "").strip()
+    if stored_id:
+        for client in clients:
+            if client.get("id") == stored_id:
+                return client
+    fingerprint = (node.get("fingerprint") or "").strip()
+    if fingerprint:
+        for client in clients:
+            if client.get("id") == fingerprint:
+                return client
+    node_host = _node_host_from_url(node.get("url"))
+    if node_host:
+        for client in clients:
+            host = client.get("host") or {}
+            if host.get("ip") == node_host or host.get("name") == node_host:
+                return client
+    node_name = (node.get("name") or "").strip().lower()
+    if node_name:
+        for client in clients:
+            config = client.get("config") or {}
+            client_name = (config.get("name") or "").strip().lower()
+            if client_name and client_name == node_name:
+                return client
+    return None
+
+
 def _register_node_internal(
     reg: NodeRegistration,
     *,
@@ -1134,6 +1222,8 @@ def _register_node_internal(
         "playback_device": previous.get("playback_device"),
         "outputs": previous.get("outputs", {}),
         "fingerprint": fingerprint or previous.get("fingerprint"),
+        "channel_id": _select_initial_channel_id(previous.get("channel_id")),
+        "snapclient_id": previous.get("snapclient_id"),
         "online": True,
         "offline_since": None,
     }
@@ -1443,6 +1533,9 @@ def load_nodes() -> None:
                 item["online"] = True
             else:
                 item["online"] = bool(item.get("online", False))
+            item["channel_id"] = _select_initial_channel_id(item.get("channel_id"))
+            snapclient_id = (item.get("snapclient_id") or "").strip() or None
+            item["snapclient_id"] = snapclient_id
             nodes[item["id"]] = item
     except Exception:
         nodes = {}
@@ -1825,6 +1918,55 @@ async def _get_agent(node: dict, path: str) -> dict:
     return resp.json()
 
 
+async def _ensure_snapclient_stream(node: dict, channel: dict) -> str:
+    if node.get("type") != "agent":
+        raise HTTPException(status_code=400, detail="Channel assignment only applies to hardware nodes")
+    try:
+        clients = await snapcast.list_clients()
+    except Exception as exc:  # pragma: no cover - network dependency
+        log.exception("Failed to list snapcast clients")
+        raise HTTPException(status_code=502, detail=f"Failed to talk to snapserver: {exc}") from exc
+    client = _match_snapclient_for_node(node, clients)
+    if not client:
+        raise HTTPException(status_code=409, detail="Snapclient for this node is offline or unidentified")
+    stream_id = channel.get("snap_stream")
+    if not stream_id:
+        raise HTTPException(status_code=400, detail="Channel is missing snap_stream mapping")
+    if client.get("_stream_id") != stream_id:
+        try:
+            await snapcast.set_client_stream(client["id"], stream_id)
+        except RuntimeError as exc:  # pragma: no cover - network dependency
+            if _is_rpc_method_not_found_error(exc):
+                group_id = client.get("_group_id")
+                if not group_id:
+                    log.error("Snapclient %s missing group id; cannot switch stream", client.get("id"))
+                    raise HTTPException(status_code=502, detail="Snapclient group unknown; cannot switch stream") from exc
+                try:
+                    await snapcast.set_group_stream(group_id, stream_id)
+                except Exception as group_exc:  # pragma: no cover - network dependency
+                    log.exception("Failed to move snapclient group %s to stream %s", group_id, stream_id)
+                    raise HTTPException(status_code=502, detail=f"Failed to switch snapclient group stream: {group_exc}") from group_exc
+            else:
+                log.exception("Failed to move snapclient %s to stream %s", client.get("id"), stream_id)
+                raise HTTPException(status_code=502, detail=f"Failed to switch snapclient stream: {exc}") from exc
+        except Exception as exc:  # pragma: no cover - network dependency
+            log.exception("Failed to move snapclient %s to stream %s", client.get("id"), stream_id)
+            raise HTTPException(status_code=502, detail=f"Failed to switch snapclient stream: {exc}") from exc
+    return str(client.get("id"))
+
+
+async def _set_node_channel(node: dict, channel_id: str) -> None:
+    resolved = resolve_channel_id(channel_id)
+    current = resolve_node_channel_id(node)
+    if resolved == current:
+        return
+    channel = channels_by_id[resolved]
+    if node.get("type") == "agent":
+        client_id = await _ensure_snapclient_stream(node, channel)
+        node["snapclient_id"] = client_id
+    node["channel_id"] = resolved
+
+
 @app.post("/api/nodes/{node_id}/volume")
 async def set_node_volume(node_id: str, payload: VolumePayload) -> dict:
     node = nodes.get(node_id)
@@ -1960,6 +2102,17 @@ async def rename_node(node_id: str, payload: RenameNodePayload) -> dict:
     save_nodes()
     await broadcast_nodes()
     return {"ok": True, "name": new_name}
+
+
+@app.post("/api/nodes/{node_id}/channel")
+async def update_node_channel(node_id: str, payload: NodeChannelPayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    await _set_node_channel(node, payload.channel_id)
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True, "channel_id": node.get("channel_id")}
 
 
 @app.post("/api/nodes/{node_id}/configure")

@@ -450,6 +450,8 @@ def _snapclient_args(config: dict) -> list[str]:
         f"alsa:device={PLAYBACK_DEVICE}",
         "--sampleformat",
         "48000:32:*",
+        "-i",
+        node_uid,
     ]
     return base
 

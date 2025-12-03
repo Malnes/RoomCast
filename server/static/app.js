@@ -38,6 +38,8 @@ setRangeProgress(masterVolume, masterVolume?.value || 0, masterVolume?.max || 10
 const playerVolumeInline = document.getElementById('player-volume-inline');
 const playerVolumeToggle = document.getElementById('player-volume-toggle');
 const playerPanel = document.getElementById('player-panel');
+const playerCarouselTrack = document.getElementById('player-carousel-track');
+const playerCarouselIndicators = document.getElementById('player-carousel-indicators');
 const playerShuffleBtn = document.getElementById('player-shuffle');
 const playerPrev = document.getElementById('player-prev');
 const playerPlay = document.getElementById('player-play');
@@ -75,6 +77,19 @@ const playlistTracksView = document.querySelector('.playlist-tracks-view');
 const playlistSubtitle = document.getElementById('playlist-modal-subtitle');
 const playlistSearchInput = document.getElementById('playlist-search');
 const playlistSortSelect = document.getElementById('playlist-sort');
+const channelsPanel = document.getElementById('channels-panel');
+const spotifyChannelSelect = document.getElementById('spotify-channel-select');
+const DEFAULT_CHANNEL_COLOR = '#22c55e';
+if (playerPanel) {
+  playerPanel.addEventListener('pointerdown', handleCarouselPointerDown);
+  playerPanel.addEventListener('pointermove', handleCarouselPointerMove);
+  playerPanel.addEventListener('pointerup', handleCarouselPointerUp);
+  playerPanel.addEventListener('pointercancel', handleCarouselPointerCancel);
+  playerPanel.addEventListener('keydown', handleCarouselKeydown);
+}
+window.addEventListener('resize', () => {
+  syncPlayerCarouselToActive({ animate: false });
+});
 if (playlistLoadMoreBtn) {
   playlistLoadMoreBtn.addEventListener('click', () => {
     if (!playlistSelected) return;
@@ -123,6 +138,12 @@ let activeDeviceId = null;
 let playerTick = null;
 let discoverAbortController = null;
 let discoverResultsCount = 0;
+let channelsCache = [];
+let activeChannelId = null;
+let channelFetchPromise = null;
+let spotifySettingsChannelId = null;
+const channelPendingEdits = new Map();
+const channelFormRefs = new Map();
 let nodeSettingsModal = null;
 let nodeSettingsContent = null;
 let nodeSettingsTitle = null;
@@ -148,6 +169,17 @@ let lastSearchQuery = '';
 let searchHasAttempted = false;
 let searchResultsState = defaultSearchBuckets();
 let searchAbortController = null;
+const playerCarouselCards = new Map();
+const playerCarouselIndicatorRefs = new Map();
+// Runtime data for the swipeable player carousel.
+let playerCarouselState = {
+  isDragging: false,
+  pointerId: null,
+  startX: 0,
+  deltaX: 0,
+  width: 0,
+  captured: false,
+};
 let queueAbortController = null;
 const playlistNameCollator = typeof Intl !== 'undefined' && typeof Intl.Collator === 'function'
   ? new Intl.Collator(undefined, { sensitivity: 'base' })
@@ -275,6 +307,7 @@ function stopDataPolling() {
     playerPollTimer = null;
   }
   stopNodeSocket();
+  resetChannelUiState();
 }
 
 function startDataPolling() {
@@ -302,6 +335,9 @@ function enterAppShell() {
   updateUserStatusUI();
   syncGeneralSettingsUI();
   renderUsersList();
+  refreshChannels().catch(() => {
+    /* errors surfaced via toast */
+  });
   startDataPolling();
 }
 
@@ -494,6 +530,753 @@ function clearPersistentAlertSuppression(key) {
   persistentAlertSuppression.delete(key);
 }
 
+function normalizeChannelColorInput(value) {
+  if (!value) return null;
+  let raw = String(value).trim().toLowerCase();
+  if (!raw) return null;
+  if (!raw.startsWith('#')) raw = `#${raw}`;
+  if (raw.length === 4) {
+    const [, r, g, b] = raw;
+    raw = `#${r}${r}${g}${g}${b}${b}`;
+  }
+  if (raw.length !== 7) return null;
+  if (!/^#[0-9a-f]{6}$/i.test(raw)) return null;
+  return raw;
+}
+
+function hexToRgbParts(hexValue) {
+  const normalized = normalizeChannelColorInput(hexValue);
+  if (!normalized) return null;
+  const r = parseInt(normalized.slice(1, 3), 16);
+  const g = parseInt(normalized.slice(3, 5), 16);
+  const b = parseInt(normalized.slice(5, 7), 16);
+  if ([r, g, b].some(num => Number.isNaN(num))) return null;
+  return [r, g, b];
+}
+
+function rgbaFromHex(hexValue, alpha = 1) {
+  const rgb = hexToRgbParts(hexValue);
+  if (!rgb) return null;
+  const parsed = Number(alpha);
+  const normalizedAlpha = Math.max(0, Math.min(1, Number.isFinite(parsed) ? parsed : 1));
+  return `rgba(${rgb.join(',')}, ${normalizedAlpha})`;
+}
+
+function darkenHexColor(hexValue, amount = 0.2) {
+  const rgb = hexToRgbParts(hexValue);
+  if (!rgb) return null;
+  const factor = Math.max(0, Math.min(1, 1 - amount));
+  const shaded = rgb.map(part => Math.round(part * factor));
+  return `#${shaded.map(value => value.toString(16).padStart(2, '0')).join('')}`;
+}
+
+function applyChannelTheme(channel) {
+  const fallbackColor = DEFAULT_CHANNEL_COLOR;
+  const fallbackDark = '#16a34a';
+  const fallbackRgb = '34,197,94';
+  const color = normalizeChannelColorInput(channel?.color) || fallbackColor;
+  const rgbParts = hexToRgbParts(color) || hexToRgbParts(fallbackColor);
+  const rgbString = rgbParts ? rgbParts.join(',') : fallbackRgb;
+  const darker = darkenHexColor(color, 0.18) || fallbackDark;
+  document.documentElement?.style?.setProperty('--accent', color);
+  document.documentElement?.style?.setProperty('--accent-dark', darker);
+  document.documentElement?.style?.setProperty('--accent-rgb', rgbString);
+}
+
+function withChannel(path, channelId = getActiveChannelId()) {
+  if (!channelId) return path;
+  const separator = path.includes('?') ? '&' : '?';
+  return `${path}${separator}channel_id=${encodeURIComponent(channelId)}`;
+}
+
+function getChannelById(channelId) {
+  if (!channelId) return null;
+  return channelsCache.find(ch => ch.id === channelId) || null;
+}
+
+function getChannelAccentColor(channelId) {
+  const channel = getChannelById(channelId);
+  return normalizeChannelColorInput(channel?.color);
+}
+
+function getNodeChannelAccent(node) {
+  if (!node) return DEFAULT_CHANNEL_COLOR;
+  if (node.type === 'browser') {
+    const activeColor = getActiveChannel()?.color;
+    return normalizeChannelColorInput(activeColor) || DEFAULT_CHANNEL_COLOR;
+  }
+  const resolvedId = resolveNodeChannelId(node);
+  return getChannelAccentColor(resolvedId) || DEFAULT_CHANNEL_COLOR;
+}
+
+function applyRangeAccent(el, colorValue) {
+  if (!el) return;
+  const normalized = normalizeChannelColorInput(colorValue);
+  if (normalized) {
+    el.style.setProperty('--range-accent', normalized);
+    el.dataset.rangeAccent = normalized;
+    const rgbParts = hexToRgbParts(normalized);
+    if (rgbParts) {
+      const rgbValue = rgbParts.join(',');
+      el.style.setProperty('--range-accent-rgb', rgbValue);
+      el.dataset.rangeAccentRgb = rgbValue;
+    } else {
+      el.style.removeProperty('--range-accent-rgb');
+      delete el.dataset.rangeAccentRgb;
+    }
+  } else {
+    el.style.removeProperty('--range-accent');
+    el.style.removeProperty('--range-accent-rgb');
+    delete el.dataset.rangeAccent;
+    delete el.dataset.rangeAccentRgb;
+  }
+}
+
+function resolveRangeAccent(el) {
+  const fallback = 'var(--accent)';
+  const fallbackRgb = 'var(--accent-rgb)';
+  if (!el) return { accent: fallback, accentRgb: fallbackRgb };
+  const accent = (el.dataset?.rangeAccent || el.style?.getPropertyValue('--range-accent') || '').trim() || fallback;
+  const accentRgb = (el.dataset?.rangeAccentRgb || el.style?.getPropertyValue('--range-accent-rgb') || '').trim() || fallbackRgb;
+  return { accent, accentRgb };
+}
+
+function resolveNodeChannelId(node) {
+  if (node?.channel_id && channelsCache.some(ch => ch.id === node.channel_id)) {
+    return node.channel_id;
+  }
+  return channelsCache[0]?.id || null;
+}
+
+function updateChannelDotColor(target, channelId) {
+  if (!target) return;
+  const color = getChannelAccentColor(channelId) || '#94a3b8';
+  target.style.background = color;
+}
+
+function getActiveChannelId() {
+  if (activeChannelId && channelsCache.some(ch => ch.id === activeChannelId)) {
+    return activeChannelId;
+  }
+  activeChannelId = channelsCache[0]?.id || null;
+  return activeChannelId;
+}
+
+function getActiveChannel() {
+  const cid = getActiveChannelId();
+  return cid ? getChannelById(cid) : null;
+}
+
+function setActiveChannel(channelId) {
+  if (!channelId || channelId === activeChannelId) return;
+  if (!channelsCache.some(ch => ch.id === channelId)) return;
+  const previous = activeChannelId;
+  activeChannelId = channelId;
+  syncPlayerCarouselToActive({ animate: true });
+  applyChannelTheme(getActiveChannel());
+  onActiveChannelChanged(previous, channelId);
+}
+
+
+
+function updatePlayerCarouselCards(channel) {
+  if (!channel || !channel.id) return null;
+  let card = playerCarouselCards.get(channel.id);
+  if (!card) {
+    card = document.createElement('div');
+    card.className = 'player-carousel-card';
+    card.dataset.channelId = channel.id;
+    playerCarouselCards.set(channel.id, card);
+  }
+  return card;
+}
+
+function updatePlayerCarouselIndicatorState() {
+  const activeId = getActiveChannelId();
+  playerCarouselIndicatorRefs.forEach((btn, channelId) => {
+    const isActive = channelId === activeId;
+    btn.classList.toggle('is-active', isActive);
+    btn.setAttribute('aria-pressed', isActive ? 'true' : 'false');
+  });
+}
+
+function updatePlayerCarouselIndicators() {
+  if (!playerCarouselIndicators) return;
+  playerCarouselIndicators.innerHTML = '';
+  playerCarouselIndicatorRefs.clear();
+  if (channelsCache.length <= 1) {
+    playerCarouselIndicators.hidden = true;
+    return;
+  }
+  playerCarouselIndicators.hidden = false;
+  channelsCache.forEach(channel => {
+    if (!channel?.id) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'player-carousel-indicator';
+    btn.dataset.channelId = channel.id;
+    btn.setAttribute('aria-label', `Switch to ${channel.name || channel.id}`);
+    const color = getChannelAccentColor(channel.id) || DEFAULT_CHANNEL_COLOR;
+    btn.style.setProperty('--indicator-color', color);
+    btn.addEventListener('click', () => setActiveChannel(channel.id));
+    playerCarouselIndicators.appendChild(btn);
+    playerCarouselIndicatorRefs.set(channel.id, btn);
+  });
+  updatePlayerCarouselIndicatorState();
+}
+
+function getActiveChannelIndex() {
+  const activeId = getActiveChannelId();
+  if (!activeId) return 0;
+  const idx = channelsCache.findIndex(ch => ch.id === activeId);
+  return idx === -1 ? 0 : idx;
+}
+
+function updatePlayerCarouselPosition(index, animate = true) {
+  if (!playerCarouselTrack || !playerPanel) return;
+  const width = playerPanel.clientWidth || window.innerWidth || 1;
+  const dragOffset = playerCarouselState.isDragging ? playerCarouselState.deltaX : 0;
+  const offset = -index * width + dragOffset;
+  if (!animate || playerCarouselState.isDragging) {
+    playerCarouselTrack.style.transition = 'none';
+  } else {
+    playerCarouselTrack.style.transition = '';
+  }
+  playerCarouselTrack.style.transform = `translate3d(${offset}px, 0, 0)`;
+}
+
+function syncPlayerCarouselToActive(options = {}) {
+  const animate = options.animate !== false;
+  const activeId = getActiveChannelId();
+  playerCarouselCards.forEach(card => {
+    card.classList.toggle('is-active', card.dataset.channelId === activeId);
+  });
+  updatePlayerCarouselIndicatorState();
+  updatePlayerCarouselPosition(getActiveChannelIndex(), animate);
+  if (playerPanel) {
+    playerPanel.classList.toggle('is-carousel-enabled', channelsCache.length > 1);
+  }
+}
+
+function renderPlayerCarousel() {
+  if (!playerCarouselTrack) return;
+  if (!channelsCache.length) {
+    if (playerCarouselTrack) {
+      playerCarouselTrack.innerHTML = '<div class="player-carousel-empty">Add a channel in Settings to begin playback.</div>';
+    }
+    playerCarouselCards.clear();
+    updatePlayerCarouselIndicators();
+    syncPlayerCarouselToActive({ animate: false });
+    if (playerPanel) playerPanel.classList.remove('is-carousel-enabled');
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  const seen = new Set();
+  channelsCache.forEach(channel => {
+    if (!channel?.id) return;
+    const card = updatePlayerCarouselCards(channel);
+    if (card) fragment.appendChild(card);
+    seen.add(channel.id);
+  });
+  playerCarouselTrack.innerHTML = '';
+  playerCarouselTrack.appendChild(fragment);
+  Array.from(playerCarouselCards.keys()).forEach(channelId => {
+    if (!seen.has(channelId)) {
+      playerCarouselCards.get(channelId)?.remove();
+      playerCarouselCards.delete(channelId);
+    }
+  });
+  updatePlayerCarouselIndicators();
+  syncPlayerCarouselToActive({ animate: false });
+}
+
+function selectAdjacentChannel(step) {
+  if (!channelsCache.length) return false;
+  const currentIdx = getActiveChannelIndex();
+  const nextIdx = step < 0 ? Math.max(0, currentIdx - 1) : Math.min(channelsCache.length - 1, currentIdx + 1);
+  if (nextIdx === currentIdx) return false;
+  const nextChannel = channelsCache[nextIdx];
+  if (nextChannel?.id) {
+    setActiveChannel(nextChannel.id);
+    return true;
+  }
+  return false;
+}
+
+function isInteractiveControl(target) {
+  if (!target || target === document || target === window) return false;
+  return !!target.closest('button, input, select, textarea, a, [role="button"], [role="slider"], [contenteditable="true"]');
+}
+
+function shouldStartCarouselGesture(event) {
+  if (!playerPanel || channelsCache.length <= 1) return false;
+  if (event.pointerType === 'mouse' && event.button !== 0) return false;
+  if (isInteractiveControl(event.target)) return false;
+  return true;
+}
+
+function handleCarouselPointerDown(event) {
+  if (!shouldStartCarouselGesture(event) || playerCarouselState.isDragging) return;
+  playerCarouselState.isDragging = true;
+  playerCarouselState.pointerId = event.pointerId;
+  playerCarouselState.startX = event.clientX;
+  playerCarouselState.deltaX = 0;
+  playerCarouselState.width = playerPanel?.clientWidth || window.innerWidth || 1;
+  playerCarouselState.captured = false;
+  playerPanel.classList.add('is-dragging');
+  if (playerPanel?.setPointerCapture) {
+    try {
+      playerPanel.setPointerCapture(event.pointerId);
+      playerCarouselState.captured = true;
+    } catch (err) {
+      console.debug('Pointer capture failed', err);
+    }
+  }
+}
+
+function handleCarouselPointerMove(event) {
+  if (!playerCarouselState.isDragging || event.pointerId !== playerCarouselState.pointerId) return;
+  const delta = event.clientX - playerCarouselState.startX;
+  const max = playerCarouselState.width ? playerCarouselState.width * 1.1 : 400;
+  playerCarouselState.deltaX = Math.max(-max, Math.min(max, delta));
+  updatePlayerCarouselPosition(getActiveChannelIndex(), false);
+  if (Math.abs(delta) > 6) event.preventDefault();
+}
+
+function releaseCarouselPointer(pointerId) {
+  if (playerCarouselState.captured && playerPanel?.releasePointerCapture) {
+    try {
+      playerPanel.releasePointerCapture(pointerId);
+    } catch (err) {
+      console.debug('Pointer release failed', err);
+    }
+  }
+  playerCarouselState.captured = false;
+  playerPanel?.classList.remove('is-dragging');
+}
+
+function finishCarouselGesture(event, cancelled = false) {
+  if (!playerCarouselState.isDragging || event.pointerId !== playerCarouselState.pointerId) return;
+  const delta = playerCarouselState.deltaX;
+  const width = playerCarouselState.width || 1;
+  const threshold = Math.min(140, width * 0.25);
+  releaseCarouselPointer(event.pointerId);
+  const moved = !cancelled && Math.abs(delta) >= threshold;
+  let changed = false;
+  if (moved) {
+    changed = delta < 0 ? selectAdjacentChannel(1) : selectAdjacentChannel(-1);
+  }
+  playerCarouselState = {
+    isDragging: false,
+    pointerId: null,
+    startX: 0,
+    deltaX: 0,
+    width: 0,
+    captured: false,
+  };
+  if (!changed) {
+    syncPlayerCarouselToActive({ animate: true });
+  }
+}
+
+function handleCarouselPointerUp(event) {
+  finishCarouselGesture(event, false);
+}
+
+function handleCarouselPointerCancel(event) {
+  finishCarouselGesture(event, true);
+}
+
+function handleCarouselKeydown(event) {
+  if (!playerPanel || !channelsCache.length) return;
+  if (event.altKey || event.ctrlKey || event.metaKey) return;
+  if (event.key === 'ArrowLeft') {
+    if (selectAdjacentChannel(-1)) event.preventDefault();
+  } else if (event.key === 'ArrowRight') {
+    if (selectAdjacentChannel(1)) event.preventDefault();
+  }
+}
+
+function populateSpotifyChannelSelect() {
+  if (!spotifyChannelSelect) return;
+  spotifyChannelSelect.innerHTML = '';
+  if (!channelsCache.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No channels available';
+    spotifyChannelSelect.appendChild(option);
+    spotifyChannelSelect.disabled = true;
+    return;
+  }
+  spotifyChannelSelect.disabled = false;
+  channelsCache.forEach(channel => {
+    const option = document.createElement('option');
+    option.value = channel.id;
+    option.textContent = channel.name || channel.id;
+    spotifyChannelSelect.appendChild(option);
+  });
+  const resolved = getSettingsChannelId();
+  if (resolved) spotifyChannelSelect.value = resolved;
+}
+
+function getSettingsChannelId() {
+  if (spotifySettingsChannelId && channelsCache.some(ch => ch.id === spotifySettingsChannelId)) {
+    return spotifySettingsChannelId;
+  }
+  spotifySettingsChannelId = getActiveChannelId();
+  if (spotifyChannelSelect && spotifySettingsChannelId) {
+    spotifyChannelSelect.value = spotifySettingsChannelId;
+  }
+  return spotifySettingsChannelId;
+}
+
+function setChannelSwatchColor(el, color) {
+  if (!el) return;
+  const normalized = normalizeChannelColorInput(color);
+  if (normalized) {
+    el.style.background = normalized;
+  } else {
+    el.style.background = 'linear-gradient(135deg, rgba(148,163,184,0.35), rgba(30,41,59,0.6))';
+  }
+}
+
+function renderChannelsPanel() {
+  if (!channelsPanel) return;
+  channelsPanel.innerHTML = '';
+  channelFormRefs.clear();
+  if (!channelsCache.length) {
+    channelsPanel.innerHTML = '<div class="muted">No channels configured yet.</div>';
+    return;
+  }
+  channelsCache.forEach(channel => {
+    const pending = channelPendingEdits.get(channel.id) || {};
+    const nameValue = Object.prototype.hasOwnProperty.call(pending, 'name')
+      ? pending.name
+      : channel.name || '';
+    const snapValue = Object.prototype.hasOwnProperty.call(pending, 'snap_stream')
+      ? pending.snap_stream
+      : channel.snap_stream || '';
+    const hasPendingColor = Object.prototype.hasOwnProperty.call(pending, 'color');
+    const colorValue = hasPendingColor ? pending.color : channel.color;
+
+    const card = document.createElement('div');
+    card.className = 'channel-card';
+    card.dataset.channelId = channel.id;
+
+    const header = document.createElement('div');
+    header.className = 'channel-card-header';
+
+    const nameGroup = document.createElement('div');
+    const nameLabel = document.createElement('label');
+    nameLabel.textContent = 'Channel name';
+    const nameInput = document.createElement('input');
+    nameInput.value = nameValue;
+    nameGroup.appendChild(nameLabel);
+    nameGroup.appendChild(nameInput);
+    header.appendChild(nameGroup);
+
+    const snapGroup = document.createElement('div');
+    const snapLabel = document.createElement('label');
+    snapLabel.textContent = 'Snapcast stream';
+    const snapInput = document.createElement('input');
+    snapInput.value = snapValue;
+    snapGroup.appendChild(snapLabel);
+    snapGroup.appendChild(snapInput);
+    header.appendChild(snapGroup);
+
+    const colorGroup = document.createElement('div');
+    const colorLabel = document.createElement('label');
+    colorLabel.textContent = 'Accent colour';
+    const colorInputs = document.createElement('div');
+    colorInputs.className = 'channel-color-inputs';
+    const colorPicker = document.createElement('input');
+    colorPicker.type = 'color';
+    colorPicker.value = normalizeChannelColorInput(colorValue) || '#22c55e';
+    const colorText = document.createElement('input');
+    colorText.type = 'text';
+    colorText.placeholder = '#22c55e';
+    colorText.value = colorValue || '';
+    colorInputs.appendChild(colorPicker);
+    colorInputs.appendChild(colorText);
+    const swatch = document.createElement('div');
+    swatch.className = 'channel-color-swatch';
+    setChannelSwatchColor(swatch, colorValue || colorPicker.value);
+    colorGroup.appendChild(colorLabel);
+    colorGroup.appendChild(colorInputs);
+    colorGroup.appendChild(swatch);
+    header.appendChild(colorGroup);
+
+    card.appendChild(header);
+
+    const status = document.createElement('div');
+    status.className = 'channel-card-status';
+    status.textContent = 'Synced';
+    card.appendChild(status);
+
+    const actions = document.createElement('div');
+    actions.className = 'channel-card-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'button';
+    saveBtn.className = 'small-btn';
+    saveBtn.textContent = 'Save changes';
+    saveBtn.disabled = true;
+    actions.appendChild(saveBtn);
+    card.appendChild(actions);
+
+    channelsPanel.appendChild(card);
+
+    const refs = {
+      card,
+      nameInput,
+      snapInput,
+      colorPicker,
+      colorTextInput: colorText,
+      saveButton: saveBtn,
+      statusEl: status,
+      swatch,
+    };
+    channelFormRefs.set(channel.id, refs);
+
+    nameInput.addEventListener('input', () => updateChannelCardState(channel.id));
+    snapInput.addEventListener('input', () => updateChannelCardState(channel.id));
+    colorPicker.addEventListener('input', () => {
+      colorText.value = colorPicker.value;
+      setChannelSwatchColor(swatch, colorPicker.value);
+      updateChannelCardState(channel.id);
+    });
+    colorText.addEventListener('input', () => {
+      const normalized = normalizeChannelColorInput(colorText.value);
+      if (normalized) {
+        colorPicker.value = normalized;
+        setChannelSwatchColor(swatch, normalized);
+      } else if (!colorText.value.trim()) {
+        setChannelSwatchColor(swatch, null);
+      }
+      updateChannelCardState(channel.id);
+    });
+    saveBtn.addEventListener('click', () => saveChannelChanges(channel.id));
+
+    updateChannelCardState(channel.id);
+  });
+}
+
+function updateChannelCardState(channelId) {
+  const refs = channelFormRefs.get(channelId);
+  if (!refs) return;
+  const base = getChannelById(channelId) || {};
+  const nameValue = (refs.nameInput.value || '').trim();
+  const snapValue = (refs.snapInput.value || '').trim();
+  const colorRaw = (refs.colorTextInput.value || '').trim();
+  const normalizedColor = colorRaw ? normalizeChannelColorInput(colorRaw) : null;
+  if (colorRaw && !normalizedColor) {
+    refs.statusEl.textContent = 'Use #RGB or #RRGGBB';
+    refs.card.dataset.dirty = 'false';
+    refs.saveButton.disabled = true;
+    channelPendingEdits.delete(channelId);
+    return;
+  }
+  if (!nameValue) {
+    refs.statusEl.textContent = 'Channel name required';
+    refs.card.dataset.dirty = 'false';
+    refs.saveButton.disabled = true;
+    channelPendingEdits.delete(channelId);
+    return;
+  }
+  if (!snapValue) {
+    refs.statusEl.textContent = 'Snap stream required';
+    refs.card.dataset.dirty = 'false';
+    refs.saveButton.disabled = true;
+    channelPendingEdits.delete(channelId);
+    return;
+  }
+  const pending = {};
+  let hasDiff = false;
+  if (nameValue !== base.name) {
+    pending.name = nameValue;
+    hasDiff = true;
+  }
+  if (snapValue !== base.snap_stream) {
+    pending.snap_stream = snapValue;
+    hasDiff = true;
+  }
+  const baseColor = base.color || null;
+  const nextColor = normalizedColor || null;
+  if (nextColor !== baseColor) {
+    pending.color = nextColor;
+    hasDiff = true;
+  }
+  if (hasDiff) {
+    channelPendingEdits.set(channelId, pending);
+    refs.card.dataset.dirty = 'true';
+    refs.statusEl.textContent = 'Unsaved changes';
+    refs.saveButton.disabled = false;
+  } else {
+    channelPendingEdits.delete(channelId);
+    refs.card.dataset.dirty = 'false';
+    refs.statusEl.textContent = 'Synced';
+    refs.saveButton.disabled = true;
+  }
+}
+
+async function saveChannelChanges(channelId) {
+  const pending = channelPendingEdits.get(channelId);
+  const refs = channelFormRefs.get(channelId);
+  if (!pending || !refs) return;
+  try {
+    refs.saveButton.disabled = true;
+    refs.saveButton.textContent = 'Saving…';
+    refs.statusEl.textContent = 'Saving…';
+    const res = await fetch(`/api/channels/${encodeURIComponent(channelId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(pending),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    channelPendingEdits.delete(channelId);
+    if (data?.channel) {
+      const idx = channelsCache.findIndex(ch => ch.id === channelId);
+      if (idx !== -1) channelsCache[idx] = data.channel;
+    }
+    showSuccess('Channel updated.');
+    renderPlayerCarousel();
+    populateSpotifyChannelSelect();
+    renderChannelsPanel();
+    if (channelId === getActiveChannelId()) {
+      applyChannelTheme(getActiveChannel());
+    }
+    refreshNodeVolumeAccents();
+  } catch (err) {
+    refs.statusEl.textContent = `Save failed: ${err.message}`;
+    showError(`Failed to update channel: ${err.message}`);
+  } finally {
+    if (refs.saveButton) {
+      refs.saveButton.textContent = 'Save changes';
+      refs.saveButton.disabled = !channelPendingEdits.has(channelId);
+    }
+  }
+}
+
+function resetChannelUiState() {
+  channelsCache = [];
+  activeChannelId = null;
+  spotifySettingsChannelId = null;
+  channelPendingEdits.clear();
+  channelFormRefs.clear();
+  if (channelsPanel) channelsPanel.innerHTML = '<div class="muted">No channels configured yet.</div>';
+  if (spotifyChannelSelect) {
+    spotifyChannelSelect.innerHTML = '';
+    spotifyChannelSelect.disabled = true;
+  }
+  playerCarouselCards.clear();
+  playerCarouselIndicatorRefs.clear();
+  if (playerCarouselTrack) playerCarouselTrack.innerHTML = '';
+  if (playerCarouselIndicators) {
+    playerCarouselIndicators.innerHTML = '';
+    playerCarouselIndicators.hidden = true;
+  }
+  renderPlayerCarousel();
+  setPlayerIdleState('Create a channel to control playback');
+  refreshNodeVolumeAccents();
+  applyChannelTheme(null);
+}
+
+async function refreshChannels(options = {}) {
+  if (channelFetchPromise && !options.force) {
+    return channelFetchPromise;
+  }
+  channelFetchPromise = (async () => {
+    try {
+      const res = await fetch('/api/channels');
+      await ensureOk(res);
+      const data = await res.json();
+      const previousActive = activeChannelId;
+      const list = Array.isArray(data?.channels) ? data.channels : [];
+      channelsCache = list.slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+      if (!channelsCache.some(ch => ch.id === activeChannelId)) {
+        activeChannelId = channelsCache[0]?.id || null;
+      }
+      if (!channelsCache.some(ch => ch.id === spotifySettingsChannelId)) {
+        spotifySettingsChannelId = activeChannelId;
+      }
+      renderPlayerCarousel();
+      populateSpotifyChannelSelect();
+      renderChannelsPanel();
+      applyChannelTheme(getActiveChannel());
+      if (nodesCache.length) {
+        renderNodes(nodesCache, { force: true });
+      }
+      refreshNodeVolumeAccents();
+      if (!channelsCache.length) {
+        setPlayerIdleState('Create a channel to control playback');
+      }
+      if (activeChannelId && previousActive !== activeChannelId) {
+        onActiveChannelChanged(previousActive, activeChannelId);
+      } else if (!previousActive && activeChannelId) {
+        onActiveChannelChanged(null, activeChannelId);
+      } else if (!activeChannelId) {
+        setPlayerIdleState('Select a channel to control playback');
+      }
+      return channelsCache;
+    } catch (err) {
+      showError(`Failed to load channels: ${err.message}`);
+      throw err;
+    } finally {
+      channelFetchPromise = null;
+    }
+  })();
+  return channelFetchPromise;
+}
+
+function resetChannelScopedState() {
+  playlistAbortController?.abort();
+  playlistTracksAbortController?.abort();
+  playlistSummaryAbortController?.abort();
+  playlistAbortController = null;
+  playlistTracksAbortController = null;
+  playlistSummaryAbortController = null;
+  playlistsCache = [];
+  playlistTrackCache.clear();
+  playlistSelected = null;
+  playlistAutoSelectId = null;
+  if (playlistGrid) playlistGrid.innerHTML = '';
+  if (playlistTracklist) playlistTracklist.innerHTML = '';
+  setPlaylistErrorMessage('');
+  resetPlaylistDetails();
+  searchAbortController?.abort();
+  searchAbortController = null;
+  searchHasAttempted = false;
+  lastSearchQuery = '';
+  searchResultsState = defaultSearchBuckets();
+  SEARCH_TABS.forEach(tab => renderSearchPane(tab));
+  updateSearchTabCounts();
+  queueAbortController?.abort();
+  queueAbortController = null;
+  resetQueueContent();
+  setQueueErrorMessage('');
+  if (playerTick) {
+    clearInterval(playerTick);
+    playerTick = null;
+  }
+}
+
+function onActiveChannelChanged(previousId, nextId) {
+  if (previousId === nextId) return;
+  resetChannelScopedState();
+  if (!nextId) {
+    setPlayerIdleState('Select a channel to control playback');
+    return;
+  }
+  fetchPlayerStatus();
+  if (playlistOverlay && playlistOverlay.classList.contains('is-open')) {
+    fetchPlaylists();
+  }
+  if (queueOverlay && queueOverlay.classList.contains('is-open')) {
+    fetchQueue();
+  }
+  refreshNodeVolumeAccents();
+}
+
 function reportSpotifyError(detail) {
   const reason = getErrorMessage(detail);
   const message = reason
@@ -521,6 +1304,9 @@ function handlePersistentAlertAction() {
 
 function markSpotifyHealthy() {
   clearPersistentAlertSuppression(SPOTIFY_ALERT_KEY);
+  if (persistentAlertState?.key === SPOTIFY_ALERT_KEY) {
+    hidePersistentAlert();
+  }
 }
 
 function promptPwaUpdate(worker) {
@@ -743,7 +1529,9 @@ function setRangeProgress(el, value, maxOverride) {
   const safeValue = Number.isFinite(rawValue) ? rawValue : safeMin;
   const ratio = (safeValue - safeMin) / span;
   const percent = Math.max(0, Math.min(100, ratio * 100));
-  el.style.background = `linear-gradient(90deg, var(--accent) 0%, var(--accent) ${percent}%, rgba(255,255,255,0.12) ${percent}%, rgba(255,255,255,0.12) 100%)`;
+  const { accent } = resolveRangeAccent(el);
+  const inactive = 'rgba(255,255,255,0.12)';
+  el.style.background = `linear-gradient(90deg, ${accent} 0%, ${accent} ${percent}%, ${inactive} ${percent}%, ${inactive} 100%)`;
 }
 
 function setPlayButtonIcon(playing) {
@@ -1223,6 +2011,13 @@ async function fetchPlaylists() {
   setPlaylistErrorMessage('');
   setPlaylistLoadingState(true, 'Loading playlists…');
   if (playlistEmpty) playlistEmpty.hidden = true;
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    setPlaylistErrorMessage('Select a channel to browse playlists.');
+    setPlaylistLoadingState(false);
+    playlistAbortController = null;
+    return;
+  }
   try {
     const collected = [];
     let offset = 0;
@@ -1230,7 +2025,7 @@ async function fetchPlaylists() {
     let reportedTotal = null;
     while (hasNext) {
       const params = new URLSearchParams({ limit: String(PLAYLIST_PAGE_LIMIT), offset: String(offset) });
-      const res = await fetch(`/api/spotify/playlists?${params.toString()}`, { signal: playlistAbortController.signal });
+      const res = await fetch(withChannel(`/api/spotify/playlists?${params.toString()}`, channelId), { signal: playlistAbortController.signal });
       await ensureOk(res);
       const data = await res.json();
       const items = Array.isArray(data?.items) ? data.items : [];
@@ -1273,6 +2068,12 @@ async function fetchPlaylistTracksPage(playlist, options = {}) {
   if (!playlist?.id) return;
   const state = ensurePlaylistTrackState(playlist.id);
   if (!state) return;
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    setPlaylistErrorMessage('Select a channel to load tracks.');
+    setPlaylistLoadingState(false);
+    return;
+  }
   const offsetOverride = typeof options.offset === 'number' ? options.offset : null;
   const targetOffset = offsetOverride !== null ? offsetOverride : (options.append ? state.nextOffset : 0);
   const isInitialPage = targetOffset === 0;
@@ -1287,7 +2088,7 @@ async function fetchPlaylistTracksPage(playlist, options = {}) {
   }
   try {
     const params = new URLSearchParams({ limit: '100', offset: String(targetOffset) });
-    const res = await fetch(`/api/spotify/playlists/${encodeURIComponent(playlist.id)}/tracks?${params.toString()}`, { signal: playlistTracksAbortController.signal });
+    const res = await fetch(withChannel(`/api/spotify/playlists/${encodeURIComponent(playlist.id)}/tracks?${params.toString()}`, channelId), { signal: playlistTracksAbortController.signal });
     await ensureOk(res);
     const data = await res.json();
     const tracks = Array.isArray(data?.items) ? data.items : [];
@@ -1320,6 +2121,11 @@ async function fetchPlaylistSummary(playlist) {
   if (!playlist?.id) return;
   const state = ensurePlaylistTrackState(playlist.id);
   if (!state) return;
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    setPlaylistErrorMessage('Select a channel to load playlist details.');
+    return;
+  }
   const currentStatus = state.summary?.status;
   if (currentStatus === 'loading' || currentStatus === 'resolved') {
     updatePlaylistSummary(state);
@@ -1330,7 +2136,7 @@ async function fetchPlaylistSummary(playlist) {
   state.summary = { status: 'loading' };
   updatePlaylistSummary(state);
   try {
-    const res = await fetch(`/api/spotify/playlists/${encodeURIComponent(playlist.id)}/summary`, { signal: playlistSummaryAbortController.signal });
+    const res = await fetch(withChannel(`/api/spotify/playlists/${encodeURIComponent(playlist.id)}/summary`, channelId), { signal: playlistSummaryAbortController.signal });
     await ensureOk(res);
     const data = await res.json();
     const tracksTotal = typeof data?.tracks_total === 'number'
@@ -1704,8 +2510,15 @@ async function fetchQueue() {
   resetQueueContent();
   setQueueErrorMessage('');
   setQueueLoadingState(true);
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    setQueueErrorMessage('Select a channel to view the queue.');
+    setQueueLoadingState(false);
+    queueAbortController = null;
+    return;
+  }
   try {
-    const res = await fetch('/api/spotify/player/queue', { signal: controller.signal });
+    const res = await fetch(withChannel('/api/spotify/player/queue', channelId), { signal: controller.signal });
     await ensureOk(res);
     const data = await res.json();
     renderQueueOverlay(data);
@@ -1998,6 +2811,11 @@ async function runSpotifySearch(query) {
     if (searchInput) searchInput.focus();
     return;
   }
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    setSearchError('Select a channel to search.');
+    return;
+  }
   searchHasAttempted = true;
   setSearchError('');
   setSearchLoading(true, `Searching Spotify for "${term}"…`);
@@ -2005,7 +2823,7 @@ async function runSpotifySearch(query) {
   searchAbortController = new AbortController();
   try {
     const params = new URLSearchParams({ q: term, limit: '10' });
-    const res = await fetch(`/api/spotify/search?${params.toString()}`, { signal: searchAbortController.signal });
+    const res = await fetch(withChannel(`/api/spotify/search?${params.toString()}`, channelId), { signal: searchAbortController.signal });
     await ensureOk(res);
     const data = await res.json();
     searchResultsState = {
@@ -2112,6 +2930,7 @@ function applyMuteButtonState(btn, muted) {
 }
 
 let nodesCache = [];
+const nodeVolumeSliderRefs = new Map();
 let pendingNodesRender = null;
 let pendingNodesForce = false;
 const eqState = {};
@@ -2327,8 +3146,56 @@ function stopNodeSocket() {
   }
 }
 
+function createNodeChannelSelector(node, options = {}) {
+  if (!channelsCache.length || !node) return null;
+  const wrapper = document.createElement('div');
+  wrapper.className = 'node-channel-selector';
+  const dot = document.createElement('span');
+  dot.className = 'node-channel-dot';
+  wrapper.appendChild(dot);
+  const select = document.createElement('select');
+  select.className = 'node-channel-select';
+  select.setAttribute('aria-label', `Channel for ${node.name || 'node'}`);
+  channelsCache.forEach(channel => {
+    const option = document.createElement('option');
+    option.value = channel.id;
+    option.textContent = channel.name || channel.id;
+    select.appendChild(option);
+  });
+  const resolvedId = resolveNodeChannelId(node) || channelsCache[0]?.id;
+  if (resolvedId) {
+    select.value = resolvedId;
+    select.dataset.previousChannel = resolvedId;
+    updateChannelDotColor(dot, resolvedId);
+  }
+  const shouldDisable = options.disabled || node.type === 'browser';
+  select.disabled = !!shouldDisable;
+  if (node.type === 'browser') {
+    select.title = 'Browser nodes mirror the controller stream';
+  }
+  select.addEventListener('change', async () => {
+    const targetChannel = select.value;
+    if (!targetChannel || select.disabled) {
+      if (resolvedId) select.value = resolvedId;
+      return;
+    }
+    try {
+      await setNodeChannel(node.id, targetChannel, select, dot);
+    } catch (_) {
+      const previous = select.dataset.previousChannel || resolvedId;
+      if (previous) {
+        select.value = previous;
+        updateChannelDotColor(dot, previous);
+      }
+    }
+  });
+  wrapper.appendChild(select);
+  return wrapper;
+}
+
 function commitRenderNodes(nodes) {
   nodesEl.innerHTML = '';
+  nodeVolumeSliderRefs.clear();
   if (!nodes.length) {
     nodesEl.innerHTML = '<div class="muted">No nodes registered yet.</div>';
     Object.keys(camillaPendingNodes).forEach(id => delete camillaPendingNodes[id]);
@@ -2385,6 +3252,10 @@ function commitRenderNodes(nodes) {
       openEqModal(n.id, n.name);
     });
     gearWrap.insertBefore(eqBtn, gearBtn);
+    const channelSelector = createNodeChannelSelector(n, { disabled: disableAgentControls });
+    if (channelSelector) {
+      gearWrap.insertBefore(channelSelector, eqBtn);
+    }
     if (!isBrowser) {
       const onlinePill = document.createElement('span');
       onlinePill.className = `status-pill ${online ? 'ok' : 'warn'}`;
@@ -2460,6 +3331,8 @@ function commitRenderNodes(nodes) {
     volInput.value = Number.isFinite(parsedVolume) ? parsedVolume : 75;
     volInput.disabled = disableAgentControls;
     volInput.style.width = '100%';
+    const nodeVolumeColor = getNodeChannelAccent(n);
+    applyRangeAccent(volInput, nodeVolumeColor);
     setRangeProgress(volInput, volInput.value, volInput.max || 100);
     let volumeMeta = null;
     const shouldShowLimit = maxVolumePercent < 100;
@@ -2480,6 +3353,7 @@ function commitRenderNodes(nodes) {
     });
     volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
     volRow.appendChild(volInput);
+    nodeVolumeSliderRefs.set(n.id, volInput);
     if (volumeMeta) {
       volRow.appendChild(volumeMeta);
     }
@@ -2540,6 +3414,19 @@ function commitRenderNodes(nodes) {
     if (!nodeIds.has(id)) delete camillaPendingNodes[id];
   });
   refreshNodeSettingsModal();
+}
+
+function refreshNodeVolumeAccents() {
+  if (!nodeVolumeSliderRefs.size || !nodesCache.length) return;
+  const nodeMap = new Map(nodesCache.map(node => [node.id, node]));
+  nodeVolumeSliderRefs.forEach((slider, nodeId) => {
+    if (!slider) return;
+    const node = nodeMap.get(nodeId);
+    if (!node) return;
+    const color = getNodeChannelAccent(node);
+    applyRangeAccent(slider, color);
+    setRangeProgress(slider, slider.value, slider.max || 100);
+  });
 }
 
 function renderClients(groups, target) {
@@ -2642,9 +3529,16 @@ async function fetchNodes(options = {}) {
   }
 }
 
-async function fetchSpotifyConfig() {
+async function fetchSpotifyConfig(targetChannelId = getSettingsChannelId()) {
+  if (!targetChannelId) {
+    if (spotifyLinkStatus) {
+      spotifyLinkStatus.textContent = 'No channels available';
+      spotifyLinkStatus.className = 'status-pill warn';
+    }
+    return;
+  }
   try {
-    const res = await fetch('/api/config/spotify');
+    const res = await fetch(withChannel('/api/config/spotify', targetChannelId));
     await ensureOk(res);
     const cfg = await res.json();
     spName.value = cfg.device_name || 'RoomCast';
@@ -2670,9 +3564,13 @@ async function fetchSpotifyConfig() {
   }
 }
 
-async function fetchLibrespotStatus() {
+async function fetchLibrespotStatus(targetChannelId = getSettingsChannelId()) {
+  if (!targetChannelId) {
+    if (librespotStatus) librespotStatus.innerText = 'Status: no channel selected';
+    return;
+  }
   try {
-    const res = await fetch('/api/librespot/status');
+    const res = await fetch(withChannel('/api/librespot/status', targetChannelId));
     await ensureOk(res);
     const data = await res.json();
     librespotStatus.innerText = `Status: ${data.state || 'unknown'}${data.message ? ' – ' + data.message : ''}`;
@@ -2811,6 +3709,37 @@ async function setNodeMaxVolume(nodeId, percent, sliderEl) {
     showError(`Failed to set max volume: ${err.message}`);
   } finally {
     if (sliderEl) sliderEl.disabled = false;
+  }
+}
+
+async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
+  if (!channelId) return;
+  const previous = selectEl?.dataset?.previousChannel || null;
+  if (previous && previous === channelId) return;
+  if (selectEl) selectEl.disabled = true;
+  try {
+    const res = await fetch(`/api/nodes/${nodeId}/channel`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ channel_id: channelId }),
+    });
+    await ensureOk(res);
+    showSuccess('Channel updated');
+    if (selectEl) {
+      selectEl.dataset.previousChannel = channelId;
+    }
+    updateChannelDotColor(dotEl, channelId);
+    await fetchNodes({ force: true });
+  } catch (err) {
+    showError(`Failed to update channel: ${err.message}`);
+    if (selectEl && previous) {
+      selectEl.value = previous;
+      selectEl.dataset.previousChannel = previous;
+    }
+    if (dotEl) updateChannelDotColor(dotEl, previous);
+    throw err;
+  } finally {
+    if (selectEl) selectEl.disabled = false;
   }
 }
 
@@ -3883,39 +4812,51 @@ function formatDurationHuman(ms) {
   return parts.join(' ');
 }
 
+function setPlayerIdleState(message = 'Player unavailable') {
+  if (!playerPanel) return;
+  if (playerTick) {
+    clearInterval(playerTick);
+    playerTick = null;
+  }
+  playerStatus = null;
+  playerPanel.style.display = 'flex';
+  playerTitle.textContent = message;
+  playerArtist.textContent = '';
+  playerSeek.disabled = true;
+  playerTimeCurrent.textContent = '0:00';
+  playerTimeTotal.textContent = '0:00';
+  playerArt.style.display = 'none';
+  playerArt.alt = '';
+  setPlayerArtInteractivity(false);
+  lastCoverArtUrl = null;
+  applyCoverArtBackground();
+  setRangeProgress(playerSeek, 0, playerSeek.max || 1);
+  setPlayButtonIcon(false);
+  playerPrev.disabled = true;
+  playerPlay.disabled = true;
+  playerNext.disabled = true;
+  if (playerShuffleBtn) playerShuffleBtn.disabled = true;
+  if (playerRepeatBtn) playerRepeatBtn.disabled = true;
+  setShuffleActive(false);
+  setRepeatMode('off');
+  setTakeoverBannerVisible(false);
+}
+
 async function fetchPlayerStatus() {
   if (!isAuthenticated()) return;
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    setPlayerIdleState('Select a channel to control playback');
+    return;
+  }
   try {
-    const res = await fetch('/api/spotify/player/status');
+    const res = await fetch(withChannel('/api/spotify/player/status', channelId));
     await ensureOk(res);
     playerStatus = await res.json();
     renderPlayer(playerStatus);
     markSpotifyHealthy();
   } catch (err) {
-    if (playerTick) {
-      clearInterval(playerTick);
-      playerTick = null;
-    }
-    playerStatus = null;
-    playerPanel.style.display = 'flex';
-    playerTitle.textContent = 'Player unavailable';
-    playerArtist.textContent = '';
-    playerSeek.disabled = true;
-    playerTimeCurrent.textContent = '0:00';
-    playerTimeTotal.textContent = '0:00';
-    playerArt.style.display = 'none';
-    playerArt.alt = '';
-    setPlayerArtInteractivity(false);
-    setRangeProgress(playerSeek, 0, playerSeek.max || 1);
-    setPlayButtonIcon(false);
-    playerPrev.disabled = true;
-    playerPlay.disabled = true;
-    playerNext.disabled = true;
-    if (playerShuffleBtn) playerShuffleBtn.disabled = true;
-    if (playerRepeatBtn) playerRepeatBtn.disabled = true;
-    setShuffleActive(false);
-    setRepeatMode('off');
-    setTakeoverBannerVisible(false);
+    setPlayerIdleState('Player unavailable');
     reportSpotifyError(err);
   }
 }
@@ -3986,18 +4927,24 @@ function renderPlayer(status) {
   }
 }
 
-function buildPlayerActionPath(path, body) {
+function buildPlayerActionPath(path, body, channelId) {
   const hasDevice = body && typeof body === 'object' && Object.prototype.hasOwnProperty.call(body, 'device_id');
-  if (hasDevice) return path;
+  let targetPath = withChannel(path, channelId);
+  if (hasDevice) return targetPath;
   const deviceId = getActiveDeviceId();
-  if (!deviceId) return path;
-  const separator = path.includes('?') ? '&' : '?';
-  return `${path}${separator}device_id=${encodeURIComponent(deviceId)}`;
+  if (!deviceId) return targetPath;
+  const separator = targetPath.includes('?') ? '&' : '?';
+  return `${targetPath}${separator}device_id=${encodeURIComponent(deviceId)}`;
 }
 
 async function activateRoomcastDevice(play = false) {
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    showError('Select a channel to activate playback.');
+    return;
+  }
   const payload = { play: !!play };
-  const res = await fetch('/api/spotify/player/activate-roomcast', {
+  const res = await fetch(withChannel('/api/spotify/player/activate-roomcast', channelId), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -4010,11 +4957,16 @@ async function activateRoomcastDevice(play = false) {
 }
 
 async function playerAction(path, body, options = {}) {
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    showError('Select a channel before controlling playback.');
+    return;
+  }
   const allowRoomcastFallback = options.roomcastFallback !== false;
   let attemptedRoomcastActivation = false;
   while (true) {
     try {
-      const targetPath = buildPlayerActionPath(path, body);
+      const targetPath = buildPlayerActionPath(path, body, channelId);
       const res = await fetch(targetPath, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -4046,7 +4998,12 @@ async function playerAction(path, body, options = {}) {
 
 async function startSpotifyAuth() {
   try {
-    const res = await fetch('/api/spotify/auth-url');
+    const channelId = getSettingsChannelId();
+    if (!channelId) {
+      showError('No channels available to link.');
+      return;
+    }
+    const res = await fetch(withChannel('/api/spotify/auth-url', channelId));
     await ensureOk(res);
     const data = await res.json();
     if (data.url) window.open(data.url, '_blank');
@@ -4096,6 +5053,11 @@ async function registerNodeWithName(name, url, btn, nodeId, fingerprint) {
 }
 
 async function saveSpotify() {
+  const channelId = getSettingsChannelId();
+  if (!channelId) {
+    showError('No channels available to update.');
+    return;
+  }
   try {
     spotifySpinner.style.display = 'block';
     saveSpotifyBtn.disabled = true;
@@ -4109,15 +5071,17 @@ async function saveSpotify() {
       redirect_uri: spRedirect.value || 'http://localhost:8000/api/spotify/callback',
     };
     if (!payload.client_secret) delete payload.client_secret;
-    const res = await fetch('/api/config/spotify', {
+    const res = await fetch(withChannel('/api/config/spotify', channelId), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     await ensureOk(res);
     spClientSecret.value = '';
-    showSuccess('Spotify config saved. Librespot will reload and connect.');
-    await pollLibrespotStatus();
+    const targetChannel = getChannelById(channelId);
+    const channelName = targetChannel?.name ? ` for ${targetChannel.name}` : '';
+    showSuccess(`Spotify config saved${channelName}. Librespot will reload and connect.`);
+    await pollLibrespotStatus(channelId);
   } catch (err) {
     showError(`Failed to save Spotify config: ${err.message}`);
   } finally {
@@ -4330,18 +5294,26 @@ function resetUsersState() {
   }
 }
 
-async function pollLibrespotStatus() {
+async function pollLibrespotStatus(channelId = getSettingsChannelId()) {
+  if (!channelId) return;
   for (let i = 0; i < 8; i++) {
     await new Promise(r => setTimeout(r, 1200));
-    await fetchLibrespotStatus();
+    await fetchLibrespotStatus(channelId);
     const text = librespotStatus.innerText || '';
     if (!text.includes('starting') && !text.includes('waiting') && !text.includes('unknown')) break;
   }
 }
 
-function openSettings() {
+async function openSettings() {
   settingsOverlay.style.display = 'flex';
   collapseAllPanels();
+  try {
+    await refreshChannels();
+  } catch (_) {
+    /* channel errors already surfaced via toast */
+  }
+  spotifySettingsChannelId = getActiveChannelId();
+  populateSpotifyChannelSelect();
   syncGeneralSettingsUI();
   fetchSpotifyConfig();
   fetchLibrespotStatus();
@@ -4374,6 +5346,13 @@ startDiscoverBtn.addEventListener('click', discoverNodes);
 saveSpotifyBtn.addEventListener('click', saveSpotify);
 if (spInitVol) {
   spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
+}
+if (spotifyChannelSelect) {
+  spotifyChannelSelect.addEventListener('change', () => {
+    spotifySettingsChannelId = spotifyChannelSelect.value || null;
+    fetchSpotifyConfig();
+    fetchLibrespotStatus();
+  });
 }
 if (saveServerNameBtn) {
   saveServerNameBtn.addEventListener('click', saveServerName);

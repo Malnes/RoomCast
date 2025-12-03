@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v20251203';
+const CACHE_VERSION = 'v20251203b';
 const CACHE_NAME = `roomcast-shell-${CACHE_VERSION}`;
 const CACHE_ASSETS = [
   '/',
@@ -8,6 +8,7 @@ const CACHE_ASSETS = [
   '/static/icons/icon-192.png',
   '/static/icons/icon-512.png'
 ];
+const NETWORK_FIRST_PATHS = new Set(['/', '/static/app.css', '/static/app.js']);
 
 self.addEventListener('install', event => {
   event.waitUntil(
@@ -38,8 +39,22 @@ self.addEventListener('fetch', event => {
     return;
   }
 
+  const path = url.pathname || '/';
+  if (NETWORK_FIRST_PATHS.has(path)) {
+    event.respondWith(
+      fetch(request)
+        .then(response => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then(cache => cache.put(request, copy));
+          return response;
+        })
+        .catch(() => caches.match(request))
+    );
+    return;
+  }
+
   const cacheFirstPaths = CACHE_ASSETS;
-  if (!cacheFirstPaths.includes(url.pathname)) return;
+  if (!cacheFirstPaths.includes(path)) return;
 
   event.respondWith(
     caches.match(request).then(cached => {
