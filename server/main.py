@@ -1741,15 +1741,39 @@ async def spotify_player_status() -> dict:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     data = resp.json()
     active = bool(data.get("device"))
+    device = data.get("device") or {}
+    preferred_names = [name.lower() for name in _preferred_roomcast_device_names()]
+    device_name = (device.get("name") or "").strip().lower()
+    is_roomcast_device = bool(device_name) and device_name in preferred_names
     return {
         "active": active,
         "is_playing": data.get("is_playing", False),
         "progress_ms": data.get("progress_ms"),
-        "device": data.get("device", {}),
+        "device": device,
+        "device_is_roomcast": is_roomcast_device,
         "item": data.get("item", {}),
         "shuffle_state": data.get("shuffle_state", False),
         "repeat_state": data.get("repeat_state", "off"),
         "context": data.get("context"),
+    }
+
+
+@app.get("/api/spotify/player/queue")
+async def spotify_player_queue() -> dict:
+    token = _ensure_spotify_token()
+    resp = await spotify_request("GET", "/me/player/queue", token)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    queue_items: list[dict] = []
+    for raw in data.get("queue") or []:
+        mapped = _map_spotify_track_simple(raw)
+        if mapped:
+            queue_items.append(mapped)
+    current = _map_spotify_track_simple(data.get("currently_playing"))
+    return {
+        "current": current,
+        "queue": queue_items,
     }
 
 

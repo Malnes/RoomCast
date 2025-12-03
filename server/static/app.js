@@ -2,6 +2,9 @@ const nodesEl = document.getElementById('nodes');
 const clientsSettingsEl = document.getElementById('clients-settings');
 const errorEl = document.getElementById('error');
 const successEl = document.getElementById('success');
+const persistentAlertEl = document.getElementById('persistent-alert');
+const persistentAlertMessage = document.getElementById('persistent-alert-message');
+const persistentAlertDismiss = document.getElementById('persistent-alert-dismiss');
 const addNodeContainer = document.querySelector('[data-add-node-container]');
 const addNodeToggle = document.getElementById('add-node-button');
 const addNodeMenu = document.getElementById('add-node-menu');
@@ -48,6 +51,9 @@ const playerTitle = document.getElementById('player-title');
 const playerArtist = document.getElementById('player-artist');
 const playerPlaylistsBtn = document.getElementById('player-playlists');
 const playerSearchBtn = document.getElementById('player-search');
+const takeoverBanner = document.getElementById('takeover-banner');
+const takeoverMessage = document.getElementById('takeover-message');
+const takeoverButton = document.getElementById('takeover-button');
 const playlistOverlay = document.getElementById('playlist-overlay');
 const playlistCloseBtn = document.getElementById('playlist-close');
 const playlistGrid = document.getElementById('playlist-grid');
@@ -101,6 +107,13 @@ const searchPaneMap = searchPanes.reduce((acc, pane) => {
 const searchLoading = document.getElementById('search-loading');
 const searchError = document.getElementById('search-error');
 const searchSubtitle = document.getElementById('search-modal-subtitle');
+const queueOverlay = document.getElementById('queue-overlay');
+const queueCloseBtn = document.getElementById('queue-close');
+const queueLoading = document.getElementById('queue-loading');
+const queueError = document.getElementById('queue-error');
+const queueEmpty = document.getElementById('queue-empty');
+const queueCurrent = document.getElementById('queue-current');
+const queueList = document.getElementById('queue-list');
 const coverArtBackdrop = document.getElementById('cover-art-backdrop');
 const coverArtBackgroundToggle = document.getElementById('cover-art-background');
 const collapsiblePanels = Array.from(document.querySelectorAll('[data-collapsible]'));
@@ -134,6 +147,7 @@ let lastSearchQuery = '';
 let searchHasAttempted = false;
 let searchResultsState = defaultSearchBuckets();
 let searchAbortController = null;
+let queueAbortController = null;
 const playlistNameCollator = typeof Intl !== 'undefined' && typeof Intl.Collator === 'function'
   ? new Intl.Collator(undefined, { sensitivity: 'base' })
   : { compare: (a, b) => {
@@ -165,6 +179,10 @@ function clearMessages() {
 
 const toastQueue = [];
 let toastActive = false;
+let persistentAlertState = null;
+const persistentAlertSuppression = new Set();
+const SPOTIFY_ALERT_KEY = 'spotify';
+const SPOTIFY_ALERT_HELP = 'Open Settings > Spotify setup and tap "Save Spotify config" to reconnect.';
 
 function showToast(el, msg, timeout = 3500) {
   el.innerText = msg;
@@ -202,6 +220,119 @@ function showError(msg) {
 
 function showSuccess(msg) {
   enqueueToast(successEl, msg, 3000);
+}
+
+function getErrorMessage(err) {
+  if (!err) return '';
+  if (typeof err === 'string') return err;
+  if (err instanceof Error && err.message) return err.message;
+  if (typeof err.message === 'string') return err.message;
+  try {
+    return String(err);
+  } catch (_) {
+    return 'Unknown error';
+  }
+}
+
+function showPersistentAlert(message, options = {}) {
+  if (!persistentAlertEl || !persistentAlertMessage) return;
+  const key = options.key || '';
+  if (key && persistentAlertSuppression.has(key)) return;
+  persistentAlertMessage.textContent = message;
+  persistentAlertEl.dataset.alertKey = key;
+  persistentAlertEl.classList.add('is-visible');
+  persistentAlertEl.hidden = false;
+  persistentAlertEl.setAttribute('aria-hidden', 'false');
+  persistentAlertState = { key, message };
+}
+
+function hidePersistentAlert() {
+  if (!persistentAlertEl) return;
+  persistentAlertEl.classList.remove('is-visible');
+  persistentAlertEl.setAttribute('aria-hidden', 'true');
+  persistentAlertEl.hidden = true;
+  persistentAlertEl.dataset.alertKey = '';
+  persistentAlertState = null;
+}
+
+function suppressPersistentAlert(key) {
+  if (!key) return;
+  persistentAlertSuppression.add(key);
+}
+
+function clearPersistentAlertSuppression(key) {
+  if (!key) return;
+  persistentAlertSuppression.delete(key);
+}
+
+function reportSpotifyError(detail) {
+  const reason = getErrorMessage(detail);
+  const message = reason
+    ? `Spotify connection issue: ${reason}. ${SPOTIFY_ALERT_HELP}`
+    : `Spotify connection issue. ${SPOTIFY_ALERT_HELP}`;
+  if (persistentAlertState &&
+      persistentAlertState.key === SPOTIFY_ALERT_KEY &&
+      persistentAlertState.message === message) {
+    return;
+  }
+  showPersistentAlert(message, { key: SPOTIFY_ALERT_KEY });
+}
+
+function handlePersistentAlertDismiss() {
+  const key = persistentAlertEl?.dataset?.alertKey;
+  if (key) suppressPersistentAlert(key);
+  hidePersistentAlert();
+}
+
+function markSpotifyHealthy() {
+  clearPersistentAlertSuppression(SPOTIFY_ALERT_KEY);
+}
+
+function setTakeoverBannerVisible(visible, message) {
+  if (!takeoverBanner) return;
+  const next = !!visible;
+  takeoverBanner.classList.toggle('is-visible', next);
+  takeoverBanner.hidden = !next;
+  takeoverBanner.setAttribute('aria-hidden', next ? 'false' : 'true');
+  if (next && takeoverMessage && message) {
+    takeoverMessage.textContent = message;
+  }
+}
+
+function updateTakeoverBanner(status) {
+  if (!takeoverBanner) return;
+  const active = !!status?.active;
+  const playing = !!status?.is_playing;
+  const isRoomcastDevice = !!status?.device_is_roomcast;
+  const shouldShow = active && playing && !isRoomcastDevice;
+  if (!shouldShow) {
+    setTakeoverBannerVisible(false);
+    return;
+  }
+  const deviceName = (status?.device?.name || '').trim();
+  const message = deviceName
+    ? `Spotify is playing on “${deviceName}”.`
+    : 'Spotify is playing on another device.';
+  setTakeoverBannerVisible(true, message);
+}
+
+async function handleTakeoverClick() {
+  if (!takeoverButton) return;
+  takeoverButton.disabled = true;
+  try {
+    await activateRoomcastDevice(true);
+    showSuccess('Taking over playback on RoomCast…');
+    markSpotifyHealthy();
+  } catch (err) {
+    showError(`Failed to take over session: ${err.message}`);
+    reportSpotifyError(err);
+  } finally {
+    takeoverButton.disabled = false;
+  }
+}
+
+if (persistentAlertDismiss) {
+  persistentAlertDismiss.addEventListener('click', handlePersistentAlertDismiss);
 }
 
 function normalizeNodeUrl(value) {
@@ -355,6 +486,19 @@ function setRepeatMode(mode) {
       ? 'Repeat queue'
       : 'Enable repeat';
   playerRepeatBtn.setAttribute('aria-label', label);
+}
+
+function setPlayerArtInteractivity(enabled) {
+  if (!playerArt) return;
+  const next = !!enabled;
+  playerArt.dataset.queueEnabled = next ? 'true' : 'false';
+  playerArt.setAttribute('tabindex', next ? '0' : '-1');
+  playerArt.setAttribute('aria-disabled', next ? 'false' : 'true');
+  playerArt.setAttribute('aria-hidden', next ? 'false' : 'true');
+}
+
+function isPlayerArtInteractive() {
+  return playerArt?.dataset?.queueEnabled === 'true';
 }
 
 function setVolumeSliderOpen(open) {
@@ -832,6 +976,7 @@ async function fetchPlaylists() {
       playlistEmpty.textContent = 'Unable to load playlists right now.';
     }
     setPlaylistErrorMessage(`Failed to load playlists: ${err.message}`);
+    reportSpotifyError(err);
   } finally {
     setPlaylistLoadingState(false);
   }
@@ -875,6 +1020,7 @@ async function fetchPlaylistTracksPage(playlist, options = {}) {
   } catch (err) {
     if (err.name === 'AbortError') return;
     setPlaylistErrorMessage(`Failed to load tracks: ${err.message}`);
+    reportSpotifyError(err);
   } finally {
     if (isInitialPage) setPlaylistLoadingState(false);
     state.loadingMore = false;
@@ -911,6 +1057,7 @@ async function fetchPlaylistSummary(playlist) {
       state.summary = { status: 'idle' };
     } else {
       state.summary = { status: 'error', error: err.message };
+      reportSpotifyError(err);
     }
   } finally {
     updatePlaylistSummary(state);
@@ -934,7 +1081,7 @@ function openPlaylistOverlay() {
   setPlaylistView('playlists');
   setPlaylistOverlayOpen(true);
   playlistAutoSelectId = activePlaylistContextId || null;
-  if (playlistSubtitle) playlistSubtitle.textContent = 'Pick a playlist to browse tracks.';
+  if (playlistSubtitle) playlistSubtitle.textContent = '';
   setPlaylistErrorMessage('');
   if (playlistTracklist) playlistTracklist.innerHTML = '';
   setPlaylistLoadingState(true, 'Loading playlists…');
@@ -958,7 +1105,7 @@ function handlePlaylistBack() {
   playlistSelected = null;
   playlistSummaryAbortController?.abort();
   playlistSummaryAbortController = null;
-  if (playlistSubtitle) playlistSubtitle.textContent = 'Pick a playlist to browse tracks.';
+  if (playlistSubtitle) playlistSubtitle.textContent = '';
   setPlaylistErrorMessage('');
   setPlaylistView('playlists');
   resetPlaylistDetails();
@@ -980,7 +1127,7 @@ function selectPlaylist(playlist) {
     playlistSelectedOwner.textContent = playlist?.owner ? `by ${playlist.owner}` : '';
     playlistSelectedOwner.hidden = !playlist?.owner;
   }
-  if (playlistSubtitle) playlistSubtitle.textContent = 'Choose a track to play';
+  if (playlistSubtitle) playlistSubtitle.textContent = '';
   setPlaylistView('tracks');
   if (playlistTracklist) playlistTracklist.scrollTop = 0;
   const state = ensurePlaylistTrackState(playlist.id);
@@ -1042,7 +1189,7 @@ function setSearchOverlayOpen(open) {
     searchResultsState = defaultSearchBuckets();
     setSearchLoading(false);
     setSearchError('');
-    if (searchSubtitle) searchSubtitle.textContent = 'Find songs, albums, artists, and playlists.';
+    if (searchSubtitle) searchSubtitle.textContent = '';
     if (searchInput) searchInput.value = '';
     SEARCH_TABS.forEach(tab => renderSearchPane(tab));
   }
@@ -1120,6 +1267,188 @@ function renderSearchPane(tab) {
     default:
       renderSearchTracks(searchResultsState.tracks);
       break;
+  }
+}
+
+function setQueueOverlayOpen(open) {
+  if (!queueOverlay) return;
+  const next = !!open;
+  queueOverlay.classList.toggle('is-open', next);
+  queueOverlay.setAttribute('aria-hidden', next ? 'false' : 'true');
+  if (next) {
+    document.addEventListener('keydown', handleQueueOverlayKey, true);
+  } else {
+    document.removeEventListener('keydown', handleQueueOverlayKey, true);
+  }
+}
+
+function handleQueueOverlayKey(evt) {
+  if (evt.key === 'Escape' && queueOverlay?.classList.contains('is-open')) {
+    evt.stopPropagation();
+    closeQueueOverlay();
+  }
+}
+
+function setQueueLoadingState(isLoading) {
+  if (!queueLoading) return;
+  const next = !!isLoading;
+  queueLoading.hidden = !next;
+  queueLoading.setAttribute('aria-hidden', next ? 'false' : 'true');
+}
+
+function setQueueErrorMessage(message) {
+  if (!queueError) return;
+  const text = (message || '').trim();
+  queueError.textContent = text;
+  queueError.hidden = !text;
+  queueError.setAttribute('aria-hidden', text ? 'false' : 'true');
+}
+
+function resetQueueContent() {
+  if (queueCurrent) {
+    queueCurrent.innerHTML = '';
+    queueCurrent.hidden = true;
+  }
+  if (queueList) {
+    queueList.innerHTML = '';
+    queueList.hidden = true;
+  }
+  if (queueEmpty) {
+    queueEmpty.hidden = true;
+  }
+}
+
+function renderQueueOverlay(data) {
+  const current = data?.current || null;
+  const items = Array.isArray(data?.queue) ? data.queue.filter(Boolean) : [];
+  renderQueueCurrent(current);
+  renderQueueItems(items);
+}
+
+function renderQueueCurrent(track) {
+  if (!queueCurrent) return;
+  queueCurrent.innerHTML = '';
+  if (!track) {
+    queueCurrent.hidden = true;
+    return;
+  }
+  queueCurrent.hidden = false;
+  const heading = document.createElement('div');
+  heading.className = 'queue-section-title';
+  heading.textContent = 'Now playing';
+  queueCurrent.appendChild(heading);
+  queueCurrent.appendChild(createQueueTrack(track, { isCurrent: true }));
+}
+
+function renderQueueItems(items) {
+  if (!queueList) return;
+  queueList.innerHTML = '';
+  if (!items.length) {
+    queueList.hidden = true;
+    if (queueEmpty) {
+      queueEmpty.hidden = false;
+      queueEmpty.textContent = 'No upcoming tracks.';
+    }
+    return;
+  }
+  queueList.hidden = false;
+  if (queueEmpty) queueEmpty.hidden = true;
+  const heading = document.createElement('div');
+  heading.className = 'queue-section-title';
+  heading.textContent = 'Next up';
+  queueList.appendChild(heading);
+  const list = document.createElement('div');
+  list.className = 'queue-tracklist';
+  items.forEach((track, index) => {
+    list.appendChild(createQueueTrack(track, { index: index + 1 }));
+  });
+  queueList.appendChild(list);
+}
+
+function createQueueTrack(track, options = {}) {
+  const row = document.createElement('div');
+  row.className = 'queue-track';
+  if (options.isCurrent) row.classList.add('is-current');
+  const coverWrap = document.createElement('div');
+  coverWrap.className = 'queue-track-cover-wrap';
+  const img = document.createElement('img');
+  img.className = 'queue-track-cover';
+  img.alt = track?.name ? `${track.name} cover art` : 'Track cover art';
+  img.src = track?.image?.url || PLAYLIST_FALLBACK_COVER;
+  coverWrap.appendChild(img);
+  if (typeof options.index === 'number') {
+    const badge = document.createElement('div');
+    badge.className = 'queue-track-index';
+    badge.textContent = String(options.index);
+    coverWrap.appendChild(badge);
+  }
+  const meta = document.createElement('div');
+  meta.className = 'queue-track-meta';
+  const title = document.createElement('div');
+  title.className = 'queue-track-title';
+  title.textContent = track?.name || 'Unknown track';
+  meta.appendChild(title);
+  const subtitle = document.createElement('div');
+  subtitle.className = 'queue-track-subtitle';
+  subtitle.textContent = track?.artists || '—';
+  meta.appendChild(subtitle);
+  if (track?.album) {
+    const album = document.createElement('div');
+    album.className = 'queue-track-album';
+    album.textContent = track.album;
+    meta.appendChild(album);
+  }
+  row.appendChild(coverWrap);
+  row.appendChild(meta);
+  const duration = document.createElement('div');
+  duration.className = 'queue-track-duration';
+  duration.textContent = typeof track?.duration_ms === 'number'
+    ? msToTime(track.duration_ms)
+    : '—';
+  row.appendChild(duration);
+  return row;
+}
+
+async function fetchQueue() {
+  if (!queueOverlay) return;
+  queueAbortController?.abort();
+  const controller = new AbortController();
+  queueAbortController = controller;
+  resetQueueContent();
+  setQueueErrorMessage('');
+  setQueueLoadingState(true);
+  try {
+    const res = await fetch('/api/spotify/player/queue', { signal: controller.signal });
+    await ensureOk(res);
+    const data = await res.json();
+    renderQueueOverlay(data);
+    markSpotifyHealthy();
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    setQueueErrorMessage(`Unable to load queue: ${err.message}`);
+    reportSpotifyError(err);
+  } finally {
+    setQueueLoadingState(false);
+    if (queueAbortController === controller) queueAbortController = null;
+  }
+}
+
+function openQueueOverlay() {
+  if (!queueOverlay || !isPlayerArtInteractive()) return;
+  setVolumeSliderOpen(false);
+  setQueueOverlayOpen(true);
+  fetchQueue();
+}
+
+function closeQueueOverlay() {
+  setQueueOverlayOpen(false);
+  queueAbortController?.abort();
+  queueAbortController = null;
+  setQueueLoadingState(false);
+  setQueueErrorMessage('');
+  resetQueueContent();
+  if (playerArt && isPlayerArtInteractive()) {
+    playerArt.focus({ preventScroll: true });
   }
 }
 
@@ -1405,6 +1734,7 @@ async function runSpotifySearch(query) {
   } catch (err) {
     if (err.name === 'AbortError') return;
     setSearchError(`Failed to search Spotify: ${err.message}`);
+    reportSpotifyError(err);
   } finally {
     setSearchLoading(false);
   }
@@ -3140,6 +3470,7 @@ async function fetchPlayerStatus() {
     await ensureOk(res);
     playerStatus = await res.json();
     renderPlayer(playerStatus);
+    markSpotifyHealthy();
   } catch (err) {
     if (playerTick) {
       clearInterval(playerTick);
@@ -3153,6 +3484,8 @@ async function fetchPlayerStatus() {
     playerTimeCurrent.textContent = '0:00';
     playerTimeTotal.textContent = '0:00';
     playerArt.style.display = 'none';
+    playerArt.alt = '';
+    setPlayerArtInteractivity(false);
     setRangeProgress(playerSeek, 0, playerSeek.max || 1);
     setPlayButtonIcon(false);
     playerPrev.disabled = true;
@@ -3162,6 +3495,8 @@ async function fetchPlayerStatus() {
     if (playerRepeatBtn) playerRepeatBtn.disabled = true;
     setShuffleActive(false);
     setRepeatMode('off');
+    setTakeoverBannerVisible(false);
+    reportSpotifyError(err);
   }
 }
 
@@ -3169,6 +3504,7 @@ function renderPlayer(status) {
   const item = status?.item || {};
   const active = !!status?.active;
   updateActivePlaylistContext(status);
+  updateTakeoverBanner(status);
   activeDeviceId = active && status?.device?.id ? status.device.id : null;
   playerPanel.style.display = 'flex';
   playerTitle.textContent = active ? (item.name || '—') : 'No active playback';
@@ -3177,9 +3513,13 @@ function renderPlayer(status) {
   const art = active ? (item.album?.images?.[1]?.url || item.album?.images?.[0]?.url) : null;
   if (art) {
     playerArt.src = art;
+    playerArt.alt = item?.name ? `${item.name} cover art` : 'Album art';
     playerArt.style.display = 'block';
+    setPlayerArtInteractivity(true);
   } else {
     playerArt.style.display = 'none';
+    playerArt.alt = '';
+    setPlayerArtInteractivity(false);
   }
   lastCoverArtUrl = art || null;
   applyCoverArtBackground();
@@ -3278,6 +3618,7 @@ async function playerAction(path, body, options = {}) {
       throw new Error(detail);
     } catch (err) {
       showError(`Player action failed: ${err.message}`);
+      reportSpotifyError(err);
       return;
     }
   }
@@ -3291,6 +3632,7 @@ async function startSpotifyAuth() {
     if (data.url) window.open(data.url, '_blank');
   } catch (err) {
     showError(`Failed to start Spotify auth: ${err.message}`);
+    reportSpotifyError(err);
   }
 }
 
@@ -3526,6 +3868,28 @@ searchTabs.forEach(btn => {
 SEARCH_TABS.forEach(tab => renderSearchPane(tab));
 updateSearchTabCounts();
 
+if (queueOverlay) {
+  queueOverlay.addEventListener('click', evt => {
+    if (evt.target === queueOverlay) closeQueueOverlay();
+  });
+}
+if (queueCloseBtn) queueCloseBtn.addEventListener('click', closeQueueOverlay);
+if (playerArt) {
+  playerArt.addEventListener('click', () => {
+    if (!isPlayerArtInteractive()) return;
+    openQueueOverlay();
+  });
+  playerArt.addEventListener('keydown', evt => {
+    if (evt.key === 'Enter' || evt.key === ' ') {
+      if (!isPlayerArtInteractive()) return;
+      evt.preventDefault();
+      openQueueOverlay();
+    }
+  });
+}
+
+setPlayerArtInteractivity(false);
+
 playerPrev.addEventListener('click', () => {
   if (playerPrev.disabled) return;
   playerAction('/api/spotify/player/previous');
@@ -3562,6 +3926,7 @@ playerRepeatBtn.addEventListener('click', () => {
 });
 spotifyAuthBtn.addEventListener('click', startSpotifyAuth);
 spotifyDashboardBtn.addEventListener('click', () => window.open('https://developer.spotify.com/dashboard', '_blank'));
+if (takeoverButton) takeoverButton.addEventListener('click', handleTakeoverClick);
 
 const NODE_REFRESH_MS = 4000;
 fetchNodes();

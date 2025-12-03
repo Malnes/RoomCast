@@ -23,6 +23,10 @@
 
     <div id="error" class="toast error" style="display:none; opacity:0;"></div>
     <div id="success" class="toast success" style="display:none; opacity:0;"></div>
+    <div id="persistent-alert" class="persistent-alert" role="alert" aria-live="assertive" aria-hidden="true" hidden>
+      <span id="persistent-alert-message"></span>
+      <button id="persistent-alert-dismiss" type="button" aria-label="Dismiss alert">✕</button>
+    </div>
 
     <div class="nodes-section">
       <div class="section-title">Nodes</div>
@@ -31,10 +35,15 @@
 
   </div>
 
+  <div id="takeover-banner" class="takeover-banner" role="status" aria-live="polite" hidden>
+    <span id="takeover-message">Spotify is playing on another device.</span>
+    <button id="takeover-button" class="small-btn" type="button">Take over session</button>
+  </div>
+
   <div id="player-panel">
     <div class="player-top">
       <div class="player-meta">
-        <img id="player-art" src="" alt="" style="display:none;">
+        <img id="player-art" src="" alt="" style="display:none;" role="button" tabindex="-1" aria-label="Show play queue">
         <div class="player-text">
           <div id="player-title" class="player-title">Player unavailable</div>
           <div id="player-artist" class="player-artist">—</div>
@@ -82,7 +91,7 @@
       <div class="playlist-header">
         <div>
           <div class="section-title" id="playlist-modal-title">Playlists</div>
-          <div class="muted" id="playlist-modal-subtitle">Pick a playlist to browse tracks.</div>
+          <div class="muted" id="playlist-modal-subtitle"></div>
         </div>
         <button id="playlist-close" class="icon-btn small-btn" type="button" aria-label="Close playlists">✕</button>
       </div>
@@ -134,12 +143,34 @@
     </div>
   </div>
 
+  <div id="queue-overlay" class="queue-overlay" aria-hidden="true">
+    <div class="queue-modal" role="dialog" aria-modal="true" aria-labelledby="queue-modal-title">
+      <div class="queue-header">
+        <div>
+          <div class="section-title" id="queue-modal-title">Play queue</div>
+          <div class="muted" id="queue-modal-subtitle">See what's playing on RoomCast.</div>
+        </div>
+        <button id="queue-close" class="icon-btn small-btn" type="button" aria-label="Close play queue">✕</button>
+      </div>
+      <div class="queue-body">
+        <div id="queue-loading" class="queue-loading" role="status" aria-live="polite">
+          <span class="spinner"></span>
+          <span>Loading queue…</span>
+        </div>
+        <div id="queue-error" class="queue-error" role="alert" hidden></div>
+        <div id="queue-empty" class="queue-empty muted" hidden>No upcoming tracks.</div>
+        <div id="queue-current" class="queue-current" hidden></div>
+        <div id="queue-list" class="queue-list" hidden></div>
+      </div>
+    </div>
+  </div>
+
   <div id="search-overlay" class="search-overlay" aria-hidden="true">
     <div class="search-modal" role="dialog" aria-modal="true" aria-labelledby="search-modal-title">
       <div class="search-header">
         <div>
           <div class="section-title" id="search-modal-title">Search Spotify</div>
-          <div class="muted" id="search-modal-subtitle">Find songs, albums, artists, and playlists.</div>
+          <div class="muted" id="search-modal-subtitle"></div>
         </div>
         <button id="search-close" class="icon-btn small-btn" type="button" aria-label="Close search">✕</button>
       </div>

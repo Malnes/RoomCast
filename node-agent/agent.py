@@ -1,5 +1,4 @@
 import asyncio
-import itertools
 import json
 import logging
 import os
@@ -11,10 +10,12 @@ import subprocess
 from pathlib import Path
 from typing import Callable, List, Optional
 
-try:  # Camilla v3 exposes JSON-RPC over WebSocket
+try:  # Camilla v3 exposes control API over WebSocket
     import websockets
+    from websockets import exceptions as ws_exceptions
 except ImportError:  # pragma: no cover - optional dependency
     websockets = None  # type: ignore
+    ws_exceptions = None  # type: ignore
 
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
@@ -547,7 +548,7 @@ class CamillaController:
         self.host = host
         self.port = port
         self.filter_path = filter_path
-        self._ids = itertools.count(1)
+        self._ws_uri = f"ws://{self.host}:{self.port}"
 
     # Camilla v3 exposes single filters, so we need a predictable per-slot path.
     def _filter_path_for_slot(self, slot: int) -> str:
@@ -578,82 +579,104 @@ class CamillaController:
             return suffix
         return f"{template}_{suffix}"
 
+    def _filter_name_for_slot(self, slot: int) -> str:
+        path = self._filter_path_for_slot(slot)
+        if "." in path:
+            return path.split(".", 1)[1]
+        return path
+
     async def apply_eq(self, bands: List[EqBand], target_slots: int) -> None:
         if not CAMILLA_ENABLED:
             return
+        config = await self._get_config_json()
+        filters = config.setdefault("filters", {})
         slots = max(1, min(CAMILLA_MAX_BANDS, target_slots))
-        for idx in range(slots):
-            if idx < len(bands):
-                band = bands[idx]
-                if isinstance(band, dict):
-                    freq = float(band.get("freq", 1000.0))
-                    gain = float(band.get("gain", 0.0))
-                    q_val = float(band.get("q", 1.0))
-                else:
-                    freq = float(getattr(band, "freq", 1000.0))
-                    gain = float(getattr(band, "gain", 0.0))
-                    q_val = float(getattr(band, "q", 1.0))
+        normalized: list[tuple[float, float, float]] = []
+        for band in bands[:slots]:
+            if isinstance(band, dict):
+                freq = float(band.get("freq", 1000.0))
+                gain = float(band.get("gain", 0.0))
+                q_val = float(band.get("q", 1.0))
             else:
-                freq = 1000.0
-                gain = 0.0
-                q_val = 1.0
-            payload = {
-                "path": self._filter_path_for_slot(idx),
-                "config": {
-                    "type": "Biquad",
-                    "parameters": {
-                        "type": "Peaking",
-                        "freq": freq,
-                        "gain": gain,
-                        "q": q_val,
-                    },
-                },
-            }
-            await self._call("SetFilter", payload)
+                freq = float(getattr(band, "freq", 1000.0))
+                gain = float(getattr(band, "gain", 0.0))
+                q_val = float(getattr(band, "q", 1.0))
+            normalized.append((freq, gain, q_val))
 
-    def _parse_response(self, payload: str | bytes | bytearray) -> dict | None:
+        def _upsert_filter(name: str) -> dict:
+            entry = filters.setdefault(name, {})
+            entry["type"] = "Biquad"
+            params = entry.setdefault("parameters", {})
+            params["type"] = "Peaking"
+            return params
+
+        for idx in range(slots):
+            name = self._filter_name_for_slot(idx)
+            params = _upsert_filter(name)
+            if idx < len(normalized):
+                freq, gain, q_val = normalized[idx]
+            else:
+                freq = float(params.get("freq", 1000.0))
+                gain = 0.0
+                q_val = float(params.get("q", 1.0))
+            params["freq"] = freq
+            params["gain"] = gain
+            params["q"] = q_val
+
+        for idx in range(slots, CAMILLA_MAX_BANDS):
+            name = self._filter_name_for_slot(idx)
+            params = _upsert_filter(name)
+            params["freq"] = float(params.get("freq", 1000.0))
+            params["gain"] = 0.0
+            params["q"] = float(params.get("q", 1.0))
+
+        await self._set_config_json(config)
+
+    def _parse_response(self, payload: str | bytes | bytearray, command: str) -> object | None:
         if isinstance(payload, (bytes, bytearray)):
             payload = payload.decode()
         text = (payload or "").strip()
         if not text:
             raise RuntimeError("No response from CamillaDSP")
         response = json.loads(text)
-        if "error" in response:
-            raise RuntimeError(str(response["error"]))
-        return response.get("result")
+        if "Invalid" in response:
+            detail = response["Invalid"]
+            if isinstance(detail, dict):
+                detail = detail.get("error") or detail
+            raise RuntimeError(f"Camilla rejected command: {detail}")
+        if command not in response:
+            return response
+        result = response[command]
+        if isinstance(result, dict):
+            status = result.get("result")
+            if status not in (None, "Ok"):
+                raise RuntimeError(f"Camilla command failed: {status}")
+            if "value" in result:
+                return result["value"]
+            return status
+        return result
 
-    async def _call(self, method: str, params: dict | None = None) -> dict | None:
-        request = {"jsonrpc": "2.0", "method": method, "id": next(self._ids)}
-        if params is not None:
-            request["params"] = params
-        message = json.dumps(request)
+    async def _invoke(self, command: str, payload: object | None = None) -> object | None:
+        if websockets is None:
+            raise RuntimeError("websockets dependency missing; Camilla control unavailable")
+        message = json.dumps({command: payload})
+        async with websockets.connect(self._ws_uri, ping_interval=None) as ws:
+            await ws.send(message)
+            response_line = await ws.recv()
+        return self._parse_response(response_line, command)
 
-        last_error: Exception | None = None
-        if websockets is not None:
-            ws_uri = f"ws://{self.host}:{self.port}"
-            try:
-                async with websockets.connect(ws_uri, ping_interval=None) as ws:
-                    await ws.send(message)
-                    response_line = await ws.recv()
-                return self._parse_response(response_line)
-            except Exception as exc:  # pragma: no cover - network path
-                last_error = exc
-                log.debug("WebSocket call to Camilla failed (%s); falling back", exc)
-
-        reader, writer = await asyncio.open_connection(self.host, self.port)
+    async def _get_config_json(self) -> dict:
+        raw = await self._invoke("GetConfigJson", None)
+        if not isinstance(raw, str):
+            raise RuntimeError("Unexpected Camilla config payload")
         try:
-            wire = message + "\n"
-            writer.write(wire.encode())
-            await writer.drain()
-            response_line = await reader.readline()
-        finally:
-            writer.close()
-            await writer.wait_closed()
-        if not response_line:
-            if last_error:
-                raise last_error
-            raise RuntimeError("No response from CamillaDSP")
-        return self._parse_response(response_line)
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:  # pragma: no cover - Camilla bug
+            raise RuntimeError("Failed to decode Camilla config") from exc
+
+    async def _set_config_json(self, config: dict) -> None:
+        serialized = json.dumps(config, separators=(",", ":"))
+        await self._invoke("SetConfigJson", serialized)
 
 
 camilla = CamillaController(CAMILLA_HOST, CAMILLA_PORT, CAMILLA_FILTER_PATH)
@@ -662,6 +685,8 @@ camilla_pending_eq = False
 
 
 def _is_connection_error(exc: BaseException) -> bool:
+    if ws_exceptions is not None and isinstance(exc, ws_exceptions.WebSocketException):
+        return True
     if isinstance(exc, ConnectionError):
         return True
     errno = getattr(exc, "errno", None)
