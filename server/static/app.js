@@ -38,6 +38,7 @@ setRangeProgress(masterVolume, masterVolume?.value || 0, masterVolume?.max || 10
 const playerVolumeInline = document.getElementById('player-volume-inline');
 const playerVolumeToggle = document.getElementById('player-volume-toggle');
 const playerPanel = document.getElementById('player-panel');
+const playerCardContents = document.querySelector('.player-card-contents');
 const playerCarouselTrack = document.getElementById('player-carousel-track');
 const playerCarouselIndicators = document.getElementById('player-carousel-indicators');
 const playerShuffleBtn = document.getElementById('player-shuffle');
@@ -186,6 +187,9 @@ let playerCarouselState = {
   width: 0,
   captured: false,
 };
+const PLAYER_SWIPE_DIRECTIONS = { FORWARD: 'forward', BACKWARD: 'backward' };
+let playerPanelSwipeState = { cleanup: null, timerId: null, unhideTimer: null };
+let pendingPlayerEntryDirection = null;
 let queueAbortController = null;
 const playlistNameCollator = typeof Intl !== 'undefined' && typeof Intl.Collator === 'function'
   ? new Intl.Collator(undefined, { sensitivity: 'base' })
@@ -673,12 +677,143 @@ function getActiveChannel() {
   return cid ? getChannelById(cid) : null;
 }
 
-function setActiveChannel(channelId) {
+function resolveChannelSwipeDirection(previousId, nextId, hintedDirection) {
+  if (hintedDirection === PLAYER_SWIPE_DIRECTIONS.FORWARD || hintedDirection === PLAYER_SWIPE_DIRECTIONS.BACKWARD) {
+    return hintedDirection;
+  }
+  if (!previousId || !nextId || previousId === nextId) return null;
+  const prevIndex = channelsCache.findIndex(ch => ch.id === previousId);
+  const nextIndex = channelsCache.findIndex(ch => ch.id === nextId);
+  if (prevIndex === -1 || nextIndex === -1) return null;
+  return nextIndex > prevIndex ? PLAYER_SWIPE_DIRECTIONS.FORWARD : PLAYER_SWIPE_DIRECTIONS.BACKWARD;
+}
+
+function sanitizePlayerCardClone(clone) {
+  if (!clone) return;
+  clone.setAttribute('aria-hidden', 'true');
+  clone.querySelectorAll('button, input, select, textarea, a, [tabindex]').forEach(el => {
+    el.setAttribute('tabindex', '-1');
+    el.setAttribute('aria-hidden', 'true');
+  });
+}
+
+function triggerPlayerPanelSwipe(direction) {
+  if (!playerPanel || !playerCardContents) return;
+  if (!direction || channelsCache.length <= 1) {
+    pendingPlayerEntryDirection = null;
+    return;
+  }
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    pendingPlayerEntryDirection = null;
+    return;
+  }
+  pendingPlayerEntryDirection = direction;
+  playerCardContents.classList.add('is-swipe-hidden');
+  if (playerPanelSwipeState.unhideTimer) {
+    clearTimeout(playerPanelSwipeState.unhideTimer);
+    playerPanelSwipeState.unhideTimer = null;
+  }
+  playerPanelSwipeState.unhideTimer = setTimeout(() => {
+    playerCardContents?.classList.remove('is-swipe-hidden');
+    pendingPlayerEntryDirection = null;
+    playerPanelSwipeState.unhideTimer = null;
+  }, 900);
+  const contentRect = playerCardContents.getBoundingClientRect();
+  const panelRect = playerPanel.getBoundingClientRect();
+  if (!contentRect.width || !contentRect.height) return;
+  if (playerPanelSwipeState.cleanup) {
+    playerPanelSwipeState.cleanup();
+  }
+  const clone = playerCardContents.cloneNode(true);
+  clone.classList.add('player-card-contents-clone');
+  sanitizePlayerCardClone(clone);
+  clone.style.top = `${contentRect.top - panelRect.top}px`;
+  clone.style.left = `${contentRect.left - panelRect.left}px`;
+  clone.style.width = `${contentRect.width}px`;
+  clone.style.height = `${contentRect.height}px`;
+  playerPanel.appendChild(clone);
+
+  const outgoingClass = direction === PLAYER_SWIPE_DIRECTIONS.FORWARD ? 'slide-out-left' : 'slide-out-right';
+
+  void clone.offsetWidth;
+  clone.classList.add(outgoingClass);
+
+  const cleanup = () => {
+    if (playerPanelSwipeState.cleanup !== cleanup) return;
+    if (clone.isConnected) clone.remove();
+    if (playerPanelSwipeState.timerId) {
+      clearTimeout(playerPanelSwipeState.timerId);
+      playerPanelSwipeState.timerId = null;
+    }
+    playerPanelSwipeState.cleanup = null;
+  };
+
+  playerPanelSwipeState.cleanup = cleanup;
+
+  clone.addEventListener('animationend', cleanup, { once: true });
+
+  playerPanelSwipeState.timerId = setTimeout(() => {
+    cleanup();
+  }, 600);
+}
+
+function playPendingPlayerPanelEntryAnimation() {
+  if (!playerCardContents || !pendingPlayerEntryDirection) return;
+  if (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    pendingPlayerEntryDirection = null;
+    playerCardContents.classList.remove('is-swiping', 'slide-in-from-right', 'slide-in-from-left');
+    return;
+  }
+  const direction = pendingPlayerEntryDirection;
+  pendingPlayerEntryDirection = null;
+  const incomingClass = direction === PLAYER_SWIPE_DIRECTIONS.FORWARD ? 'slide-in-from-right' : 'slide-in-from-left';
+  if (playerPanelSwipeState.unhideTimer) {
+    clearTimeout(playerPanelSwipeState.unhideTimer);
+    playerPanelSwipeState.unhideTimer = null;
+  }
+  playerCardContents.classList.remove('is-swipe-hidden');
+  playerCardContents.classList.remove('is-swiping', 'slide-in-from-right', 'slide-in-from-left');
+  playerCardContents.classList.add('is-swiping', incomingClass);
+  const handleAnimationEnd = event => {
+    if (event.target !== playerCardContents) return;
+    playerCardContents.classList.remove('is-swiping', 'slide-in-from-right', 'slide-in-from-left');
+  };
+  playerCardContents.addEventListener('animationend', handleAnimationEnd, { once: true });
+}
+
+function resetPlayerPanelSwipeEffects() {
+  pendingPlayerEntryDirection = null;
+  if (playerPanelSwipeState.cleanup) {
+    playerPanelSwipeState.cleanup();
+  }
+  if (playerPanelSwipeState.timerId) {
+    clearTimeout(playerPanelSwipeState.timerId);
+    playerPanelSwipeState.timerId = null;
+  }
+  if (playerPanelSwipeState.unhideTimer) {
+    clearTimeout(playerPanelSwipeState.unhideTimer);
+    playerPanelSwipeState.unhideTimer = null;
+  }
+  if (playerCardContents) {
+    playerCardContents.classList.remove('is-swipe-hidden', 'is-swiping', 'slide-in-from-right', 'slide-in-from-left');
+  }
+}
+
+function setActiveChannel(channelId, options = {}) {
   if (!channelId || channelId === activeChannelId) return;
   if (!channelsCache.some(ch => ch.id === channelId)) return;
   const previous = activeChannelId;
   activeChannelId = channelId;
-  syncPlayerCarouselToActive({ animate: true });
+  if (previous && options.animate !== false) {
+    const direction = resolveChannelSwipeDirection(previous, channelId, options.direction);
+    if (direction) {
+      triggerPlayerPanelSwipe(direction);
+    }
+  } else {
+    pendingPlayerEntryDirection = null;
+  }
+  const animateCarousel = options.carouselAnimate !== false;
+  syncPlayerCarouselToActive({ animate: animateCarousel });
   applyChannelTheme(getActiveChannel());
   onActiveChannelChanged(previous, channelId);
 }
@@ -803,7 +938,8 @@ function selectAdjacentChannel(step) {
   if (nextIdx === currentIdx) return false;
   const nextChannel = channelsCache[nextIdx];
   if (nextChannel?.id) {
-    setActiveChannel(nextChannel.id);
+    const direction = step < 0 ? PLAYER_SWIPE_DIRECTIONS.BACKWARD : PLAYER_SWIPE_DIRECTIONS.FORWARD;
+    setActiveChannel(nextChannel.id, { direction });
     return true;
   }
   return false;
@@ -1157,6 +1293,7 @@ function resetChannelUiState() {
   }
   playerCarouselCards.clear();
   playerCarouselIndicatorRefs.clear();
+  resetPlayerPanelSwipeEffects();
   if (playerCarouselTrack) playerCarouselTrack.innerHTML = '';
   if (playerCarouselIndicators) {
     playerCarouselIndicators.innerHTML = '';
@@ -5081,6 +5218,8 @@ function renderPlayer(status) {
     playerRepeatBtn.disabled = !active;
     setRepeatMode(active ? status?.repeat_state : 'off');
   }
+
+  playPendingPlayerPanelEntryAnimation();
 
   if (playerTick) {
     clearInterval(playerTick);
