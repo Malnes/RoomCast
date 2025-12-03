@@ -2937,6 +2937,20 @@ async def spotify_playlists(
     }
 
 
+@app.get("/api/spotify/playlists/{playlist_id}")
+async def spotify_playlist_detail(playlist_id: str, channel_id: Optional[str] = Query(default=None)) -> dict:
+    resolved = resolve_channel_id(channel_id)
+    token = _ensure_spotify_token(resolved)
+    resp = await spotify_request("GET", f"/playlists/{playlist_id}", token, resolved)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=resp.status_code, detail=resp.text)
+    data = resp.json()
+    playlist = _map_spotify_playlist(data) if isinstance(data, dict) else None
+    if not playlist:
+        raise HTTPException(status_code=404, detail="Playlist not found")
+    return {"playlist": playlist}
+
+
 @app.get("/api/spotify/playlists/{playlist_id}/tracks")
 async def spotify_playlist_tracks(
     playlist_id: str,

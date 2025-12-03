@@ -151,7 +151,11 @@ let nodeSettingsNodeId = null;
 let useCoverArtBackground = true;
 let lastCoverArtUrl = null;
 const PLAYLIST_PAGE_LIMIT = 50;
+const PLAYLIST_CACHE_TTL_MS = 60 * 60 * 1000;
+const PLAYLIST_TRACK_CACHE_TTL_MS = 60 * 60 * 1000;
 let playlistsCache = [];
+let playlistsCacheFetchedAt = 0;
+const playlistMetadataCache = new Map();
 let playlistSelected = null;
 const playlistTrackCache = new Map();
 let playlistAbortController = null;
@@ -930,16 +934,6 @@ function getSettingsChannelId() {
   return spotifySettingsChannelId;
 }
 
-function setChannelSwatchColor(el, color) {
-  if (!el) return;
-  const normalized = normalizeChannelColorInput(color);
-  if (normalized) {
-    el.style.background = normalized;
-  } else {
-    el.style.background = 'linear-gradient(135deg, rgba(148,163,184,0.35), rgba(30,41,59,0.6))';
-  }
-}
-
 function renderChannelsPanel() {
   if (!channelsPanel) return;
   channelsPanel.innerHTML = '';
@@ -998,12 +992,8 @@ function renderChannelsPanel() {
     colorText.value = colorValue || '';
     colorInputs.appendChild(colorPicker);
     colorInputs.appendChild(colorText);
-    const swatch = document.createElement('div');
-    swatch.className = 'channel-color-swatch';
-    setChannelSwatchColor(swatch, colorValue || colorPicker.value);
     colorGroup.appendChild(colorLabel);
     colorGroup.appendChild(colorInputs);
-    colorGroup.appendChild(swatch);
     header.appendChild(colorGroup);
 
     card.appendChild(header);
@@ -1033,7 +1023,6 @@ function renderChannelsPanel() {
       colorTextInput: colorText,
       saveButton: saveBtn,
       statusEl: status,
-      swatch,
     };
     channelFormRefs.set(channel.id, refs);
 
@@ -1041,16 +1030,12 @@ function renderChannelsPanel() {
     snapInput.addEventListener('input', () => updateChannelCardState(channel.id));
     colorPicker.addEventListener('input', () => {
       colorText.value = colorPicker.value;
-      setChannelSwatchColor(swatch, colorPicker.value);
       updateChannelCardState(channel.id);
     });
     colorText.addEventListener('input', () => {
       const normalized = normalizeChannelColorInput(colorText.value);
       if (normalized) {
         colorPicker.value = normalized;
-        setChannelSwatchColor(swatch, normalized);
-      } else if (!colorText.value.trim()) {
-        setChannelSwatchColor(swatch, null);
       }
       updateChannelCardState(channel.id);
     });
@@ -1236,6 +1221,8 @@ function resetChannelScopedState() {
   playlistTracksAbortController = null;
   playlistSummaryAbortController = null;
   playlistsCache = [];
+  playlistsCacheFetchedAt = 0;
+  playlistMetadataCache.clear();
   playlistTrackCache.clear();
   playlistSelected = null;
   playlistAutoSelectId = null;
@@ -1618,6 +1605,102 @@ function setPlaylistView(mode) {
   }
 }
 
+function isCacheFresh(timestamp, ttl) {
+  if (!Number.isFinite(timestamp) || timestamp <= 0) return false;
+  return Date.now() - timestamp < ttl;
+}
+
+function rememberPlaylistMetadata(item, timestamp = Date.now()) {
+  if (!item?.id) return;
+  playlistMetadataCache.set(item.id, { ...item, _cachedAt: timestamp });
+}
+
+function getCachedPlaylistMetadata(playlistId) {
+  if (!playlistId) return null;
+  const entry = playlistMetadataCache.get(playlistId);
+  if (!entry) return null;
+  if (!isCacheFresh(entry._cachedAt, PLAYLIST_CACHE_TTL_MS)) {
+    playlistMetadataCache.delete(playlistId);
+    return null;
+  }
+  return entry;
+}
+
+function ensurePlaylistsLoaded(options = {}) {
+  const forceRefresh = !!options.forceRefresh;
+  const hasFreshCache = !forceRefresh
+    && playlistsCache.length
+    && isCacheFresh(playlistsCacheFetchedAt, PLAYLIST_CACHE_TTL_MS);
+  if (hasFreshCache) {
+    setPlaylistLoadingState(false);
+    renderPlaylistGrid(playlistsCache);
+    maybeAutoSelectPlaylist();
+    return;
+  }
+  fetchPlaylists();
+}
+
+function showPlaylistsGrid(options = {}) {
+  playlistAutoSelectId = null;
+  setPlaylistView('playlists');
+  if (playlistSubtitle) playlistSubtitle.textContent = '';
+  if (playlistTracklist) playlistTracklist.innerHTML = '';
+  setPlaylistErrorMessage('');
+  if (playlistGrid) playlistGrid.innerHTML = '';
+  if (playlistEmpty) {
+    playlistEmpty.hidden = true;
+    playlistEmpty.textContent = '';
+  }
+  setPlaylistLoadingState(true, 'Loading playlists…');
+  ensurePlaylistsLoaded(options);
+}
+
+async function fetchPlaylistDetails(playlistId) {
+  if (!playlistId) return null;
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    setPlaylistErrorMessage('Select a channel to load playlists.');
+    return null;
+  }
+  const res = await fetch(withChannel(`/api/spotify/playlists/${encodeURIComponent(playlistId)}`, channelId));
+  await ensureOk(res);
+  const data = await res.json();
+  const playlist = data?.playlist || null;
+  if (playlist) rememberPlaylistMetadata(playlist);
+  return playlist;
+}
+
+async function ensurePlaylistDetails(playlistId) {
+  const cached = getCachedPlaylistMetadata(playlistId);
+  if (cached) return cached;
+  return fetchPlaylistDetails(playlistId);
+}
+
+async function showPlaylistTracksForContext(playlistId) {
+  if (!playlistId) {
+    showPlaylistsGrid();
+    return;
+  }
+  setPlaylistView('tracks');
+  setPlaylistErrorMessage('');
+  if (playlistTracklist) playlistTracklist.innerHTML = '';
+  setPlaylistLoadingState(true, 'Loading playlist…');
+  try {
+    const playlist = await ensurePlaylistDetails(playlistId);
+    if (!playlist) throw new Error('Unable to load playlist right now.');
+    const usedCache = selectPlaylist(playlist);
+    if (usedCache) setPlaylistLoadingState(false);
+  } catch (err) {
+    setPlaylistErrorMessage(err?.message || 'Unable to load playlist right now.');
+    showPlaylistsGrid();
+  }
+}
+
+function isTrackCacheFresh(state) {
+  if (!state) return false;
+  return isCacheFresh(state.fetchedAt, PLAYLIST_TRACK_CACHE_TTL_MS);
+}
+
 function setPlaylistLoadingState(isLoading, message) {
   if (!playlistLoading) return;
   const next = !!isLoading;
@@ -1801,6 +1884,7 @@ function ensurePlaylistTrackState(playlistId) {
       loadingMore: false,
       loadedDurationMs: 0,
       summary: { status: 'idle' },
+      fetchedAt: 0,
     };
     playlistTrackCache.set(playlistId, state);
   }
@@ -2046,14 +2130,18 @@ async function fetchPlaylists() {
       hasNext = serverHasNext && (typeof reportedTotal === 'number' ? fetchedCount < reportedTotal : true);
       if (!hasNext) break;
     }
-    playlistsCache = collected.map((item, idx) => ({ ...item, _order: idx }));
+    const timestamp = Date.now();
+    playlistsCache = collected.map((item, idx) => {
+      rememberPlaylistMetadata(item, timestamp);
+      return { ...item, _order: idx };
+    });
+    playlistsCacheFetchedAt = timestamp;
     renderPlaylistGrid(playlistsCache);
     maybeAutoSelectPlaylist();
   } catch (err) {
     if (err.name === 'AbortError') return;
-    playlistsCache = [];
-    if (playlistGrid) playlistGrid.innerHTML = '';
-    if (playlistEmpty) {
+    if (!playlistsCache.length && playlistGrid) playlistGrid.innerHTML = '';
+    if (playlistEmpty && !playlistsCache.length) {
       playlistEmpty.hidden = false;
       playlistEmpty.textContent = 'Unable to load playlists right now.';
     }
@@ -2102,6 +2190,7 @@ async function fetchPlaylistTracksPage(playlist, options = {}) {
     const serverHasNext = Boolean(data?.next);
     const totalKnown = typeof state.total === 'number';
     state.hasMore = serverHasNext || (totalKnown ? state.nextOffset < state.total : tracks.length === limitValue && limitValue > 0);
+    state.fetchedAt = Date.now();
     renderPlaylistTracks(state);
     updatePlaylistProgress(state);
     updatePlaylistLoadMore(state);
@@ -2163,22 +2252,20 @@ function openPlaylistOverlay() {
   resetPlaylistFilters();
   resetPlaylistTrackFilter();
   playlistSelected = null;
-  playlistsCache = [];
   playlistSummaryAbortController?.abort();
   playlistSummaryAbortController = null;
-  if (playlistGrid) playlistGrid.innerHTML = '';
-  if (playlistEmpty) {
-    playlistEmpty.hidden = true;
-    playlistEmpty.textContent = '';
-  }
-  setPlaylistView('playlists');
+  resetPlaylistDetails();
   setPlaylistOverlayOpen(true);
-  playlistAutoSelectId = activePlaylistContextId || null;
   if (playlistSubtitle) playlistSubtitle.textContent = '';
   setPlaylistErrorMessage('');
   if (playlistTracklist) playlistTracklist.innerHTML = '';
-  setPlaylistLoadingState(true, 'Loading playlists…');
-  fetchPlaylists();
+  const contextPlaylistId = activePlaylistContextId || null;
+  if (contextPlaylistId) {
+    playlistAutoSelectId = null;
+    showPlaylistTracksForContext(contextPlaylistId);
+  } else {
+    showPlaylistsGrid();
+  }
 }
 
 function closePlaylistOverlay() {
@@ -2200,18 +2287,16 @@ function handlePlaylistBack() {
   playlistSummaryAbortController = null;
   if (playlistSubtitle) playlistSubtitle.textContent = '';
   setPlaylistErrorMessage('');
-  setPlaylistView('playlists');
-  resetPlaylistDetails();
-  if (playlistTracklist) playlistTracklist.innerHTML = '';
-  if (playlistsCache.length) renderPlaylistGrid(playlistsCache);
-  else fetchPlaylists();
+  playlistAutoSelectId = null;
+  showPlaylistsGrid();
 }
 
-function selectPlaylist(playlist) {
+function selectPlaylist(playlist, options = {}) {
   if (!playlist?.id) {
     showError('Unable to open this playlist.');
-    return;
+    return false;
   }
+  rememberPlaylistMetadata(playlist);
   setPlaylistErrorMessage('');
   resetPlaylistTrackFilter();
   playlistSelected = playlist;
@@ -2224,11 +2309,15 @@ function selectPlaylist(playlist) {
   setPlaylistView('tracks');
   if (playlistTracklist) playlistTracklist.scrollTop = 0;
   const state = ensurePlaylistTrackState(playlist.id);
+  const hasCachedTracks = !options.forceTrackReload
+    && Array.isArray(state?.items)
+    && state.items.length > 0
+    && isTrackCacheFresh(state);
   updatePlaylistSummary(state);
+  if (hasCachedTracks) renderPlaylistTracks(state);
+  else if (playlistTracklist) playlistTracklist.innerHTML = '';
   updatePlaylistProgress(state);
   updatePlaylistLoadMore(state);
-  if (state?.items?.length) renderPlaylistTracks(state);
-  else if (playlistTracklist) playlistTracklist.innerHTML = '';
   playlistSummaryAbortController?.abort();
   playlistSummaryAbortController = null;
   if (!state.summary || state.summary.status === 'idle' || state.summary.status === 'error') {
@@ -2236,9 +2325,10 @@ function selectPlaylist(playlist) {
   } else {
     updatePlaylistSummary(state);
   }
-  if (!state.items.length) {
+  if (!hasCachedTracks) {
     fetchPlaylistTracksPage(playlist, { offset: 0 });
   }
+  return hasCachedTracks;
 }
 
 function playPlaylistTrack(track) {

@@ -74,7 +74,7 @@
     </div>
 
     <div class="nodes-section">
-      <div class="section-title">Nodes</div>
+      <div class="section-title" aria-hidden="true">&nbsp;</div>
       <div id="nodes"></div>
     </div>
 
@@ -315,6 +315,9 @@
           <span class="collapsible-icon" aria-hidden="true">▾</span>
         </button>
         <div class="collapsible-content" aria-hidden="true">
+          <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
+            <button class="small-btn" id="spotify-dashboard" type="button">Open Spotify developer dashboard</button>
+          </div>
           <div class="spotify-channel-select">
             <label for="spotify-channel-select">Configure channel</label>
             <select id="spotify-channel-select"></select>
@@ -359,7 +362,6 @@
             <div id="spotify-spinner" style="display:none; margin-top:8px;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
             <div style="margin-top:8px;">
             <button class="small-btn" id="spotify-auth">Link Spotify account</button>
-            <button class="small-btn" id="spotify-dashboard">Open Spotify developer dashboard</button>
             <div id="spotify-link-status" class="status-pill warn" style="margin-top:6px;">Account link status: unknown</div>
             <div class="muted" style="font-size:12px;">Create Client ID/Secret in the dashboard, save them here, then click “Link Spotify account”. Password sign-ins are no longer supported.</div>
             </div>
