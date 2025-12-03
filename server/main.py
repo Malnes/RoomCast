@@ -3,21 +3,24 @@ import asyncio
 import ipaddress
 import logging
 import os
+import secrets
 import subprocess
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 from typing import Dict, Optional, AsyncIterator, List, Callable
 
 import httpx
+import asyncssh
 import websockets
-from fastapi import Body, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query
+from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from itsdangerous import URLSafeSerializer
+from itsdangerous import URLSafeSerializer, URLSafeTimedSerializer, BadSignature
 from pydantic import BaseModel, Field
 from webrtc import WebAudioRelay
+import bcrypt
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -53,6 +56,24 @@ NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
 NODE_REDISCOVERY_INTERVAL = int(os.getenv("NODE_REDISCOVERY_INTERVAL", "90"))
 LIBRESPOT_FALLBACK_NAME = os.getenv("LIBRESPOT_FALLBACK_NAME", "RoomCast").strip() or "RoomCast"
 SPOTIFY_SEARCH_TYPES = ("album", "track", "artist", "playlist")
+NODE_TERMINAL_ENABLED = os.getenv("NODE_TERMINAL_ENABLED", "1").lower() not in {"0", "false", "no"}
+NODE_TERMINAL_SSH_USER = os.getenv("NODE_TERMINAL_SSH_USER", "").strip()
+NODE_TERMINAL_SSH_PASSWORD = os.getenv("NODE_TERMINAL_SSH_PASSWORD", "").strip()
+NODE_TERMINAL_SSH_KEY_PATH = os.getenv("NODE_TERMINAL_SSH_KEY_PATH", "").strip()
+NODE_TERMINAL_SSH_PORT = int(os.getenv("NODE_TERMINAL_SSH_PORT", "22"))
+NODE_TERMINAL_TOKEN_TTL = int(os.getenv("NODE_TERMINAL_TOKEN_TTL", "60"))
+NODE_TERMINAL_MAX_DURATION = int(os.getenv("NODE_TERMINAL_MAX_DURATION", "900"))
+NODE_TERMINAL_STRICT_HOST_KEY = os.getenv("NODE_TERMINAL_STRICT_HOST_KEY", "0").lower() in {"1", "true", "yes"}
+USERS_PATH = Path(os.getenv("USERS_PATH", "/config/users.json"))
+USERS_PATH.parent.mkdir(parents=True, exist_ok=True)
+SERVER_DEFAULT_NAME = os.getenv("ROOMCAST_SERVER_NAME", "RoomCast").strip() or "RoomCast"
+SESSION_SECRET = os.getenv("AUTH_SESSION_SECRET", "roomcast-auth-secret")
+SESSION_SIGNER = URLSafeTimedSerializer(SESSION_SECRET, salt="roomcast-session")
+SESSION_COOKIE_NAME = os.getenv("AUTH_SESSION_COOKIE", "roomcast_session")
+SESSION_COOKIE_SECURE = os.getenv("AUTH_SESSION_COOKIE_SECURE", "0").lower() in {"1", "true", "yes"}
+_raw_samesite = os.getenv("AUTH_SESSION_COOKIE_SAMESITE", "lax").lower()
+SESSION_COOKIE_SAMESITE = _raw_samesite if _raw_samesite in {"lax", "strict", "none"} else "lax"
+SESSION_MAX_AGE = int(os.getenv("AUTH_SESSION_MAX_AGE", str(7 * 24 * 3600)))
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -174,6 +195,33 @@ class SpotifyConfig(BaseModel):
     redirect_uri: Optional[str] = None
 
 
+class InitializePayload(BaseModel):
+    server_name: str = Field(default="RoomCast", min_length=1, max_length=120)
+    username: str = Field(min_length=1, max_length=60)
+    password: str = Field(min_length=4, max_length=128)
+
+
+class LoginPayload(BaseModel):
+    username: str = Field(min_length=1, max_length=60)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class CreateUserPayload(BaseModel):
+    username: str = Field(min_length=1, max_length=60)
+    password: str = Field(min_length=4, max_length=128)
+    role: str = Field(pattern="^(admin|member)$")
+
+
+class UpdateUserPayload(BaseModel):
+    username: Optional[str] = Field(default=None, min_length=1, max_length=60)
+    password: Optional[str] = Field(default=None, min_length=4, max_length=128)
+    role: Optional[str] = Field(default=None, pattern="^(admin|member)$")
+
+
+class ServerNamePayload(BaseModel):
+    server_name: str = Field(min_length=1, max_length=120)
+
+
 class SnapcastClient:
     def __init__(self, host: str, port: int = 1780) -> None:
         self.url = f"ws://{host}:{port}/jsonrpc"
@@ -211,6 +259,30 @@ snapcast = SnapcastClient(SNAPSERVER_HOST, SNAPSERVER_PORT)
 app = FastAPI(title="RoomCast Controller", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+PUBLIC_API_PATHS = {
+    "/api/auth/status",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/auth/initialize",
+    "/api/health",
+}
+
+
+@app.middleware("http")
+async def session_middleware(request: Request, call_next):
+    path = request.url.path
+    token = request.cookies.get(SESSION_COOKIE_NAME)
+    request.state.user = _resolve_session_user(token)
+    requires_auth = path.startswith("/api/") and path not in PUBLIC_API_PATHS
+    if requires_auth:
+        initialized = _is_initialized()
+        if not initialized and path != "/api/auth/initialize":
+            return JSONResponse(status_code=403, content={"detail": "Instance setup required"})
+        if initialized and request.state.user is None:
+            return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+    response = await call_next(request)
+    return response
+
 
 @app.get("/sw.js", include_in_schema=False)
 async def service_worker() -> FileResponse:
@@ -229,6 +301,10 @@ agent_refresh_tasks: Dict[str, asyncio.Task] = {}
 node_health_task: Optional[asyncio.Task] = None
 spotify_refresh_task: Optional[asyncio.Task] = None
 node_rediscovery_tasks: Dict[str, asyncio.Task] = {}
+terminal_sessions: Dict[str, dict] = {}
+auth_state: dict = {"server_name": SERVER_DEFAULT_NAME, "users": []}
+users_by_id: Dict[str, dict] = {}
+users_by_username: Dict[str, dict] = {}
 
 
 def default_eq_state() -> dict:
@@ -284,6 +360,272 @@ def _apply_volume_limit(node: dict, requested_percent: int) -> int:
     requested = _normalize_percent(requested_percent, default=0)
     limit = _get_node_max_volume(node)
     return (requested * limit) // 100
+
+
+def _load_auth_state() -> None:
+    global auth_state, users_by_id, users_by_username
+    if USERS_PATH.exists():
+        try:
+            data = json.loads(USERS_PATH.read_text())
+        except Exception:
+            log.exception("Failed to read users file; using defaults")
+            data = {}
+    else:
+        data = {}
+    server_name = (data.get("server_name") or SERVER_DEFAULT_NAME).strip() or SERVER_DEFAULT_NAME
+    users = data.get("users") or []
+    auth_state = {"server_name": server_name, "users": []}
+    users_by_id = {}
+    users_by_username = {}
+    for entry in users:
+        if not isinstance(entry, dict):
+            continue
+        uid = entry.get("id") or str(uuid.uuid4())
+        username = (entry.get("username") or "").strip()
+        role = entry.get("role") or "member"
+        password_hash = entry.get("password_hash")
+        if not username or not password_hash:
+            continue
+        user = {
+            "id": uid,
+            "username": username,
+            "role": role,
+            "password_hash": password_hash,
+            "created_at": entry.get("created_at") or int(time.time()),
+            "updated_at": entry.get("updated_at") or int(time.time()),
+        }
+        users_by_id[uid] = user
+        users_by_username[username.lower()] = user
+    auth_state["users"] = list(users_by_id.values())
+
+
+def _save_auth_state() -> None:
+    data = {
+        "server_name": auth_state.get("server_name", SERVER_DEFAULT_NAME),
+        "users": list(users_by_id.values()),
+    }
+    USERS_PATH.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+_load_auth_state()
+
+
+def _is_initialized() -> bool:
+    return bool(users_by_id)
+
+
+def _hash_password(raw: str) -> str:
+    value = raw.encode("utf-8")
+    hashed = bcrypt.hashpw(value, bcrypt.gensalt())
+    return hashed.decode("utf-8")
+
+
+def _verify_password(raw: str, hashed: str) -> bool:
+    if not raw or not hashed:
+        return False
+    try:
+        return bcrypt.checkpw(raw.encode("utf-8"), hashed.encode("utf-8"))
+    except ValueError:
+        return False
+
+
+def _create_user(username: str, password: str, role: str = "admin") -> dict:
+    normalized = username.strip()
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Username is required")
+    lowered = normalized.lower()
+    if lowered in users_by_username:
+        raise HTTPException(status_code=409, detail="Username already exists")
+    if not password or len(password) < 4:
+        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+    role_normalized = role if role in {"admin", "member"} else "member"
+    now = int(time.time())
+    user = {
+        "id": str(uuid.uuid4()),
+        "username": normalized,
+        "role": role_normalized,
+        "password_hash": _hash_password(password),
+        "created_at": now,
+        "updated_at": now,
+    }
+    users_by_id[user["id"]] = user
+    users_by_username[normalized.lower()] = user
+    auth_state["users"] = list(users_by_id.values())
+    _save_auth_state()
+    return user
+
+
+def _update_user(user_id: str, *, username: Optional[str] = None, password: Optional[str] = None, role: Optional[str] = None) -> dict:
+    user = users_by_id.get(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if username:
+        normalized = username.strip()
+        if not normalized:
+            raise HTTPException(status_code=400, detail="Username must not be empty")
+        lowered = normalized.lower()
+        existing = users_by_username.get(lowered)
+        if existing and existing["id"] != user_id:
+            raise HTTPException(status_code=409, detail="Username already exists")
+        users_by_username.pop(user["username"].lower(), None)
+        user["username"] = normalized
+        users_by_username[lowered] = user
+    if password:
+        if len(password) < 4:
+            raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
+        user["password_hash"] = _hash_password(password)
+    if role:
+        if role not in {"admin", "member"}:
+            raise HTTPException(status_code=400, detail="Invalid role")
+        if user.get("role") == "admin" and role == "member":
+            admins = [u for u in users_by_id.values() if u.get("role") == "admin" and u.get("id") != user_id]
+            if not admins:
+                raise HTTPException(status_code=400, detail="Cannot remove the last admin")
+        user["role"] = role
+    user["updated_at"] = int(time.time())
+    auth_state["users"] = list(users_by_id.values())
+    _save_auth_state()
+    return user
+
+
+def _delete_user(user_id: str) -> None:
+    user = users_by_id.get(user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    if user["role"] == "admin":
+        admins = [u for u in users_by_id.values() if u.get("role") == "admin" and u.get("id") != user_id]
+        if not admins:
+            raise HTTPException(status_code=400, detail="Cannot remove the last admin")
+    users_by_id.pop(user_id, None)
+    users_by_username.pop(user["username"].lower(), None)
+    auth_state["users"] = list(users_by_id.values())
+    _save_auth_state()
+
+
+def _public_user(user: dict) -> dict:
+    return {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "role": user.get("role"),
+        "created_at": user.get("created_at"),
+        "updated_at": user.get("updated_at"),
+    }
+
+
+def _session_payload(user_id: str) -> dict:
+    return {"user_id": user_id, "ts": int(time.time())}
+
+
+def _encode_session(user_id: str) -> str:
+    payload = _session_payload(user_id)
+    return SESSION_SIGNER.dumps(payload)
+
+
+def _decode_session(token: str) -> Optional[dict]:
+    if not token:
+        return None
+    try:
+        data = SESSION_SIGNER.loads(token, max_age=SESSION_MAX_AGE)
+    except BadSignature:
+        return None
+    return data
+
+
+def _resolve_session_user(token: Optional[str]) -> Optional[dict]:
+    data = _decode_session(token or "")
+    if not data:
+        return None
+    user_id = data.get("user_id")
+    if not user_id:
+        return None
+    return users_by_id.get(user_id)
+
+
+def _set_session_cookie(response: Response, user_id: str) -> None:
+    token = _encode_session(user_id)
+    response.set_cookie(
+        SESSION_COOKIE_NAME,
+        token,
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=SESSION_COOKIE_SECURE,
+        samesite=SESSION_COOKIE_SAMESITE,
+        path="/",
+    )
+
+
+def _clear_session_cookie(response: Response) -> None:
+    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
+
+
+async def _require_ws_user(ws: WebSocket) -> Optional[dict]:
+    token = ws.cookies.get(SESSION_COOKIE_NAME)
+    user = _resolve_session_user(token)
+    if not user:
+        await ws.close(code=4401)
+        return None
+    return user
+
+
+def get_current_user(request: Request) -> dict:
+    user = getattr(request.state, "user", None)
+    if not user:
+        raise HTTPException(status_code=401, detail="Authentication required")
+    return user
+
+
+def require_admin(request: Request) -> dict:
+    user = get_current_user(request)
+    if user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return user
+
+def _extract_node_host(node: dict) -> Optional[str]:
+    override = (node.get("ssh_host") or "").strip()
+    if override:
+        return override
+    url = node.get("url")
+    if not url:
+        return None
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return None
+    return parsed.hostname
+
+
+def _resolve_terminal_target(node: dict) -> Optional[dict]:
+    host = _extract_node_host(node)
+    if not host:
+        return None
+    port_raw = node.get("ssh_port") or NODE_TERMINAL_SSH_PORT
+    try:
+        port = int(port_raw)
+    except (TypeError, ValueError):
+        port = NODE_TERMINAL_SSH_PORT
+    user = (node.get("ssh_user") or NODE_TERMINAL_SSH_USER).strip()
+    password = (node.get("ssh_password") or NODE_TERMINAL_SSH_PASSWORD).strip()
+    key_path = (node.get("ssh_key_path") or NODE_TERMINAL_SSH_KEY_PATH).strip()
+    if not user:
+        return None
+    if not password and not key_path:
+        return None
+    return {
+        "host": host,
+        "port": port if port and port > 0 else 22,
+        "user": user,
+        "password": password,
+        "key_path": key_path,
+    }
+
+
+def _cleanup_terminal_sessions() -> None:
+    if not terminal_sessions:
+        return
+    now = time.time()
+    expired = [token for token, session in terminal_sessions.items() if session.get("expires_at", 0) <= now]
+    for token in expired:
+        terminal_sessions.pop(token, None)
 
 
 async def _send_browser_volume(node: dict, requested_percent: int) -> None:
@@ -1076,6 +1418,94 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/api/auth/status")
+async def auth_status(request: Request) -> dict:
+    user = getattr(request.state, "user", None)
+    return {
+        "initialized": _is_initialized(),
+        "server_name": auth_state.get("server_name", SERVER_DEFAULT_NAME),
+        "authenticated": bool(user),
+        "user": _public_user(user) if user else None,
+    }
+
+
+@app.post("/api/auth/initialize")
+async def initialize_instance(payload: InitializePayload) -> JSONResponse:
+    if _is_initialized():
+        raise HTTPException(status_code=409, detail="Instance already initialized")
+    server_name = payload.server_name.strip() or SERVER_DEFAULT_NAME
+    auth_state["server_name"] = server_name
+    user = _create_user(payload.username, payload.password, role="admin")
+    response = JSONResponse({
+        "ok": True,
+        "server_name": server_name,
+        "user": _public_user(user),
+    })
+    _set_session_cookie(response, user["id"])
+    return response
+
+
+@app.post("/api/auth/login")
+async def login(payload: LoginPayload) -> JSONResponse:
+    if not _is_initialized():
+        raise HTTPException(status_code=403, detail="Instance setup required")
+    user = users_by_username.get(payload.username.strip().lower()) if payload.username else None
+    if not user or not _verify_password(payload.password, user.get("password_hash")):
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    response = JSONResponse({"ok": True, "user": _public_user(user)})
+    _set_session_cookie(response, user["id"])
+    return response
+
+
+@app.post("/api/auth/logout")
+async def logout() -> JSONResponse:
+    response = JSONResponse({"ok": True})
+    _clear_session_cookie(response)
+    return response
+
+
+@app.get("/api/users")
+async def list_users(_: dict = Depends(require_admin)) -> dict:
+    return {"users": [_public_user(user) for user in users_by_id.values()]}
+
+
+@app.post("/api/users")
+async def create_user(payload: CreateUserPayload, _: dict = Depends(require_admin)) -> dict:
+    user = _create_user(payload.username, payload.password, role=payload.role)
+    return {"ok": True, "user": _public_user(user)}
+
+
+@app.patch("/api/users/{user_id}")
+async def update_user(user_id: str, payload: UpdateUserPayload, _: dict = Depends(require_admin)) -> dict:
+    updates = payload.model_dump(exclude_unset=True)
+    user = _update_user(
+        user_id,
+        username=updates.get("username"),
+        password=updates.get("password"),
+        role=updates.get("role"),
+    )
+    return {"ok": True, "user": _public_user(user)}
+
+
+@app.delete("/api/users/{user_id}")
+async def delete_user(user_id: str, request: Request, _: dict = Depends(require_admin)) -> JSONResponse:
+    current_user = getattr(request.state, "user", None)
+    deleting_self = current_user and current_user.get("id") == user_id
+    _delete_user(user_id)
+    response = JSONResponse({"ok": True, "removed": user_id, "self_removed": bool(deleting_self)})
+    if deleting_self:
+        _clear_session_cookie(response)
+    return response
+
+
+@app.post("/api/server/name")
+async def update_server_name(payload: ServerNamePayload, _: dict = Depends(require_admin)) -> dict:
+    name = payload.server_name.strip() or SERVER_DEFAULT_NAME
+    auth_state["server_name"] = name
+    _save_auth_state()
+    return {"ok": True, "server_name": name}
+
+
 @app.get("/api/snapcast/status")
 async def snapcast_status() -> dict:
     try:
@@ -1366,6 +1796,40 @@ async def restart_agent_node(node_id: str) -> dict:
     return {"ok": True, "result": result, "timeout": NODE_RESTART_TIMEOUT}
 
 
+@app.post("/api/nodes/{node_id}/terminal-session")
+async def create_terminal_session(node_id: str) -> dict:
+    if not NODE_TERMINAL_ENABLED:
+        raise HTTPException(status_code=503, detail="Terminal access is disabled")
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "browser":
+        raise HTTPException(status_code=400, detail="Browser nodes do not support terminal access")
+    if node.get("online") is False:
+        raise HTTPException(status_code=409, detail="Node is offline")
+    target = _resolve_terminal_target(node)
+    if not target:
+        raise HTTPException(status_code=400, detail="Terminal credentials are not configured")
+    _cleanup_terminal_sessions()
+    token = secrets.token_urlsafe(32)
+    now = time.time()
+    expires_at = now + max(5, NODE_TERMINAL_TOKEN_TTL)
+    deadline = now + max(30, NODE_TERMINAL_MAX_DURATION)
+    terminal_sessions[token] = {
+        "node_id": node_id,
+        "target": target,
+        "created_at": now,
+        "expires_at": expires_at,
+        "deadline": deadline,
+    }
+    return {
+        "token": token,
+        "expires_at": expires_at,
+        "ws_path": f"/ws/terminal/{token}",
+        "page_url": f"/static/terminal.html?token={token}",
+    }
+
+
 @app.delete("/api/nodes/{node_id}")
 async def unregister_node(node_id: str) -> dict:
     node = nodes.pop(node_id, None)
@@ -1428,6 +1892,9 @@ async def web_node_session(payload: WebNodeOffer) -> dict:
 
 @app.websocket("/ws/web-node")
 async def web_node_ws(ws: WebSocket):
+    user = await _require_ws_user(ws)
+    if not user:
+        return
     await ws.accept()
     node_id = ws.query_params.get("node_id")
     if not node_id or node_id not in nodes:
@@ -1445,6 +1912,9 @@ async def web_node_ws(ws: WebSocket):
 
 @app.websocket("/ws/nodes")
 async def nodes_ws(ws: WebSocket):
+    user = await _require_ws_user(ws)
+    if not user:
+        return
     await ws.accept()
     node_watchers.add(ws)
     try:
@@ -1457,6 +1927,153 @@ async def nodes_ws(ws: WebSocket):
         pass
     finally:
         node_watchers.discard(ws)
+
+
+@app.websocket("/ws/terminal/{token}")
+async def terminal_ws(ws: WebSocket, token: str):
+    if not NODE_TERMINAL_ENABLED:
+        await ws.close(code=4403)
+        return
+    user = await _require_ws_user(ws)
+    if not user:
+        return
+    session = terminal_sessions.pop(token, None)
+    now = time.time()
+    if not session or session.get("expires_at", 0) < now:
+        await ws.close(code=4403)
+        return
+    target = session.get("target") or {}
+    await ws.accept()
+    key_path = (target.get("key_path") or "").strip()
+    if key_path:
+        key_path = os.path.expanduser(key_path)
+        if not Path(key_path).exists():
+            await ws.send_json({"type": "error", "message": "SSH key not found"})
+            await ws.close(code=1011)
+            return
+    password = (target.get("password") or "").strip()
+    if not key_path and not password:
+        await ws.send_json({"type": "error", "message": "No SSH credentials configured"})
+        await ws.close(code=1011)
+        return
+    ssh_host = target.get("host")
+    if not ssh_host:
+        await ws.send_json({"type": "error", "message": "Terminal host unavailable"})
+        await ws.close(code=1011)
+        return
+    ssh_kwargs = {
+        "host": ssh_host,
+        "port": target.get("port", 22),
+        "username": target.get("user"),
+        "client_keys": [key_path] if key_path else None,
+        "password": password or None,
+    }
+    if not ssh_kwargs["username"]:
+        await ws.send_json({"type": "error", "message": "Terminal user is not configured"})
+        await ws.close(code=1011)
+        return
+    if not NODE_TERMINAL_STRICT_HOST_KEY:
+        ssh_kwargs["known_hosts"] = None
+    term_size = asyncssh.TermSize(80, 24)
+    deadline = session.get("deadline", now + NODE_TERMINAL_MAX_DURATION)
+
+    async def _send_error(message: str) -> None:
+        try:
+            await ws.send_json({"type": "error", "message": message})
+        finally:
+            await ws.close(code=1011)
+
+    try:
+        async with asyncssh.connect(
+            ssh_kwargs["host"],
+            port=ssh_kwargs.get("port") or 22,
+            username=ssh_kwargs.get("username"),
+            client_keys=ssh_kwargs.get("client_keys"),
+            password=ssh_kwargs.get("password"),
+            known_hosts=ssh_kwargs.get("known_hosts"),
+        ) as conn:
+            process = await conn.create_process(term_type="xterm-256color", term_size=term_size, encoding=None)
+
+            async def pump_stream(stream):
+                try:
+                    while True:
+                        chunk = await stream.read(1024)
+                        if not chunk:
+                            break
+                        if isinstance(chunk, bytes):
+                            text = chunk.decode("utf-8", errors="ignore")
+                        else:
+                            text = chunk
+                        try:
+                            await ws.send_json({"type": "output", "data": text})
+                        except Exception:
+                            break
+                except Exception:
+                    return
+
+            async def pump_input():
+                try:
+                    while True:
+                        if time.time() > deadline:
+                            await ws.send_json({"type": "error", "message": "Terminal session expired"})
+                            break
+                        raw = await ws.receive_text()
+                        payload = json.loads(raw)
+                        msg_type = payload.get("type")
+                        if msg_type == "input":
+                            data = payload.get("data", "")
+                            if data:
+                                process.stdin.write(data)
+                                await process.stdin.drain()
+                        elif msg_type == "resize":
+                            cols = int(payload.get("cols") or 80)
+                            rows = int(payload.get("rows") or 24)
+                            try:
+                                set_size = getattr(process.channel, "set_terminal_size", None)
+                                if asyncio.iscoroutinefunction(set_size):
+                                    await set_size(cols, rows)
+                                elif set_size:
+                                    set_size(cols, rows)
+                            except Exception:
+                                pass
+                        elif msg_type == "close":
+                            break
+                except WebSocketDisconnect:
+                    pass
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        process.stdin.write_eof()
+                    except Exception:
+                        pass
+
+            tasks = [asyncio.create_task(pump_input())]
+            if process.stdout:
+                tasks.append(asyncio.create_task(pump_stream(process.stdout)))
+            if process.stderr:
+                tasks.append(asyncio.create_task(pump_stream(process.stderr)))
+
+            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            await process.wait()
+            try:
+                await ws.send_json({"type": "exit", "code": process.exit_status})
+            except Exception:
+                pass
+            try:
+                await ws.close()
+            except Exception:
+                pass
+    except asyncssh.PermissionDenied as exc:
+        await _send_error(f"Permission denied: {exc}")
+    except asyncssh.Error as exc:
+        await _send_error(f"SSH error: {exc}")
+    except Exception as exc:
+        await _send_error(f"Terminal failed: {exc}")
 
 
 async def _probe_host(host: str) -> Optional[dict]:

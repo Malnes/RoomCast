@@ -155,6 +155,191 @@ const playlistNameCollator = typeof Intl !== 'undefined' && typeof Intl.Collator
       if (a === b) return 0;
       return a > b ? 1 : -1;
     } };
+const appShell = document.getElementById('app-shell');
+const authShell = document.getElementById('auth-shell');
+const authLoading = document.getElementById('auth-loading');
+const loginView = document.getElementById('login-view');
+const onboardingView = document.getElementById('onboarding-view');
+const loginForm = document.getElementById('login-form');
+const loginUsername = document.getElementById('login-username');
+const loginPassword = document.getElementById('login-password');
+const loginError = document.getElementById('login-error');
+const onboardingForm = document.getElementById('onboarding-form');
+const onboardingServerName = document.getElementById('onboarding-server-name');
+const onboardingUsername = document.getElementById('onboarding-username');
+const onboardingPassword = document.getElementById('onboarding-password');
+const onboardingError = document.getElementById('onboarding-error');
+const serverNameDisplay = document.getElementById('server-name-display');
+const queueServerName = document.getElementById('queue-server-name');
+const serverNameInput = document.getElementById('server-name-input');
+const saveServerNameBtn = document.getElementById('save-server-name');
+const userStatusEl = document.getElementById('user-status');
+const currentUserNameEl = document.getElementById('current-user-name');
+const currentUserRoleEl = document.getElementById('current-user-role');
+const logoutButton = document.getElementById('logout-button');
+const usersListEl = document.getElementById('users-list');
+const addUserForm = document.getElementById('add-user-form');
+const newUserUsername = document.getElementById('new-user-username');
+const newUserPassword = document.getElementById('new-user-password');
+const newUserRole = document.getElementById('new-user-role');
+const usersPanelNote = document.getElementById('users-panel-note');
+let authState = { initialized: false, authenticated: false, server_name: 'RoomCast', user: null };
+let appBootstrapped = false;
+let nodePollTimer = null;
+let playerPollTimer = null;
+let usersCache = [];
+let usersLoaded = false;
+
+function isAuthenticated() {
+  return !!authState?.authenticated;
+}
+
+function isAdminUser() {
+  return !!authState?.user && authState.user.role === 'admin';
+}
+
+function setInlineMessage(target, message) {
+  if (!target) return;
+  target.textContent = message || '';
+}
+
+function setServerBranding(name) {
+  const normalized = (name || 'RoomCast').trim() || 'RoomCast';
+  if (serverNameDisplay) serverNameDisplay.textContent = normalized;
+  if (queueServerName) queueServerName.textContent = normalized;
+  if (serverNameInput && document.activeElement !== serverNameInput) {
+    serverNameInput.value = normalized;
+  }
+  document.title = `${normalized} – RoomCast`;
+}
+
+function updateUserStatusUI() {
+  if (!userStatusEl) return;
+  if (!authState?.user) {
+    userStatusEl.hidden = true;
+    return;
+  }
+  userStatusEl.hidden = false;
+  if (currentUserNameEl) currentUserNameEl.textContent = authState.user.username || 'User';
+  if (currentUserRoleEl) currentUserRoleEl.textContent = (authState.user.role || 'member').replace(/^./, ch => ch.toUpperCase());
+}
+
+function showAuthLoading() {
+  if (authShell) authShell.hidden = false;
+  if (appShell) appShell.hidden = true;
+  if (authLoading) authLoading.hidden = false;
+  if (loginView) loginView.hidden = true;
+  if (onboardingView) onboardingView.hidden = true;
+}
+
+function showLoginScreen() {
+  if (authShell) authShell.hidden = false;
+  if (appShell) appShell.hidden = true;
+  if (authLoading) authLoading.hidden = true;
+  if (loginView) {
+    loginView.hidden = false;
+    setTimeout(() => loginUsername?.focus(), 50);
+  }
+  if (onboardingView) onboardingView.hidden = true;
+  setInlineMessage(loginError, '');
+  resetUsersState();
+}
+
+function showOnboardingScreen() {
+  if (authShell) authShell.hidden = false;
+  if (appShell) appShell.hidden = true;
+  if (authLoading) authLoading.hidden = true;
+  if (onboardingView) {
+    onboardingView.hidden = false;
+    onboardingServerName.value = authState.server_name || 'RoomCast';
+    setTimeout(() => onboardingServerName?.focus(), 50);
+  }
+  if (loginView) loginView.hidden = true;
+  setInlineMessage(onboardingError, '');
+  resetUsersState();
+}
+
+function stopDataPolling() {
+  if (nodePollTimer) {
+    clearInterval(nodePollTimer);
+    nodePollTimer = null;
+  }
+  if (playerPollTimer) {
+    clearInterval(playerPollTimer);
+    playerPollTimer = null;
+  }
+}
+
+function startDataPolling() {
+  if (!isAuthenticated()) return;
+  const NODE_REFRESH_MS = 4000;
+  if (!nodePollTimer) {
+    fetchNodes();
+    nodePollTimer = setInterval(fetchNodes, NODE_REFRESH_MS);
+  }
+  if (!playerPollTimer) {
+    fetchPlayerStatus();
+    playerPollTimer = setInterval(fetchPlayerStatus, 4000);
+  }
+  fetchStatus();
+}
+
+function enterAppShell() {
+  if (authShell) authShell.hidden = true;
+  if (appShell) appShell.hidden = false;
+  setServerBranding(authState.server_name);
+  updateUserStatusUI();
+  syncGeneralSettingsUI();
+  renderUsersList();
+  startDataPolling();
+}
+
+async function requestAuthStatus() {
+  const res = await fetch('/api/auth/status');
+  await ensureOk(res);
+  return res.json();
+}
+
+async function refreshAuthState() {
+  try {
+    const status = await requestAuthStatus();
+    authState = status;
+    setServerBranding(authState.server_name);
+    if (!authState.initialized) {
+      stopDataPolling();
+      showOnboardingScreen();
+      return;
+    }
+    if (!authState.authenticated) {
+      stopDataPolling();
+      showLoginScreen();
+      return;
+    }
+    enterAppShell();
+  } catch (err) {
+    if (authLoading) {
+      authLoading.hidden = false;
+      const loadingMessage = authLoading.querySelector('p');
+      if (loadingMessage) {
+        loadingMessage.setAttribute('aria-live', 'polite');
+        loadingMessage.textContent = `Failed to check session: ${err.message}`;
+      }
+    }
+  }
+}
+
+function handleAuthSuccess(payload) {
+  if (payload?.server_name) authState.server_name = payload.server_name;
+  if (payload?.user) authState.user = payload.user;
+  authState.initialized = true;
+  authState.authenticated = true;
+  enterAppShell();
+}
+
+async function bootstrapAuth() {
+  showAuthLoading();
+  await refreshAuthState();
+}
 
 
 
@@ -1890,6 +2075,12 @@ function syncGeneralSettingsUI() {
   if (coverArtBackgroundToggle) {
     coverArtBackgroundToggle.checked = useCoverArtBackground;
   }
+  if (serverNameInput && document.activeElement !== serverNameInput) {
+    serverNameInput.value = authState?.server_name || 'RoomCast';
+  }
+  if (saveServerNameBtn) {
+    saveServerNameBtn.disabled = !isAdminUser();
+  }
 }
 
 function applyMuteButtonState(btn, muted) {
@@ -2313,6 +2504,7 @@ function appendDiscovered(items) {
 }
 
 async function fetchStatus() {
+  if (!isAuthenticated()) return;
   try {
     clearMessages();
     const res = await fetch('/api/snapcast/status');
@@ -2325,6 +2517,7 @@ async function fetchStatus() {
 }
 
 async function fetchNodes(options = {}) {
+  if (!isAuthenticated()) return;
   try {
     const res = await fetch('/api/nodes');
     await ensureOk(res);
@@ -2689,6 +2882,34 @@ async function restartNode(nodeId, btn) {
   }
 }
 
+async function openNodeTerminal(nodeId, btn) {
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Opening terminal…';
+  }
+  try {
+    const res = await fetch(`/api/nodes/${nodeId}/terminal-session`, { method: 'POST' });
+    await ensureOk(res);
+    const data = await res.json();
+    const token = data?.token;
+    if (!token) throw new Error('No terminal token returned');
+    const targetUrl = data?.page_url || `/static/terminal.html?token=${encodeURIComponent(token)}`;
+    const finalUrl = new URL(targetUrl, window.location.origin);
+    const opened = window.open(finalUrl.toString(), '_blank', 'noopener');
+    if (!opened) {
+      showError('Pop-up blocked. Allow pop-ups for RoomCast to open the terminal.');
+    }
+  } catch (err) {
+    showError(`Failed to open terminal: ${err.message}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel || 'Open terminal';
+    }
+  }
+}
+
 async function unregisterNode(nodeId) {
   const node = nodesCache.find(n => n.id === nodeId);
   const name = node?.name ? `"${node.name}"` : 'this node';
@@ -2784,10 +3005,6 @@ function renderNodeSettingsContent() {
   if (node.url) {
     detailsPanel.appendChild(createMetaRow('Endpoint', node.url));
   }
-  const host = describeNodeHost(node.url);
-  if (host && host !== node.url) {
-    detailsPanel.appendChild(createMetaRow('Host/IP', host));
-  }
   if (node.agent_version) {
     let versionText = `Agent ${node.agent_version}`;
     if (updating) versionText += ' (updating…)';
@@ -2844,7 +3061,7 @@ function renderNodeSettingsContent() {
   limitsPanel.className = 'panel';
   const limitsTitle = document.createElement('div');
   limitsTitle.className = 'section-title';
-  limitsTitle.textContent = 'Playback limit';
+  limitsTitle.textContent = 'Volume limit';
   limitsPanel.appendChild(limitsTitle);
   const currentMaxVolume = normalizePercent(node.max_volume_percent, 100);
   const requestedVolume = normalizePercent(node.volume_percent, 75);
@@ -2880,12 +3097,6 @@ function renderNodeSettingsContent() {
     }
   });
   limitsPanel.appendChild(maxSlider);
-  const maxHelp = document.createElement('div');
-  maxHelp.className = 'muted';
-  maxHelp.style.fontSize = '12px';
-  maxHelp.style.marginTop = '8px';
-  maxHelp.textContent = 'Caps the usable range of the regular volume fader for this node.';
-  limitsPanel.appendChild(maxHelp);
   nodeSettingsContent.appendChild(limitsPanel);
 
   const actionsPanel = document.createElement('div');
@@ -2913,6 +3124,9 @@ function renderNodeSettingsContent() {
 
     const restartBtn = createNodeSettingsAction(restarting ? 'Restarting…' : 'Restart node', (btn) => restartNode(node.id, btn), { disabled: restarting });
     actionStack.appendChild(restartBtn);
+
+    const terminalBtn = createNodeSettingsAction('Open terminal', (btn) => openNodeTerminal(node.id, btn), { secondary: true, disabled: restarting || updating || !online });
+    actionStack.appendChild(terminalBtn);
 
     const checkBtn = createNodeSettingsAction('Check for updates', (btn) => checkNodeUpdates(node.id, btn), { disabled: restarting || updating });
     actionStack.appendChild(checkBtn);
@@ -3556,6 +3770,7 @@ function formatDurationHuman(ms) {
 }
 
 async function fetchPlayerStatus() {
+  if (!isAuthenticated()) return;
   try {
     const res = await fetch('/api/spotify/player/status');
     await ensureOk(res);
@@ -3797,6 +4012,210 @@ async function saveSpotify() {
   }
 }
 
+async function saveServerName() {
+  if (!isAdminUser()) {
+    showError('Only admins can rename the server.');
+    return;
+  }
+  const value = (serverNameInput?.value || '').trim();
+  if (!value) {
+    showError('Server name cannot be empty.');
+    return;
+  }
+  try {
+    saveServerNameBtn.disabled = true;
+    const res = await fetch('/api/server/name', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ server_name: value }),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    authState.server_name = data.server_name || value;
+    setServerBranding(authState.server_name);
+    syncGeneralSettingsUI();
+    showSuccess('Server name updated.');
+  } catch (err) {
+    showError(`Failed to update server name: ${err.message}`);
+  } finally {
+    saveServerNameBtn.disabled = false;
+  }
+}
+
+async function fetchUsersList(force = false) {
+  if (!usersListEl) return;
+  if (!isAdminUser()) {
+    usersCache = [];
+    usersLoaded = false;
+    renderUsersList();
+    return;
+  }
+  if (usersLoaded && !force) {
+    renderUsersList();
+    return;
+  }
+  try {
+    const res = await fetch('/api/users');
+    await ensureOk(res);
+    const data = await res.json();
+    usersCache = Array.isArray(data?.users) ? data.users : [];
+    usersLoaded = true;
+    renderUsersList();
+  } catch (err) {
+    showError(`Failed to load users: ${err.message}`);
+  }
+}
+
+function renderUsersList() {
+  if (!usersListEl) return;
+  const canManage = isAdminUser();
+  if (usersPanelNote) {
+    usersPanelNote.textContent = canManage
+      ? 'Admins can add members or other admins. Password changes are immediate.'
+      : 'Only admins can manage accounts.';
+  }
+  if (addUserForm) addUserForm.hidden = !canManage;
+  if (!canManage) {
+    usersListEl.innerHTML = '';
+    usersListEl.hidden = true;
+    return;
+  }
+  usersListEl.hidden = false;
+  if (!usersCache.length) {
+    usersListEl.innerHTML = '<div class="muted">No additional users yet.</div>';
+    return;
+  }
+  usersListEl.innerHTML = '';
+  usersCache.forEach(user => {
+    const form = document.createElement('form');
+    form.className = 'user-row';
+    form.dataset.userId = user.id;
+
+    const usernameWrap = document.createElement('div');
+    const usernameLabel = document.createElement('label');
+    usernameLabel.textContent = authState?.user?.id === user.id ? 'Username (you)' : 'Username';
+    const usernameInput = document.createElement('input');
+    usernameInput.value = user.username || '';
+    usernameInput.required = true;
+    usernameWrap.appendChild(usernameLabel);
+    usernameWrap.appendChild(usernameInput);
+
+    const roleWrap = document.createElement('div');
+    const roleLabel = document.createElement('label');
+    roleLabel.textContent = 'Role';
+    const roleSelect = document.createElement('select');
+    ['admin', 'member'].forEach(value => {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = value === 'admin' ? 'Admin' : 'Member';
+      roleSelect.appendChild(option);
+    });
+    roleSelect.value = user.role || 'member';
+    roleWrap.appendChild(roleLabel);
+    roleWrap.appendChild(roleSelect);
+
+    const passwordWrap = document.createElement('div');
+    const passwordLabel = document.createElement('label');
+    passwordLabel.textContent = 'New password';
+    const passwordInput = document.createElement('input');
+    passwordInput.type = 'password';
+    passwordInput.placeholder = 'Leave blank to keep current';
+    passwordInput.autocomplete = 'new-password';
+    passwordWrap.appendChild(passwordLabel);
+    passwordWrap.appendChild(passwordInput);
+
+    const actions = document.createElement('div');
+    actions.className = 'user-row-actions';
+    const saveBtn = document.createElement('button');
+    saveBtn.type = 'submit';
+    saveBtn.textContent = 'Save';
+    const deleteBtn = document.createElement('button');
+    deleteBtn.type = 'button';
+    deleteBtn.className = 'small-btn';
+    deleteBtn.textContent = 'Delete';
+    actions.appendChild(saveBtn);
+    actions.appendChild(deleteBtn);
+
+    form.appendChild(usernameWrap);
+    form.appendChild(roleWrap);
+    form.appendChild(passwordWrap);
+    form.appendChild(actions);
+
+    form.addEventListener('submit', async evt => {
+      evt.preventDefault();
+      const payload = {};
+      const nextName = usernameInput.value.trim();
+      if (nextName && nextName !== user.username) payload.username = nextName;
+      if (roleSelect.value !== user.role) payload.role = roleSelect.value;
+      if (passwordInput.value) payload.password = passwordInput.value;
+      if (!Object.keys(payload).length) {
+        showSuccess('Nothing to update.');
+        passwordInput.value = '';
+        return;
+      }
+      try {
+        saveBtn.disabled = true;
+        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        await ensureOk(res);
+        const data = await res.json();
+        const updated = data?.user;
+        if (updated) {
+          usersCache = usersCache.map(u => (u.id === updated.id ? updated : u));
+          if (authState?.user?.id === updated.id) {
+            authState.user = updated;
+            updateUserStatusUI();
+          }
+        }
+        showSuccess('User updated.');
+        fetchUsersList(true);
+      } catch (err) {
+        showError(`Failed to update user: ${err.message}`);
+      } finally {
+        saveBtn.disabled = false;
+        passwordInput.value = '';
+      }
+    });
+
+    deleteBtn.addEventListener('click', async () => {
+      const confirmed = window.confirm(`Remove user "${user.username}"?`);
+      if (!confirmed) return;
+      try {
+        deleteBtn.disabled = true;
+        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}`, { method: 'DELETE' });
+        await ensureOk(res);
+        const data = await res.json();
+        usersCache = usersCache.filter(u => u.id !== user.id);
+        usersLoaded = false;
+        showSuccess('User removed.');
+        if (data?.self_removed) {
+          stopDataPolling();
+          await refreshAuthState();
+          return;
+        }
+        fetchUsersList(true);
+      } catch (err) {
+        showError(`Failed to delete user: ${err.message}`);
+      } finally {
+        deleteBtn.disabled = false;
+      }
+    });
+
+    usersListEl.appendChild(form);
+  });
+}
+
+function resetUsersState() {
+  usersCache = [];
+  usersLoaded = false;
+  if (usersListEl) {
+    usersListEl.innerHTML = '';
+  }
+}
+
 async function pollLibrespotStatus() {
   for (let i = 0; i < 8; i++) {
     await new Promise(r => setTimeout(r, 1200));
@@ -3813,6 +4232,7 @@ function openSettings() {
   fetchSpotifyConfig();
   fetchLibrespotStatus();
   fetchStatus();
+  fetchUsersList();
 }
 function closeSettings() { settingsOverlay.style.display = 'none'; }
 
@@ -3841,12 +4261,123 @@ saveSpotifyBtn.addEventListener('click', saveSpotify);
 if (spInitVol) {
   spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
 }
+if (saveServerNameBtn) {
+  saveServerNameBtn.addEventListener('click', saveServerName);
+}
 openSettingsBtn.addEventListener('click', openSettings);
 closeSettingsBtn.addEventListener('click', closeSettings);
 closeDiscoverBtn.addEventListener('click', closeDiscover);
 if (coverArtBackgroundToggle) {
   coverArtBackgroundToggle.addEventListener('change', () => {
     setCoverArtBackgroundEnabled(coverArtBackgroundToggle.checked);
+  });
+}
+if (logoutButton) {
+  logoutButton.addEventListener('click', async () => {
+    logoutButton.disabled = true;
+    try {
+      await fetch('/api/auth/logout', { method: 'POST' });
+    } catch (_) {
+      /* ignore logout errors */
+    } finally {
+      logoutButton.disabled = false;
+      stopDataPolling();
+      resetUsersState();
+      await refreshAuthState();
+    }
+  });
+}
+if (loginForm) {
+  const submitBtn = loginForm.querySelector('button[type="submit"]');
+  loginForm.addEventListener('submit', async evt => {
+    evt.preventDefault();
+    const username = loginUsername?.value.trim();
+    const password = loginPassword?.value || '';
+    if (!username || !password) {
+      setInlineMessage(loginError, 'Enter username and password.');
+      return;
+    }
+    setInlineMessage(loginError, '');
+    try {
+      if (submitBtn) submitBtn.disabled = true;
+      const res = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      await ensureOk(res);
+      await refreshAuthState();
+      loginPassword.value = '';
+    } catch (err) {
+      setInlineMessage(loginError, err.message);
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+  });
+}
+if (onboardingForm) {
+  const submitBtn = onboardingForm.querySelector('button[type="submit"]');
+  onboardingForm.addEventListener('submit', async evt => {
+    evt.preventDefault();
+    const serverName = onboardingServerName?.value.trim() || 'RoomCast';
+    const username = onboardingUsername?.value.trim();
+    const password = onboardingPassword?.value || '';
+    if (!serverName || !username || !password) {
+      setInlineMessage(onboardingError, 'All fields are required.');
+      return;
+    }
+    setInlineMessage(onboardingError, '');
+    try {
+      if (submitBtn) submitBtn.disabled = true;
+      const res = await fetch('/api/auth/initialize', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ server_name: serverName, username, password }),
+      });
+      await ensureOk(res);
+      onboardingPassword.value = '';
+      await refreshAuthState();
+    } catch (err) {
+      setInlineMessage(onboardingError, err.message);
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+  });
+}
+if (addUserForm) {
+  const submitBtn = addUserForm.querySelector('button[type="submit"]');
+  addUserForm.addEventListener('submit', async evt => {
+    evt.preventDefault();
+    if (!isAdminUser()) {
+      showError('Only admins can add users.');
+      return;
+    }
+    const username = newUserUsername?.value.trim();
+    const password = newUserPassword?.value || '';
+    const role = newUserRole?.value || 'member';
+    if (!username || !password) {
+      showError('Enter username and password for the new user.');
+      return;
+    }
+    try {
+      if (submitBtn) submitBtn.disabled = true;
+      const res = await fetch('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, role }),
+      });
+      await ensureOk(res);
+      newUserUsername.value = '';
+      newUserPassword.value = '';
+      newUserRole.value = 'member';
+      usersLoaded = false;
+      showSuccess('User created.');
+      fetchUsersList(true);
+    } catch (err) {
+      showError(`Failed to create user: ${err.message}`);
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
   });
 }
 const handleAddNodeKey = evt => {
@@ -4019,12 +4550,7 @@ spotifyAuthBtn.addEventListener('click', startSpotifyAuth);
 spotifyDashboardBtn.addEventListener('click', () => window.open('https://developer.spotify.com/dashboard', '_blank'));
 if (takeoverButton) takeoverButton.addEventListener('click', handleTakeoverClick);
 
-const NODE_REFRESH_MS = 4000;
-fetchNodes();
-fetchStatus();
-fetchPlayerStatus();
-setInterval(fetchNodes, NODE_REFRESH_MS);
-setInterval(fetchPlayerStatus, 4000);
+bootstrapAuth();
 
 if (document.readyState === 'complete' || document.readyState === 'interactive') {
   registerRoomcastServiceWorker();

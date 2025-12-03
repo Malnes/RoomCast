@@ -10,11 +10,25 @@
 * { box-sizing: border-box; }
 body { margin: 0; padding: 0; background: radial-gradient(circle at 20% 20%, rgba(34,197,94,0.08), transparent 30%), radial-gradient(circle at 80% 0%, rgba(59,130,246,0.08), transparent 25%), #0b1020; min-height: 100vh; position: relative; overflow-x: hidden; }
 body.use-cover-art-background { background: #020617; }
+.auth-shell { min-height: 100vh; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 16px; padding: 40px 16px 160px; }
+.auth-shell[hidden] { display: none; }
+.auth-card { width: min(420px, calc(100vw - 32px)); background: rgba(15,23,42,0.92); border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 24px; box-shadow: 0 24px 60px rgba(0,0,0,0.45); }
+.auth-card h2 { margin: 0 0 6px; font-size: 20px; }
+.auth-form { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.auth-form button { width: 100%; }
+.auth-error { margin-top: 12px; color: #fecaca; font-size: 14px; min-height: 20px; }
+.auth-error:empty { display: none; }
+#app-shell[hidden] { display: none; }
 #cover-art-backdrop { position: fixed; inset: -40px; background: #020617; background-size: cover; background-position: center; filter: blur(10px); opacity: 0; transition: opacity 0.35s ease; z-index: 0; pointer-events: none; }
 body.use-cover-art-background #cover-art-backdrop { opacity: 1; }
 .shell { max-width: 960px; margin: 0 auto; padding: 16px 16px 220px; position: relative; z-index: 1; }
 header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; }
 h1 { margin: 0; font-size: 22px; letter-spacing: -0.4px; }
+.header-meta { display: flex; flex-direction: column; gap: 6px; }
+.user-status { display: flex; align-items: center; gap: 8px; font-size: 13px; color: #cbd5e1; }
+.user-status .muted { opacity: 0.7; }
+.user-status button { width: auto; }
+.role-pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; background: rgba(59,130,246,0.2); color: #bfdbfe; }
 .icon-btn { background: rgba(255,255,255,0.07); color: #e2e8f0; border: 1px solid rgba(255,255,255,0.12); padding: 8px 10px; border-radius: 12px; cursor: pointer; font-weight: 700; min-width: 44px; width: auto; display: inline-flex; align-items: center; justify-content: center; gap: 4px; }
 .icon-btn svg { width: 18px; height: 18px; display: block; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); border: 0; }
@@ -133,6 +147,18 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 .collapsible-panel[data-open="true"] .collapsible-icon { transform: rotate(180deg); }
 .collapsible-content { display: none; padding: 0 20px 20px 20px; border-top: 1px solid rgba(255,255,255,0.08); }
 .collapsible-panel[data-open="true"] .collapsible-content { display: block; }
+#users-panel { display: flex; flex-direction: column; gap: 12px; }
+.server-name-row { display: flex; gap: 8px; align-items: center; margin-bottom: 12px; }
+.server-name-row input { flex: 1; }
+.server-name-row button { width: auto; }
+.user-inline-form { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 8px; align-items: end; }
+.user-inline-form button { width: 100%; }
+.users-list { display: flex; flex-direction: column; gap: 8px; }
+.users-list[hidden] { display: none; }
+.user-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 8px; align-items: end; padding: 12px; border-radius: 14px; border: 1px solid rgba(255,255,255,0.08); background: rgba(15,23,42,0.7); }
+.user-row .user-row-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.user-row button { width: auto; }
+.user-row .user-meta { font-size: 12px; color: #94a3b8; }
 #player-panel { position: fixed; bottom: 0; left: 0; right: 0; background: rgba(6,10,20,0.25); backdrop-filter: blur(28px); border-top: 1px solid rgba(148,163,184,0.2); box-shadow: 0 -24px 60px rgba(0,0,0,0.35); padding: 14px 18px 18px; display: flex; flex-direction: column; gap: 0; z-index: 50; }
 .player-top { display: flex; flex-wrap: nowrap; gap: 16px; justify-content: space-between; align-items: center; }
 .player-meta { display: flex; align-items: center; gap: 12px; flex: 1 1 auto; min-width: 0; }

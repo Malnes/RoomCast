@@ -11,10 +11,52 @@
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
+  <div id="auth-shell" class="auth-shell">
+    <div id="auth-loading" class="auth-card">
+      <h2>Loading…</h2>
+      <p class="muted">Checking your session.</p>
+    </div>
+    <div id="onboarding-view" class="auth-card" hidden>
+      <h2>Welcome to RoomCast</h2>
+      <p class="muted">Name this controller and create the first admin user to get started.</p>
+      <form id="onboarding-form" class="auth-form" autocomplete="off">
+        <label for="onboarding-server-name">Server name</label>
+        <input id="onboarding-server-name" placeholder="RoomCast" required>
+        <label for="onboarding-username">Admin username</label>
+        <input id="onboarding-username" placeholder="admin" required autocomplete="username">
+        <label for="onboarding-password">Admin password</label>
+        <input id="onboarding-password" type="password" placeholder="Enter a password" required autocomplete="new-password">
+        <button type="submit">Create admin</button>
+      </form>
+      <div id="onboarding-error" class="auth-error" role="alert" aria-live="polite"></div>
+    </div>
+    <div id="login-view" class="auth-card" hidden>
+      <h2>Sign in</h2>
+      <p class="muted">Enter your RoomCast credentials.</p>
+      <form id="login-form" class="auth-form" autocomplete="off">
+        <label for="login-username">Username</label>
+        <input id="login-username" required autocomplete="username">
+        <label for="login-password">Password</label>
+        <input id="login-password" type="password" required autocomplete="current-password">
+        <button type="submit">Sign in</button>
+      </form>
+      <div id="login-error" class="auth-error" role="alert" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <div id="app-shell" hidden>
   <div id="cover-art-backdrop" aria-hidden="true"></div>
   <div class="shell">
     <header>
-      <h1>RoomCast</h1>
+      <div class="header-meta">
+        <h1 id="server-name-display">RoomCast</h1>
+        <div id="user-status" class="user-status" hidden>
+          <span class="muted">Signed in as</span>
+          <span id="current-user-name">admin</span>
+          <span id="current-user-role" class="role-pill">Admin</span>
+          <button id="logout-button" class="small-btn" type="button">Log out</button>
+        </div>
+      </div>
       <div class="header-actions">
         <div class="add-node-container" data-add-node-container>
           <button id="add-node-button" class="icon-btn add-node-button" aria-haspopup="true" aria-expanded="false">Add node ▾</button>
@@ -157,7 +199,7 @@
       <div class="queue-header">
         <div>
           <div class="section-title" id="queue-modal-title">Play queue</div>
-          <div class="muted" id="queue-modal-subtitle">See what's playing on RoomCast.</div>
+          <div class="muted" id="queue-modal-subtitle">See what's playing on <span id="queue-server-name">RoomCast</span>.</div>
         </div>
         <button id="queue-close" class="icon-btn small-btn" type="button" aria-label="Close play queue">✕</button>
       </div>
@@ -230,6 +272,12 @@
           <span class="collapsible-icon" aria-hidden="true">▾</span>
         </button>
         <div class="collapsible-content" aria-hidden="true">
+          <div class="label" style="margin-bottom:4px;">Server name</div>
+          <div class="server-name-row">
+            <input id="server-name-input" placeholder="RoomCast">
+            <button id="save-server-name" type="button">Save</button>
+          </div>
+          <div class="muted" style="font-size:12px; margin-bottom:16px;">Shown across the UI and in Spotify when you take over playback.</div>
           <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
             <div>
               <div class="label" style="margin:0;">Use cover art as background</div>
@@ -304,6 +352,28 @@
         </div>
       </div>
 
+      <div class="panel collapsible-panel" data-collapsible>
+        <button class="collapsible-header" type="button" aria-expanded="false">
+          <span class="section-title" style="margin:0;">Users</span>
+          <span class="collapsible-icon" aria-hidden="true">▾</span>
+        </button>
+        <div class="collapsible-content" aria-hidden="true">
+          <div id="users-panel">
+            <div class="muted" id="users-panel-note">Only admins can manage accounts.</div>
+            <form id="add-user-form" class="user-inline-form" autocomplete="off">
+              <input id="new-user-username" placeholder="Username" required>
+              <input id="new-user-password" type="password" placeholder="Password" required autocomplete="new-password">
+              <select id="new-user-role">
+                <option value="admin">Admin</option>
+                <option value="member">Member</option>
+              </select>
+              <button type="submit">Add user</button>
+            </form>
+            <div id="users-list" class="users-list"></div>
+          </div>
+        </div>
+      </div>
+
     </div>
   </div>
 
@@ -322,6 +392,9 @@
       <div id="discover-list"></div>
     </div>
   </div>
+
+  </div> <!-- /shell -->
+  </div> <!-- /app-shell -->
 
   <script src="/static/app.js"></script>
 

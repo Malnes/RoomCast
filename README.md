@@ -46,6 +46,13 @@ Prereqs: Docker, Docker Compose, Spotify Premium (Librespot needs it), open TCP 
 5) Use the UI to set per-node EQ (bands JSON) and volume; adjust Snapcast client volumes in the “Snapcast clients” section.
 Optional: if your host participates in multiple VLANs/subnets and you want to scan additional ranges beyond whatever interfaces the OS exposes, set `DISCOVERY_CIDR` to a comma/semicolon separated list (e.g. `192.168.1.0/24;10.10.0.0/24`). Those ranges will be scanned in addition to the interfaces that host networking already reveals.
 
+Remote terminal troubleshooting
+-------------------------------
+- The node settings modal now exposes an **Open terminal** button for hardware nodes. Clicking it mints a single-use token, opens a dedicated window with an xterm.js canvas, and proxies keystrokes over a WebSocket tunnel to the node via SSH.
+- Enable the feature by configuring SSH credentials for your fleet: set `NODE_TERMINAL_SSH_USER`, plus either `NODE_TERMINAL_SSH_PASSWORD` or `NODE_TERMINAL_SSH_KEY_PATH` (path inside the controller container). Optional knobs include `NODE_TERMINAL_SSH_PORT`, `NODE_TERMINAL_TOKEN_TTL` (seconds the launch token stays valid), `NODE_TERMINAL_MAX_DURATION` (hard session cap), and `NODE_TERMINAL_STRICT_HOST_KEY` (set to `1` to enforce host key verification instead of the default `known_hosts=None`).
+- Need per-node overrides? Add `ssh_host`, `ssh_user`, `ssh_port`, `ssh_password`, or `ssh_key_path` fields to that node’s entry in `nodes.json`; those take precedence over the global env vars.
+- For security, tokens are single-use, expire quickly, and the controller refuses to open shells while nodes report offline status. Idle browser windows can keep the channel alive, but once the SSH process exits the controller closes the WebSocket automatically.
+
 Deploy from GHCR (Dockge/Portainer friendly)
 -------------------------------------------
 The repository ships a GitHub Actions workflow (`.github/workflows/publish-controller.yml`) that builds and pushes two images to GHCR whenever `main` changes:
