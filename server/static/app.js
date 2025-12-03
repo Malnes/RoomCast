@@ -189,6 +189,12 @@ let nodePollTimer = null;
 let playerPollTimer = null;
 let usersCache = [];
 let usersLoaded = false;
+const NODE_POLL_INTERVAL_MS = 4000;
+let nodesSocket = null;
+let nodesSocketConnected = false;
+let nodesSocketRetryTimer = null;
+let nodesSocketRetryAttempt = 0;
+let nodesSocketShouldConnect = false;
 
 function isAuthenticated() {
   return !!authState?.authenticated;
@@ -268,14 +274,19 @@ function stopDataPolling() {
     clearInterval(playerPollTimer);
     playerPollTimer = null;
   }
+  stopNodeSocket();
 }
 
 function startDataPolling() {
   if (!isAuthenticated()) return;
-  const NODE_REFRESH_MS = 4000;
-  if (!nodePollTimer) {
+  startNodeSocket();
+  const runNodePoll = () => {
+    if (nodesSocketConnected) return;
     fetchNodes();
-    nodePollTimer = setInterval(fetchNodes, NODE_REFRESH_MS);
+  };
+  if (!nodePollTimer) {
+    runNodePoll();
+    nodePollTimer = setInterval(runNodePoll, NODE_POLL_INTERVAL_MS);
   }
   if (!playerPollTimer) {
     fetchPlayerStatus();
@@ -2211,6 +2222,109 @@ function renderNodes(nodes, options = {}) {
     pendingNodesForce = true;
   }
   flushPendingNodesRender();
+}
+
+function getNodeSocketUrl() {
+  const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${window.location.host}/ws/nodes`;
+}
+
+function clearNodeSocketRetry() {
+  if (nodesSocketRetryTimer) {
+    clearTimeout(nodesSocketRetryTimer);
+    nodesSocketRetryTimer = null;
+  }
+}
+
+function scheduleNodeSocketReconnect() {
+  if (!nodesSocketShouldConnect || nodesSocketRetryTimer) return;
+  const baseDelay = 1500;
+  const maxDelay = 15000;
+  const delay = Math.min(baseDelay * (2 ** nodesSocketRetryAttempt || 1), maxDelay);
+  nodesSocketRetryAttempt = Math.min(nodesSocketRetryAttempt + 1, 6);
+  nodesSocketRetryTimer = setTimeout(() => {
+    nodesSocketRetryTimer = null;
+    if (!nodesSocketShouldConnect || nodesSocket) return;
+    startNodeSocket({ force: true });
+  }, delay);
+}
+
+function handleNodesSocketOpen() {
+  nodesSocketConnected = true;
+  nodesSocketRetryAttempt = 0;
+  clearNodeSocketRetry();
+}
+
+function handleNodesSocketMessage(event) {
+  if (!event?.data) return;
+  let payload;
+  try {
+    payload = JSON.parse(event.data);
+  } catch (_) {
+    return;
+  }
+  if (payload?.type === 'nodes' && Array.isArray(payload.nodes)) {
+    renderNodes(payload.nodes);
+  }
+}
+
+function handleNodesSocketClose(event) {
+  if (event?.target !== nodesSocket) return;
+  nodesSocketConnected = false;
+  nodesSocket = null;
+  if (nodesSocketShouldConnect) {
+    scheduleNodeSocketReconnect();
+  }
+}
+
+function handleNodesSocketError(event) {
+  if (event?.target?.close) {
+    try {
+      event.target.close();
+    } catch (_) {
+      /* swallow socket close errors */
+    }
+  }
+}
+
+function startNodeSocket(options = {}) {
+  if (!isAuthenticated()) return;
+  nodesSocketShouldConnect = true;
+  const force = options.force === true;
+  if (nodesSocket) return;
+  if (nodesSocketRetryTimer && !force) return;
+  if (force) clearNodeSocketRetry();
+  let socket;
+  try {
+    socket = new WebSocket(getNodeSocketUrl());
+  } catch (_) {
+    scheduleNodeSocketReconnect();
+    return;
+  }
+  nodesSocket = socket;
+  socket.addEventListener('open', handleNodesSocketOpen);
+  socket.addEventListener('message', handleNodesSocketMessage);
+  socket.addEventListener('close', handleNodesSocketClose);
+  socket.addEventListener('error', handleNodesSocketError);
+}
+
+function stopNodeSocket() {
+  nodesSocketShouldConnect = false;
+  nodesSocketConnected = false;
+  nodesSocketRetryAttempt = 0;
+  clearNodeSocketRetry();
+  if (nodesSocket) {
+    try {
+      nodesSocket.removeEventListener('open', handleNodesSocketOpen);
+      nodesSocket.removeEventListener('message', handleNodesSocketMessage);
+      nodesSocket.removeEventListener('close', handleNodesSocketClose);
+      nodesSocket.removeEventListener('error', handleNodesSocketError);
+      nodesSocket.close();
+    } catch (_) {
+      /* ignore close errors */
+    }
+    nodesSocket = null;
+  }
 }
 
 function commitRenderNodes(nodes) {
