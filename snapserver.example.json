@@ -2,16 +2,29 @@
   "ConfigVersion": 2,
   "streams": [
     {
-      "name": "default",
-      "type": "tcp",
-      "location": "tcp://0.0.0.0:1704"
+      "id": "spotify_ch1",
+      "name": "Spotify_CH1",
+      "type": "pipe",
+      "location": "pipe:///tmp/snapfifo-ch1?name=Spotify_CH1&sampleformat=44100:16:2&codec=pcm"
+    },
+    {
+      "id": "spotify_ch2",
+      "name": "Spotify_CH2",
+      "type": "pipe",
+      "location": "pipe:///tmp/snapfifo-ch2?name=Spotify_CH2&sampleformat=44100:16:2&codec=pcm"
     }
   ],
   "groups": [
     {
-      "id": "default",
-      "name": "default",
-      "stream_id": "default",
+      "id": "spotify_ch1",
+      "name": "Spotify Channel 1",
+      "stream_id": "Spotify_CH1",
+      "clients": []
+    },
+    {
+      "id": "spotify_ch2",
+      "name": "Spotify Channel 2",
+      "stream_id": "Spotify_CH2",
       "clients": []
     }
   ]

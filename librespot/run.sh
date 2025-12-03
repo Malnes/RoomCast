@@ -9,6 +9,27 @@ FALLBACK_NAME=${LIBRESPOT_FALLBACK_NAME:-RoomCast}
 LIBRESPOT_BIN=${LIBRESPOT_BIN:-/usr/bin/librespot}
 LOG_PATH=${LOG_PATH:-/config/librespot.log}
 
+ensure_paths() {
+  mkdir -p "$(dirname "$CONFIG_PATH")" \
+           "$(dirname "$STATUS_PATH")" \
+           "$(dirname "$TOKEN_PATH")" \
+           "$(dirname "$LOG_PATH")"
+}
+
+ensure_fifo() {
+  local fifo="$1"
+  if [ -z "$fifo" ]; then
+    return
+  fi
+  if [ -p "$fifo" ]; then
+    return
+  fi
+  if [ -e "$fifo" ]; then
+    rm -f "$fifo"
+  fi
+  mkfifo "$fifo"
+}
+
 write_status() {
   local state="$1"
   local message="${2:-}"
@@ -91,6 +112,9 @@ LIBRESPOT_PID=""
 LAST_HASH=""
 LAST_START=0
 ACCESS_TOKEN=""
+
+ensure_paths
+ensure_fifo "$FIFO_PATH"
 
 while true; do
   load_cfg || { sleep 3; continue; }
