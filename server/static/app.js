@@ -153,11 +153,13 @@ let lastCoverArtUrl = null;
 const PLAYLIST_PAGE_LIMIT = 50;
 const PLAYLIST_CACHE_TTL_MS = 60 * 60 * 1000;
 const PLAYLIST_TRACK_CACHE_TTL_MS = 60 * 60 * 1000;
+const PLAYER_SNAPSHOT_TTL_MS = 60 * 60 * 1000;
 let playlistsCache = [];
 let playlistsCacheFetchedAt = 0;
 const playlistMetadataCache = new Map();
 let playlistSelected = null;
 const playlistTrackCache = new Map();
+let lastPlayerSnapshot = null;
 let playlistAbortController = null;
 let playlistTracksAbortController = null;
 let playlistSummaryAbortController = null;
@@ -1161,7 +1163,7 @@ function resetChannelUiState() {
     playerCarouselIndicators.hidden = true;
   }
   renderPlayerCarousel();
-  setPlayerIdleState('Create a channel to control playback');
+  setPlayerIdleState('Create a channel to control playback', { forceClear: true });
   refreshNodeVolumeAccents();
   applyChannelTheme(null);
 }
@@ -1193,14 +1195,14 @@ async function refreshChannels(options = {}) {
       }
       refreshNodeVolumeAccents();
       if (!channelsCache.length) {
-        setPlayerIdleState('Create a channel to control playback');
+        setPlayerIdleState('Create a channel to control playback', { forceClear: true });
       }
       if (activeChannelId && previousActive !== activeChannelId) {
         onActiveChannelChanged(previousActive, activeChannelId);
       } else if (!previousActive && activeChannelId) {
         onActiveChannelChanged(null, activeChannelId);
       } else if (!activeChannelId) {
-        setPlayerIdleState('Select a channel to control playback');
+        setPlayerIdleState('Select a channel to control playback', { forceClear: true });
       }
       return channelsCache;
     } catch (err) {
@@ -1245,13 +1247,14 @@ function resetChannelScopedState() {
     clearInterval(playerTick);
     playerTick = null;
   }
+  lastPlayerSnapshot = null;
 }
 
 function onActiveChannelChanged(previousId, nextId) {
   if (previousId === nextId) return;
   resetChannelScopedState();
   if (!nextId) {
-    setPlayerIdleState('Select a channel to control playback');
+    setPlayerIdleState('Select a channel to control playback', { forceClear: true });
     return;
   }
   fetchPlayerStatus();
@@ -4902,11 +4905,66 @@ function formatDurationHuman(ms) {
   return parts.join(' ');
 }
 
-function setPlayerIdleState(message = 'Player unavailable') {
+function rememberPlayerSnapshot(status) {
+  const item = status?.item;
+  if (!item || (!item.name && !item.uri)) return;
+  lastPlayerSnapshot = {
+    item,
+    context: status?.context || null,
+    capturedAt: Date.now(),
+    shuffle_state: status?.shuffle_state ?? false,
+    repeat_state: status?.repeat_state ?? 'off',
+  };
+}
+
+function getPlayerSnapshot() {
+  if (!lastPlayerSnapshot) return null;
+  if (Date.now() - lastPlayerSnapshot.capturedAt > PLAYER_SNAPSHOT_TTL_MS) {
+    lastPlayerSnapshot = null;
+    return null;
+  }
+  return lastPlayerSnapshot;
+}
+
+function buildPlayerResumePayload() {
+  const snapshot = getPlayerSnapshot();
+  if (!snapshot) return null;
+  const contextUri = snapshot.context?.uri;
+  const trackUri = snapshot.item?.uri;
+  if (contextUri) {
+    const payload = { context_uri: contextUri };
+    if (trackUri) payload.offset = { uri: trackUri };
+    return payload;
+  }
+  if (trackUri) return { uris: [trackUri] };
+  return null;
+}
+
+function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   if (!playerPanel) return;
   if (playerTick) {
     clearInterval(playerTick);
     playerTick = null;
+  }
+  const forceClear = options.forceClear === true;
+  const snapshot = forceClear ? null : getPlayerSnapshot();
+  if (snapshot) {
+    const resumeMessage = message === 'Player unavailable' ? 'Tap play to resume on RoomCast' : message;
+    playerStatus = {
+      active: false,
+      is_playing: false,
+      progress_ms: 0,
+      device: {},
+      context: snapshot.context,
+      item: snapshot.item,
+      shuffle_state: snapshot.shuffle_state,
+      repeat_state: snapshot.repeat_state,
+      allowResume: true,
+      idleMessage: resumeMessage,
+      __fromSnapshot: true,
+    };
+    renderPlayer(playerStatus);
+    return;
   }
   playerStatus = null;
   playerPanel.style.display = 'flex';
@@ -4936,13 +4994,28 @@ async function fetchPlayerStatus() {
   if (!isAuthenticated()) return;
   const channelId = getActiveChannelId();
   if (!channelId) {
-    setPlayerIdleState('Select a channel to control playback');
+    setPlayerIdleState('Select a channel to control playback', { forceClear: true });
     return;
   }
   try {
     const res = await fetch(withChannel('/api/spotify/player/status', channelId));
     await ensureOk(res);
     playerStatus = await res.json();
+    if (!playerStatus?.active && !playerStatus?.item) {
+      const snapshot = getPlayerSnapshot();
+      if (snapshot) {
+        playerStatus = {
+          ...playerStatus,
+          item: snapshot.item,
+          context: snapshot.context,
+          shuffle_state: snapshot.shuffle_state,
+          repeat_state: snapshot.repeat_state,
+          allowResume: true,
+          idleMessage: 'Tap play to resume on RoomCast',
+          __fromSnapshot: true,
+        };
+      }
+    }
     renderPlayer(playerStatus);
     markSpotifyHealthy();
   } catch (err) {
@@ -4954,19 +5027,32 @@ async function fetchPlayerStatus() {
 function renderPlayer(status) {
   const item = status?.item || {};
   const active = !!status?.active;
+  const resumeAvailable = !!status?.allowResume && !active;
+  const showMeta = active || resumeAvailable;
   updateActivePlaylistContext(status);
   updateTakeoverBanner(status);
   activeDeviceId = active && status?.device?.id ? status.device.id : null;
+  if (!status?.__fromSnapshot && active && status?.device_is_roomcast !== false) {
+    rememberPlayerSnapshot(status);
+  }
   playerPanel.style.display = 'flex';
-  playerTitle.textContent = active ? (item.name || '—') : 'No active playback';
-  const artists = (item.artists || []).map(a => a.name).join(', ');
-  playerArtist.textContent = active ? (artists || '—') : '';
-  const art = active ? (item.album?.images?.[1]?.url || item.album?.images?.[0]?.url) : null;
+  playerTitle.textContent = showMeta ? (item.name || '—') : 'No active playback';
+  const artistsRaw = Array.isArray(item.artists)
+    ? item.artists.map(a => a?.name).filter(Boolean).join(', ')
+    : (item.artists || '');
+  if (showMeta) {
+    const resumeHint = resumeAvailable ? (status?.idleMessage || 'Tap play to resume on RoomCast') : '';
+    const artistLine = artistsRaw || resumeHint ? [artistsRaw || '—', resumeHint].filter(Boolean).join(' • ') : '';
+    playerArtist.textContent = artistLine || '—';
+  } else {
+    playerArtist.textContent = '';
+  }
+  const art = showMeta ? (item.album?.images?.[1]?.url || item.album?.images?.[0]?.url) : null;
   if (art) {
     playerArt.src = art;
     playerArt.alt = item?.name ? `${item.name} cover art` : 'Album art';
     playerArt.style.display = 'block';
-    setPlayerArtInteractivity(true);
+    setPlayerArtInteractivity(active);
   } else {
     playerArt.style.display = 'none';
     playerArt.alt = '';
@@ -4984,7 +5070,7 @@ function renderPlayer(status) {
   const playing = !!status?.is_playing && active;
   setPlayButtonIcon(playing);
   playerPrev.disabled = !active;
-  playerPlay.disabled = !active;
+  playerPlay.disabled = !showMeta;
   playerNext.disabled = !active;
   playerSeek.disabled = !active;
   if (playerShuffleBtn) {
@@ -5702,7 +5788,10 @@ playerPrev.addEventListener('click', () => {
 playerPlay.addEventListener('click', () => {
   if (playerPlay.disabled) return;
   if (playerStatus?.is_playing) playerAction('/api/spotify/player/pause');
-  else playerAction('/api/spotify/player/play');
+  else {
+    const resumePayload = playerStatus?.allowResume ? buildPlayerResumePayload() : null;
+    playerAction('/api/spotify/player/play', resumePayload || undefined);
+  }
 });
 playerNext.addEventListener('click', () => {
   if (playerNext.disabled) return;
