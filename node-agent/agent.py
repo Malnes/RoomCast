@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.17")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.18")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -289,6 +289,46 @@ def _outputs_snapshot() -> dict:
     if selected and selected not in {opt["id"] for opt in options}:
         options.insert(0, {"id": selected, "label": f"{selected} (current)"})
     return {"selected": selected, "options": options}
+
+
+def _wifi_signal_snapshot() -> dict | None:
+    path = Path("/proc/net/wireless")
+    try:
+        lines = path.read_text().strip().splitlines()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return None
+    if len(lines) <= 2:
+        return None
+    snapshots: list[dict] = []
+    for line in lines[2:]:
+        if ":" not in line:
+            continue
+        iface_part, metrics = line.split(":", 1)
+        iface = iface_part.strip()
+        if not iface:
+            continue
+        fields = metrics.split()
+        if len(fields) < 2:
+            continue
+        try:
+            quality = float(fields[0])
+        except ValueError:
+            continue
+        try:
+            signal_dbm = float(fields[1])
+        except ValueError:
+            signal_dbm = None
+        percent = max(0, min(100, int(round((quality / 70.0) * 100))))
+        entry = {"interface": iface, "percent": percent}
+        if signal_dbm is not None:
+            entry["signal_dbm"] = signal_dbm
+        snapshots.append(entry)
+    if not snapshots:
+        return None
+    snapshots.sort(key=lambda item: item["percent"], reverse=True)
+    return snapshots[0]
 
 
 def _render_camilla_config(playback_device: str) -> str:
@@ -856,6 +896,7 @@ async def health() -> dict:
         "outputs": _outputs_snapshot(),
         "fingerprint": node_uid,
         "max_volume_percent": _max_volume_percent(),
+        "wifi": _wifi_signal_snapshot(),
     }
 
 

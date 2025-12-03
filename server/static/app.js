@@ -81,6 +81,12 @@ const playlistSortSelect = document.getElementById('playlist-sort');
 const channelsPanel = document.getElementById('channels-panel');
 const spotifyChannelSelect = document.getElementById('spotify-channel-select');
 const DEFAULT_CHANNEL_COLOR = '#22c55e';
+const WIFI_SIGNAL_THRESHOLDS = [
+  { min: 75, bars: 4, label: 'Excellent signal' },
+  { min: 55, bars: 3, label: 'Good signal' },
+  { min: 35, bars: 2, label: 'Fair signal' },
+  { min: 15, bars: 1, label: 'Weak signal' },
+];
 if (playerPanel) {
   playerPanel.addEventListener('pointerdown', handleCarouselPointerDown);
   playerPanel.addEventListener('pointermove', handleCarouselPointerMove);
@@ -3423,6 +3429,79 @@ function createNodeChannelSelector(node, options = {}) {
   return wrapper;
 }
 
+function clampWifiPercent(value) {
+  if (!Number.isFinite(value)) return null;
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
+function resolveNodeWifiState(node) {
+  if (!node || typeof node !== 'object') return null;
+  const percent = clampWifiPercent(Number(node?.wifi?.percent));
+  if (percent === null) return null;
+  let bars = 0;
+  let label = 'No signal';
+  for (const entry of WIFI_SIGNAL_THRESHOLDS) {
+    if (percent >= entry.min) {
+      bars = entry.bars;
+      label = entry.label;
+      break;
+    }
+  }
+  const signalRaw = Number(node?.wifi?.signal_dbm);
+  return {
+    percent,
+    bars,
+    label,
+    signalDbm: Number.isFinite(signalRaw) ? Math.round(signalRaw) : null,
+    interface: typeof node?.wifi?.interface === 'string' ? node.wifi.interface : null,
+  };
+}
+
+function describeNodeWifi(node) {
+  const online = node?.online !== false;
+  if (!online) return 'Node offline';
+  const state = resolveNodeWifiState(node);
+  if (!state) return 'Wi-Fi signal unavailable';
+  const parts = [`Wi-Fi ${state.label}`, `${state.percent}%`];
+  if (typeof state.signalDbm === 'number') {
+    parts.push(`${state.signalDbm} dBm`);
+  }
+  if (state.interface) {
+    parts.push(`via ${state.interface}`);
+  }
+  return parts.join(' · ');
+}
+
+function renderNodeWifiIndicator(node) {
+  const indicator = document.createElement('div');
+  indicator.className = 'node-wifi-indicator';
+  indicator.setAttribute('role', 'img');
+  const label = describeNodeWifi(node);
+  indicator.setAttribute('aria-label', label);
+  indicator.title = label;
+  const meter = document.createElement('div');
+  meter.className = 'node-wifi-meter';
+  const online = node?.online !== false;
+  const state = resolveNodeWifiState(node);
+  const level = online && state ? state.bars : 0;
+  meter.classList.add(`wifi-level-${level}`);
+  if (!online) {
+    meter.classList.add('is-offline');
+  } else if (!state) {
+    meter.classList.add('is-unknown');
+  }
+  for (let i = 0; i < 4; i += 1) {
+    meter.appendChild(document.createElement('span'));
+  }
+  const accentColor = getNodeChannelAccent(node) || DEFAULT_CHANNEL_COLOR;
+  const wifiColor = !online
+    ? '#f87171'
+    : (state ? accentColor : '#e2e8f0');
+  meter.style.setProperty('--node-wifi-color', wifiColor);
+  indicator.appendChild(meter);
+  return indicator;
+}
+
 function commitRenderNodes(nodes) {
   nodesEl.innerHTML = '';
   nodeVolumeSliderRefs.clear();
@@ -3487,10 +3566,8 @@ function commitRenderNodes(nodes) {
       gearWrap.insertBefore(channelSelector, eqBtn);
     }
     if (!isBrowser) {
-      const onlinePill = document.createElement('span');
-      onlinePill.className = `status-pill ${online ? 'ok' : 'warn'}`;
-      onlinePill.textContent = online ? 'Online' : 'Offline';
-      title.appendChild(onlinePill);
+      const wifiIndicator = renderNodeWifiIndicator(n);
+      title.appendChild(wifiIndicator);
     }
     if (isBrowser) {
       const browserPill = document.createElement('span');

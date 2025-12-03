@@ -50,7 +50,8 @@ NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.17").strip()
+TRANSIENT_NODE_FIELDS = {"wifi"}
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.18").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
@@ -625,6 +626,8 @@ def public_node(node: dict) -> dict:
     data["fingerprint"] = node.get("fingerprint")
     data["max_volume_percent"] = _get_node_max_volume(node)
     data["channel_id"] = resolve_node_channel_id(node)
+    if node.get("wifi"):
+        data["wifi"] = node.get("wifi")
     return data
 
 
@@ -1384,6 +1387,28 @@ async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[b
         if node.get("outputs") != outputs:
             node["outputs"] = outputs
             changed = True
+    wifi_payload = data.get("wifi")
+    sanitized_wifi = None
+    if isinstance(wifi_payload, dict):
+        percent_raw = wifi_payload.get("percent")
+        if isinstance(percent_raw, (int, float)):
+            percent_val = max(0, min(100, int(round(percent_raw))))
+            sanitized_wifi = {"percent": percent_val}
+            signal_raw = wifi_payload.get("signal_dbm")
+            if isinstance(signal_raw, (int, float)):
+                sanitized_wifi["signal_dbm"] = float(signal_raw)
+            iface_raw = wifi_payload.get("interface")
+            if isinstance(iface_raw, str):
+                iface = iface_raw.strip()
+                if iface:
+                    sanitized_wifi["interface"] = iface
+    if sanitized_wifi:
+        if node.get("wifi") != sanitized_wifi:
+            node["wifi"] = sanitized_wifi
+            changed = True
+    elif "wifi" in node:
+        node.pop("wifi", None)
+        changed = True
     if "max_volume_percent" in data:
         max_vol = _normalize_percent(data.get("max_volume_percent"), default=_get_node_max_volume(node))
         if node.get("max_volume_percent") != max_vol:
@@ -1542,7 +1567,11 @@ def load_nodes() -> None:
 
 
 def save_nodes() -> None:
-    NODES_PATH.write_text(json.dumps(list(nodes.values()), indent=2))
+    serialized = []
+    for node in nodes.values():
+        entry = {k: v for k, v in node.items() if k not in TRANSIENT_NODE_FIELDS}
+        serialized.append(entry)
+    NODES_PATH.write_text(json.dumps(serialized, indent=2))
 
 
 load_nodes()
