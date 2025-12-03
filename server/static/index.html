@@ -2,6 +2,12 @@
 <html lang="en">
 <head>
   <title>RoomCast</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0f172a">
+  <link rel="manifest" href="/static/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/static/icons/icon-192.png">
+  <link rel="icon" href="/static/icons/icon-192.png" type="image/png">
   <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
@@ -25,7 +31,10 @@
     <div id="success" class="toast success" style="display:none; opacity:0;"></div>
     <div id="persistent-alert" class="persistent-alert" role="alert" aria-live="assertive" aria-hidden="true" hidden>
       <span id="persistent-alert-message"></span>
-      <button id="persistent-alert-dismiss" type="button" aria-label="Dismiss alert">✕</button>
+      <div class="persistent-alert-actions">
+        <button id="persistent-alert-action" class="small-btn" type="button" hidden></button>
+        <button id="persistent-alert-dismiss" type="button" aria-label="Dismiss alert">✕</button>
+      </div>
     </div>
 
     <div class="nodes-section">

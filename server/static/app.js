@@ -4,6 +4,7 @@ const errorEl = document.getElementById('error');
 const successEl = document.getElementById('success');
 const persistentAlertEl = document.getElementById('persistent-alert');
 const persistentAlertMessage = document.getElementById('persistent-alert-message');
+const persistentAlertAction = document.getElementById('persistent-alert-action');
 const persistentAlertDismiss = document.getElementById('persistent-alert-dismiss');
 const addNodeContainer = document.querySelector('[data-add-node-container]');
 const addNodeToggle = document.getElementById('add-node-button');
@@ -183,6 +184,11 @@ let persistentAlertState = null;
 const persistentAlertSuppression = new Set();
 const SPOTIFY_ALERT_KEY = 'spotify';
 const SPOTIFY_ALERT_HELP = 'Open Settings > Spotify setup and tap "Save Spotify config" to reconnect.';
+const PWA_UPDATE_ALERT_KEY = 'pwa-update';
+const PWA_UPDATE_ACTION_LABEL = 'Update now';
+let persistentAlertActionHandler = null;
+const DEFAULT_ALERT_DISMISS_LABEL = persistentAlertDismiss?.textContent || '✕';
+const DEFAULT_ALERT_DISMISS_ARIA = persistentAlertDismiss?.getAttribute('aria-label') || 'Dismiss alert';
 
 function showToast(el, msg, timeout = 3500) {
   el.innerText = msg;
@@ -240,6 +246,24 @@ function showPersistentAlert(message, options = {}) {
   if (key && persistentAlertSuppression.has(key)) return;
   persistentAlertMessage.textContent = message;
   persistentAlertEl.dataset.alertKey = key;
+  const actionHandler = typeof options.onAction === 'function' ? options.onAction : null;
+  persistentAlertActionHandler = actionHandler;
+  if (persistentAlertAction) {
+    if (actionHandler) {
+      persistentAlertAction.hidden = false;
+      persistentAlertAction.textContent = options.actionLabel || 'View details';
+      persistentAlertAction.disabled = false;
+    } else {
+      persistentAlertAction.hidden = true;
+      persistentAlertAction.textContent = '';
+    }
+  }
+  if (persistentAlertDismiss) {
+    const dismissLabel = options.dismissLabel || DEFAULT_ALERT_DISMISS_LABEL;
+    const dismissAria = options.dismissAriaLabel || DEFAULT_ALERT_DISMISS_ARIA;
+    persistentAlertDismiss.textContent = dismissLabel;
+    persistentAlertDismiss.setAttribute('aria-label', dismissAria);
+  }
   persistentAlertEl.classList.add('is-visible');
   persistentAlertEl.hidden = false;
   persistentAlertEl.setAttribute('aria-hidden', 'false');
@@ -252,6 +276,15 @@ function hidePersistentAlert() {
   persistentAlertEl.setAttribute('aria-hidden', 'true');
   persistentAlertEl.hidden = true;
   persistentAlertEl.dataset.alertKey = '';
+  persistentAlertActionHandler = null;
+  if (persistentAlertAction) {
+    persistentAlertAction.hidden = true;
+    persistentAlertAction.textContent = '';
+  }
+  if (persistentAlertDismiss) {
+    persistentAlertDismiss.textContent = DEFAULT_ALERT_DISMISS_LABEL;
+    persistentAlertDismiss.setAttribute('aria-label', DEFAULT_ALERT_DISMISS_ARIA);
+  }
   persistentAlertState = null;
 }
 
@@ -280,12 +313,67 @@ function reportSpotifyError(detail) {
 
 function handlePersistentAlertDismiss() {
   const key = persistentAlertEl?.dataset?.alertKey;
-  if (key) suppressPersistentAlert(key);
+  if (key && key !== PWA_UPDATE_ALERT_KEY) suppressPersistentAlert(key);
   hidePersistentAlert();
+}
+
+function handlePersistentAlertAction() {
+  if (typeof persistentAlertActionHandler === 'function') {
+    persistentAlertActionHandler();
+  }
 }
 
 function markSpotifyHealthy() {
   clearPersistentAlertSuppression(SPOTIFY_ALERT_KEY);
+}
+
+function promptPwaUpdate(worker) {
+  if (!worker) return;
+  showPersistentAlert('A new RoomCast update is ready. Reload to get the latest UI.', {
+    key: PWA_UPDATE_ALERT_KEY,
+    actionLabel: PWA_UPDATE_ACTION_LABEL,
+    dismissLabel: 'Later',
+    dismissAriaLabel: 'Dismiss update notification',
+    onAction: () => {
+      worker.postMessage({ type: 'SKIP_WAITING' });
+      hidePersistentAlert();
+    },
+  });
+}
+
+function registerRoomcastServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  let refreshing = false;
+  navigator.serviceWorker.addEventListener('controllerchange', () => {
+    if (refreshing) return;
+    refreshing = true;
+    window.location.reload();
+  });
+  navigator.serviceWorker.register('/sw.js')
+    .then(registration => {
+      if (registration.waiting) {
+        promptPwaUpdate(registration.waiting);
+      }
+      const listenForInstalled = worker => {
+        if (!worker) return;
+        worker.addEventListener('statechange', () => {
+          if (worker.state === 'installed') {
+            if (navigator.serviceWorker.controller) {
+              promptPwaUpdate(worker);
+            } else {
+              hidePersistentAlert();
+            }
+          }
+        });
+      };
+      listenForInstalled(registration.installing);
+      registration.addEventListener('updatefound', () => {
+        listenForInstalled(registration.installing);
+      });
+    })
+    .catch(err => {
+      console.warn('Service worker registration failed:', err);
+    });
 }
 
 function setTakeoverBannerVisible(visible, message) {
@@ -333,6 +421,9 @@ async function handleTakeoverClick() {
 
 if (persistentAlertDismiss) {
   persistentAlertDismiss.addEventListener('click', handlePersistentAlertDismiss);
+}
+if (persistentAlertAction) {
+  persistentAlertAction.addEventListener('click', handlePersistentAlertAction);
 }
 
 function normalizeNodeUrl(value) {
@@ -3934,3 +4025,9 @@ fetchStatus();
 fetchPlayerStatus();
 setInterval(fetchNodes, NODE_REFRESH_MS);
 setInterval(fetchPlayerStatus, 4000);
+
+if (document.readyState === 'complete' || document.readyState === 'interactive') {
+  registerRoomcastServiceWorker();
+} else {
+  window.addEventListener('load', registerRoomcastServiceWorker, { once: true });
+}

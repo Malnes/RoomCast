@@ -211,6 +211,14 @@ snapcast = SnapcastClient(SNAPSERVER_HOST, SNAPSERVER_PORT)
 app = FastAPI(title="RoomCast Controller", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
+
+@app.get("/sw.js", include_in_schema=False)
+async def service_worker() -> FileResponse:
+    """Serve the service worker from the app root for maximum scope."""
+    response = FileResponse(STATIC_DIR / "sw.js", media_type="application/javascript")
+    response.headers["Cache-Control"] = "no-cache"
+    return response
+
 nodes: Dict[str, dict] = {}
 browser_ws: Dict[str, WebSocket] = {}
 node_watchers: set[WebSocket] = set()
