@@ -6,6 +6,7 @@ import os
 import secrets
 import string
 import subprocess
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -21,6 +22,11 @@ from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeSerializer, URLSafeTimedSerializer, BadSignature
 from pydantic import BaseModel, Field
 from webrtc import WebAudioRelay
+from local_agent import (
+    ensure_local_agent_running,
+    local_agent_url,
+    stop_local_agent,
+)
 import bcrypt
 
 
@@ -69,6 +75,7 @@ NODE_TERMINAL_STRICT_HOST_KEY = os.getenv("NODE_TERMINAL_STRICT_HOST_KEY", "0").
 USERS_PATH = Path(os.getenv("USERS_PATH", "/config/users.json"))
 USERS_PATH.parent.mkdir(parents=True, exist_ok=True)
 SERVER_DEFAULT_NAME = os.getenv("ROOMCAST_SERVER_NAME", "RoomCast").strip() or "RoomCast"
+LOCAL_AGENT_NAME_SUFFIX = os.getenv("LOCAL_AGENT_NAME_SUFFIX", " (local)").strip() or " (local)"
 SESSION_SECRET = os.getenv("AUTH_SESSION_SECRET", "roomcast-auth-secret")
 SESSION_SIGNER = URLSafeTimedSerializer(SESSION_SECRET, salt="roomcast-session")
 SESSION_COOKIE_NAME = os.getenv("AUTH_SESSION_COOKIE", "roomcast_session")
@@ -80,6 +87,8 @@ CHANNELS_PATH = Path(os.getenv("CHANNELS_PATH", "/config/channels.json"))
 CHANNELS_PATH.parent.mkdir(parents=True, exist_ok=True)
 PRIMARY_CHANNEL_ID = os.getenv("PRIMARY_CHANNEL_ID", "ch1").strip() or "ch1"
 CHANNEL_ID_PREFIX = os.getenv("CHANNEL_ID_PREFIX", "ch").strip() or "ch"
+PLAYER_SNAPSHOT_PATH = Path(os.getenv("PLAYER_SNAPSHOT_PATH", "/config/player-snapshots.json"))
+PLAYER_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -137,6 +146,8 @@ SNAPSERVER_AGENT_HOST = _resolve_snapserver_agent_host()
 
 channels_by_id: Dict[str, dict] = {}
 channel_order: list[str] = []
+player_snapshots: Dict[str, dict] = {}
+player_snapshot_lock = threading.Lock()
 
 
 def _sanitize_channel_color(value: Optional[str]) -> Optional[str]:
@@ -160,6 +171,125 @@ def _normalize_channel_id(value: Optional[str], fallback: str) -> str:
     candidate = (value or "").strip().lower()
     cleaned = "".join(ch for ch in candidate if ch.isalnum() or ch in {"-", "_"})
     return cleaned or fallback
+
+
+def _load_player_snapshots() -> None:
+    global player_snapshots
+    if not PLAYER_SNAPSHOT_PATH.exists():
+        player_snapshots = {}
+        return
+    try:
+        data = json.loads(PLAYER_SNAPSHOT_PATH.read_text())
+    except Exception as exc:  # pragma: no cover - filesystem edge
+        log.warning("Failed to load player snapshots: %s", exc)
+        player_snapshots = {}
+        return
+    if isinstance(data, dict):
+        player_snapshots = data
+    else:
+        player_snapshots = {}
+
+
+def _save_player_snapshots() -> None:
+    try:
+        PLAYER_SNAPSHOT_PATH.write_text(json.dumps(player_snapshots, indent=2, sort_keys=True))
+    except Exception as exc:  # pragma: no cover - filesystem edge
+        log.warning("Failed to persist player snapshots: %s", exc)
+
+
+def _snapshot_track_item(item: Optional[dict]) -> Optional[dict]:
+    if not isinstance(item, dict):
+        return None
+    track_uri = (item.get("uri") or "").strip()
+    if not track_uri:
+        return None
+    simplified_artists = []
+    for artist in item.get("artists") or []:
+        if not isinstance(artist, dict):
+            continue
+        name = (artist.get("name") or "").strip()
+        if not name:
+            continue
+        simplified_artists.append({"name": name, "uri": artist.get("uri")})
+    album = item.get("album") or {}
+    simplified_album = {
+        "name": album.get("name"),
+        "uri": album.get("uri"),
+        "images": album.get("images"),
+    }
+    return {
+        "name": item.get("name"),
+        "uri": track_uri,
+        "duration_ms": item.get("duration_ms"),
+        "artists": simplified_artists,
+        "album": simplified_album,
+    }
+
+
+def _snapshot_context(context: Optional[dict]) -> Optional[dict]:
+    if not isinstance(context, dict):
+        return None
+    uri = (context.get("uri") or "").strip()
+    if not uri:
+        return None
+    payload = {"uri": uri}
+    context_type = context.get("type")
+    if context_type:
+        payload["type"] = context_type
+    return payload
+
+
+def _set_player_snapshot(channel_id: str, status: dict) -> None:
+    if not channel_id:
+        return
+    item = _snapshot_track_item(status.get("item"))
+    if not item:
+        return
+    context = _snapshot_context(status.get("context"))
+    snapshot = {
+        "item": item,
+        "context": context,
+        "captured_at": int(time.time()),
+        "shuffle_state": bool(status.get("shuffle_state")),
+        "repeat_state": status.get("repeat_state") or "off",
+    }
+    with player_snapshot_lock:
+        existing = player_snapshots.get(channel_id)
+        if existing:
+            same_track = (existing.get("item") or {}).get("uri") == item.get("uri")
+            same_context = (existing.get("context") or {}).get("uri") == (context or {}).get("uri")
+            if same_track and same_context:
+                existing["captured_at"] = snapshot["captured_at"]
+                existing["shuffle_state"] = snapshot["shuffle_state"]
+                existing["repeat_state"] = snapshot["repeat_state"]
+                return
+        player_snapshots[channel_id] = snapshot
+        _save_player_snapshots()
+
+
+def _get_player_snapshot(channel_id: Optional[str]) -> Optional[dict]:
+    if not channel_id:
+        return None
+    with player_snapshot_lock:
+        snapshot = player_snapshots.get(channel_id)
+        if not snapshot:
+            return None
+        return snapshot.copy()
+
+
+def _public_player_snapshot(snapshot: Optional[dict]) -> Optional[dict]:
+    if not snapshot:
+        return None
+    return {
+        "item": snapshot.get("item"),
+        "context": snapshot.get("context"),
+        "captured_at": snapshot.get("captured_at"),
+        "shuffle_state": snapshot.get("shuffle_state", False),
+        "repeat_state": snapshot.get("repeat_state", "off"),
+    }
+
+
+_load_player_snapshots()
 
 
 def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
@@ -628,6 +758,7 @@ def public_node(node: dict) -> dict:
     data["channel_id"] = resolve_node_channel_id(node)
     if node.get("wifi"):
         data["wifi"] = node.get("wifi")
+    data["is_controller"] = bool(node.get("is_controller"))
     return data
 
 
@@ -1229,6 +1360,7 @@ def _register_node_internal(
         "snapclient_id": previous.get("snapclient_id"),
         "online": True,
         "offline_since": None,
+        "is_controller": bool(previous.get("is_controller")),
     }
     save_nodes()
     return nodes[node_id]
@@ -1237,6 +1369,13 @@ def _register_node_internal(
 def create_browser_node(name: str) -> dict:
     reg = NodeRegistration(id=str(uuid.uuid4()), name=name, url=f"browser:{uuid.uuid4()}")
     return public_node(_register_node_internal(reg))
+
+
+def _controller_node() -> Optional[dict]:
+    for node in nodes.values():
+        if node.get("is_controller"):
+            return node
+    return None
 
 
 async def _fetch_agent_fingerprint(url: str) -> Optional[str]:
@@ -1641,6 +1780,7 @@ async def _shutdown_events() -> None:
         except asyncio.CancelledError:
             pass
         spotify_refresh_task = None
+    await stop_local_agent()
 
 
 def current_spotify_creds(channel_id: Optional[str] = None) -> Tuple[str, str, str]:
@@ -1900,12 +2040,14 @@ async def snapcast_volume(client_id: str, payload: VolumePayload) -> dict:
         raise HTTPException(status_code=502, detail=str(exc))
 
 
-@app.post("/api/nodes/register")
-async def register_node(reg: NodeRegistration) -> dict:
+async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool = False) -> dict:
     normalized_url = _normalize_node_url(reg.url)
     reg.url = normalized_url
     fingerprint = reg.fingerprint or await _fetch_agent_fingerprint(normalized_url)
     node = _register_node_internal(reg, fingerprint=fingerprint, normalized_url=normalized_url)
+    if mark_controller:
+        node["is_controller"] = True
+        save_nodes()
     if node.get("type") == "agent":
         try:
             secret = await request_agent_secret(node, force=True)
@@ -1919,6 +2061,36 @@ async def register_node(reg: NodeRegistration) -> dict:
         save_nodes()
     await broadcast_nodes()
     return public_node(node)
+
+
+@app.post("/api/nodes/register")
+async def register_node(reg: NodeRegistration) -> dict:
+    return await _register_node_payload(reg)
+
+
+@app.post("/api/nodes/register-controller")
+async def register_controller_node(_: dict = Depends(require_admin)) -> dict:
+    existing = _controller_node()
+    if existing:
+        if existing.get("online") is False:
+            try:
+                await ensure_local_agent_running()
+                await refresh_agent_metadata(existing)
+            except Exception:
+                pass
+        return public_node(existing)
+    try:
+        await ensure_local_agent_running()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to start local agent: {exc}") from exc
+    name = f"{auth_state.get('server_name') or SERVER_DEFAULT_NAME}{LOCAL_AGENT_NAME_SUFFIX}"
+    reg = NodeRegistration(name=name, url=local_agent_url())
+    try:
+        return await _register_node_payload(reg, mark_controller=True)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 async def _call_agent(node: dict, path: str, payload: dict) -> dict:
@@ -2272,6 +2444,8 @@ async def unregister_node(node_id: str) -> dict:
     cancel_node_rediscovery(node_id)
     save_nodes()
     await broadcast_nodes()
+    if node.get("is_controller"):
+        await stop_local_agent()
     if node.get("type") == "browser":
         if webrtc_relay:
             await webrtc_relay.drop_session(node_id)
@@ -2816,7 +2990,11 @@ async def spotify_player_status(channel_id: Optional[str] = Query(default=None))
     token = _ensure_spotify_token(resolved)
     resp = await spotify_request("GET", "/me/player", token, resolved)
     if resp.status_code == 204:
-        return {"active": False}
+        snapshot = _public_player_snapshot(_get_player_snapshot(resolved))
+        payload: dict = {"active": False}
+        if snapshot:
+            payload["snapshot"] = snapshot
+        return payload
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     data = resp.json()
@@ -2825,7 +3003,7 @@ async def spotify_player_status(channel_id: Optional[str] = Query(default=None))
     preferred_names = [name.lower() for name in _preferred_roomcast_device_names(resolved)]
     device_name = (device.get("name") or "").strip().lower()
     is_roomcast_device = bool(device_name) and device_name in preferred_names
-    return {
+    payload = {
         "active": active,
         "is_playing": data.get("is_playing", False),
         "progress_ms": data.get("progress_ms"),
@@ -2836,6 +3014,13 @@ async def spotify_player_status(channel_id: Optional[str] = Query(default=None))
         "repeat_state": data.get("repeat_state", "off"),
         "context": data.get("context"),
     }
+    if is_roomcast_device and data.get("item"):
+        _set_player_snapshot(resolved, data)
+    if not active:
+        snapshot = _public_player_snapshot(_get_player_snapshot(resolved))
+        if snapshot:
+            payload["snapshot"] = snapshot
+    return payload
 
 
 @app.get("/api/spotify/player/queue")

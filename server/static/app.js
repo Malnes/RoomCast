@@ -10,6 +10,7 @@ const addNodeContainer = document.querySelector('[data-add-node-container]');
 const addNodeToggle = document.getElementById('add-node-button');
 const addNodeMenu = document.getElementById('add-node-menu');
 const addHardwareNodeBtn = document.getElementById('add-hardware-node');
+const addControllerNodeBtn = document.getElementById('add-controller-node');
 const createWebNodeBtn = document.getElementById('create-web-node');
 const saveSpotifyBtn = document.getElementById('save-spotify');
 const spClientId = document.getElementById('sp-client-id');
@@ -160,7 +161,7 @@ let lastCoverArtUrl = null;
 const PLAYLIST_PAGE_LIMIT = 50;
 const PLAYLIST_CACHE_TTL_MS = 60 * 60 * 1000;
 const PLAYLIST_TRACK_CACHE_TTL_MS = 60 * 60 * 1000;
-const PLAYER_SNAPSHOT_TTL_MS = 60 * 60 * 1000;
+const PLAYER_SNAPSHOT_TTL_MS = 24 * 60 * 60 * 1000;
 let playlistsCache = [];
 let playlistsCacheFetchedAt = 0;
 const playlistMetadataCache = new Map();
@@ -3089,6 +3090,28 @@ function setAddNodeMenuOpen(open) {
   addNodeToggle.setAttribute('aria-expanded', next ? 'true' : 'false');
 }
 
+async function registerControllerNode(btn) {
+  const target = btn || addControllerNodeBtn;
+  const originalLabel = target ? target.textContent : '';
+  if (target) {
+    target.disabled = true;
+    target.textContent = 'Adding…';
+  }
+  try {
+    const res = await fetch('/api/nodes/register-controller', { method: 'POST' });
+    await ensureOk(res);
+    showSuccess('Controller registered as a node.');
+    await fetchNodes({ force: true });
+  } catch (err) {
+    showError(`Failed to add server node: ${err.message}`);
+  } finally {
+    if (target) {
+      target.disabled = false;
+      target.textContent = originalLabel || 'Add server as node';
+    }
+  }
+}
+
 function setCollapsiblePanelState(panel, open) {
   if (!panel) return;
   const trigger = panel.querySelector('.collapsible-header');
@@ -5131,6 +5154,23 @@ function rememberPlayerSnapshot(status) {
   };
 }
 
+function hydrateServerSnapshot(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return null;
+  const item = snapshot.item;
+  if (!item || (!item.name && !item.uri)) return null;
+  const captured = typeof snapshot.captured_at === 'number'
+    ? snapshot.captured_at * 1000
+    : Date.now();
+  lastPlayerSnapshot = {
+    item,
+    context: snapshot.context || null,
+    capturedAt: captured,
+    shuffle_state: snapshot.shuffle_state ?? false,
+    repeat_state: snapshot.repeat_state ?? 'off',
+  };
+  return lastPlayerSnapshot;
+}
+
 function getPlayerSnapshot() {
   if (!lastPlayerSnapshot) return null;
   if (Date.now() - lastPlayerSnapshot.capturedAt > PLAYER_SNAPSHOT_TTL_MS) {
@@ -5215,20 +5255,22 @@ async function fetchPlayerStatus() {
     const res = await fetch(withChannel('/api/spotify/player/status', channelId));
     await ensureOk(res);
     playerStatus = await res.json();
-    if (!playerStatus?.active && !playerStatus?.item) {
-      const snapshot = getPlayerSnapshot();
-      if (snapshot) {
-        playerStatus = {
-          ...playerStatus,
-          item: snapshot.item,
-          context: snapshot.context,
-          shuffle_state: snapshot.shuffle_state,
-          repeat_state: snapshot.repeat_state,
-          allowResume: true,
-          idleMessage: 'Tap play to resume on RoomCast',
-          __fromSnapshot: true,
-        };
-      }
+    const serverSnapshot = hydrateServerSnapshot(playerStatus?.snapshot);
+    if (serverSnapshot) {
+      delete playerStatus.snapshot;
+    }
+    const cachedSnapshot = !playerStatus?.active ? getPlayerSnapshot() : null;
+    if (!playerStatus?.active && cachedSnapshot) {
+      playerStatus = {
+        ...playerStatus,
+        item: playerStatus?.item || cachedSnapshot.item,
+        context: playerStatus?.context || cachedSnapshot.context,
+        shuffle_state: playerStatus?.shuffle_state ?? cachedSnapshot.shuffle_state,
+        repeat_state: playerStatus?.repeat_state ?? cachedSnapshot.repeat_state,
+        allowResume: true,
+        idleMessage: playerStatus?.idleMessage || 'Tap play to resume on RoomCast',
+        __fromSnapshot: true,
+      };
     }
     renderPlayer(playerStatus);
     markSpotifyHealthy();
@@ -5887,6 +5929,12 @@ if (addHardwareNodeBtn) {
   addHardwareNodeBtn.addEventListener('click', () => {
     setAddNodeMenuOpen(false);
     openDiscover();
+  });
+}
+if (addControllerNodeBtn) {
+  addControllerNodeBtn.addEventListener('click', async () => {
+    setAddNodeMenuOpen(false);
+    await registerControllerNode(addControllerNodeBtn);
   });
 }
 if (createWebNodeBtn) {

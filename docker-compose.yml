@@ -11,8 +11,14 @@ x-librespot-base: &librespot-base
 
 services:
   controller:
-    build: ./server
+    build:
+      context: .
+      dockerfile: server/Dockerfile
     network_mode: host
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
     environment:
       SNAPSERVER_HOST: 127.0.0.1
       SNAPSERVER_PORT: 1780
