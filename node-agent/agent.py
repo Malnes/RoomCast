@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.19")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.20")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -310,14 +310,14 @@ def _wifi_signal_snapshot() -> dict | None:
         if not iface:
             continue
         fields = metrics.split()
-        if len(fields) < 2:
+        if len(fields) < 3:
             continue
         try:
-            quality = float(fields[0])
+            quality = float(fields[1])
         except ValueError:
             continue
         try:
-            signal_dbm = float(fields[1])
+            signal_dbm = float(fields[2])
         except ValueError:
             signal_dbm = None
         percent = max(0, min(100, int(round((quality / 70.0) * 100))))
