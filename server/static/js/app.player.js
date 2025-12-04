@@ -8,7 +8,6 @@ function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   const forceClear = options.forceClear === true;
   const snapshot = forceClear ? null : getPlayerSnapshot();
   if (snapshot) {
-    const resumeMessage = message === 'Player unavailable' ? 'Tap play to resume on RoomCast' : message;
     playerStatus = {
       active: false,
       is_playing: false,
@@ -19,7 +18,6 @@ function setPlayerIdleState(message = 'Player unavailable', options = {}) {
       shuffle_state: snapshot.shuffle_state,
       repeat_state: snapshot.repeat_state,
       allowResume: true,
-      idleMessage: resumeMessage,
       __fromSnapshot: true,
     };
     renderPlayer(playerStatus);
@@ -83,7 +81,6 @@ async function fetchSpotifyPlayerStatus(channelId) {
         shuffle_state: playerStatus?.shuffle_state ?? cachedSnapshot.shuffle_state,
         repeat_state: playerStatus?.repeat_state ?? cachedSnapshot.repeat_state,
         allowResume: true,
-        idleMessage: playerStatus?.idleMessage || 'Tap play to resume on RoomCast',
         __fromSnapshot: true,
       };
     }
@@ -213,6 +210,8 @@ function renderPlayer(status) {
   const active = !!status?.active;
   const resumeAvailable = !!status?.allowResume && !active;
   const showMeta = active || resumeAvailable;
+  const activeChannel = getActiveChannel();
+  const channelLabel = (status?.channel_name || activeChannel?.name || authState?.server_name || '').trim();
   updateActivePlaylistContext(status);
   updateTakeoverBanner(status);
   activeDeviceId = active && status?.device?.id ? status.device.id : null;
@@ -225,11 +224,13 @@ function renderPlayer(status) {
     ? item.artists.map(a => a?.name).filter(Boolean).join(', ')
     : (item.artists || '');
   if (showMeta) {
-    const resumeHint = resumeAvailable ? (status?.idleMessage || 'Tap play to resume on RoomCast') : '';
-    const artistLine = artistsRaw || resumeHint ? [artistsRaw || '—', resumeHint].filter(Boolean).join(' • ') : '';
-    playerArtist.textContent = artistLine || '—';
+    if (resumeAvailable && channelLabel) {
+      playerArtist.textContent = channelLabel;
+    } else {
+      playerArtist.textContent = artistsRaw || '—';
+    }
   } else {
-    playerArtist.textContent = '';
+    playerArtist.textContent = channelLabel || '';
   }
   const art = showMeta ? (item.album?.images?.[1]?.url || item.album?.images?.[0]?.url) : null;
   if (art) {
@@ -760,11 +761,6 @@ if (saveServerNameBtn) {
 openSettingsBtn.addEventListener('click', openSettings);
 closeSettingsBtn.addEventListener('click', closeSettings);
 closeDiscoverBtn.addEventListener('click', closeDiscover);
-if (coverArtBackgroundToggle) {
-  coverArtBackgroundToggle.addEventListener('change', () => {
-    setCoverArtBackgroundEnabled(coverArtBackgroundToggle.checked);
-  });
-}
 if (logoutButton) {
   logoutButton.addEventListener('click', async () => {
     logoutButton.disabled = true;

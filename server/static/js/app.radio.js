@@ -1555,29 +1555,16 @@ function collapseAllPanels() {
 
 function applyCoverArtBackground() {
   if (!coverArtBackdrop) return;
-  if (useCoverArtBackground && lastCoverArtUrl) {
+  if (lastCoverArtUrl) {
     const safeUrl = lastCoverArtUrl.replace(/"/g, '\"');
     coverArtBackdrop.style.backgroundImage = `${COVER_ART_BACKDROP_OVERLAY}, url("${safeUrl}")`;
   } else {
     coverArtBackdrop.style.backgroundImage = '';
   }
-  document.body.classList.toggle('use-cover-art-background', useCoverArtBackground && !!lastCoverArtUrl);
-}
-
-function setCoverArtBackgroundEnabled(enabled) {
-  const next = !!enabled;
-  if (useCoverArtBackground === next) {
-    applyCoverArtBackground();
-    return;
-  }
-  useCoverArtBackground = next;
-  applyCoverArtBackground();
+  document.body.classList.toggle('use-cover-art-background', !!lastCoverArtUrl);
 }
 
 function syncGeneralSettingsUI() {
-  if (coverArtBackgroundToggle) {
-    coverArtBackgroundToggle.checked = useCoverArtBackground;
-  }
   if (serverNameInput && document.activeElement !== serverNameInput) {
     serverNameInput.value = authState?.server_name || 'RoomCast';
   }

@@ -240,14 +240,57 @@ function registerRoomcastServiceWorker() {
     });
 }
 
+let takeoverBannerPositionFrame = null;
+
+function positionTakeoverBanner() {
+  if (!takeoverBanner || takeoverBanner.hidden || !playerPanel) return;
+  const actionRect = headerActions?.getBoundingClientRect() || appHeader?.getBoundingClientRect();
+  const playerRect = playerPanel.getBoundingClientRect();
+  const topAnchor = actionRect?.bottom ?? 80;
+  const playerTop = Number.isFinite(playerRect?.top) ? playerRect.top : (window.innerHeight - 220);
+  const gap = Math.max(0, playerTop - topAnchor);
+  const midpoint = topAnchor + gap / 2;
+  const minTop = topAnchor + 24;
+  const maxTop = playerTop - 24;
+  let targetTop = midpoint;
+  if (Number.isFinite(minTop) && Number.isFinite(maxTop)) {
+    if (minTop > maxTop) {
+      targetTop = playerTop - 32;
+    } else {
+      targetTop = Math.min(Math.max(targetTop, minTop), maxTop);
+    }
+  }
+  const clamped = Number.isFinite(targetTop) ? targetTop : (playerTop - 120);
+  takeoverBanner.style.top = `${Math.max(80, clamped)}px`;
+}
+
+function scheduleTakeoverBannerPosition() {
+  if (!takeoverBanner || takeoverBanner.hidden) return;
+  if (takeoverBannerPositionFrame) {
+    cancelAnimationFrame(takeoverBannerPositionFrame);
+  }
+  takeoverBannerPositionFrame = requestAnimationFrame(() => {
+    takeoverBannerPositionFrame = null;
+    positionTakeoverBanner();
+  });
+}
+
+window.addEventListener('resize', scheduleTakeoverBannerPosition, { passive: true });
+window.addEventListener('scroll', scheduleTakeoverBannerPosition, { passive: true });
+
 function setTakeoverBannerVisible(visible, message) {
   if (!takeoverBanner) return;
   const next = !!visible;
   takeoverBanner.classList.toggle('is-visible', next);
   takeoverBanner.hidden = !next;
   takeoverBanner.setAttribute('aria-hidden', next ? 'false' : 'true');
-  if (next && takeoverMessage && message) {
-    takeoverMessage.textContent = message;
+  if (next) {
+    if (takeoverMessage && message) {
+      takeoverMessage.textContent = message;
+    }
+    scheduleTakeoverBannerPosition();
+  } else {
+    takeoverBanner.style.top = '';
   }
 }
 
