@@ -102,6 +102,11 @@ const radioResultsStatus = document.getElementById('radio-results-status');
 const radioResultsList = document.getElementById('radio-results-list');
 const radioModalChannelName = document.getElementById('radio-modal-channel-name');
 const radioModalSubtitle = document.getElementById('radio-modal-subtitle');
+const confirmOverlay = document.getElementById('confirm-overlay');
+const confirmModalTitle = document.getElementById('confirm-modal-title');
+const confirmModalMessage = document.getElementById('confirm-modal-message');
+const confirmModalCancel = document.getElementById('confirm-modal-cancel');
+const confirmModalAccept = document.getElementById('confirm-modal-accept');
 const DEFAULT_CHANNEL_COLOR = '#22c55e';
 const WIFI_SIGNAL_THRESHOLDS = [
   { min: 75, bars: 4, label: 'Excellent signal' },
@@ -109,6 +114,27 @@ const WIFI_SIGNAL_THRESHOLDS = [
   { min: 35, bars: 2, label: 'Fair signal' },
   { min: 15, bars: 1, label: 'Weak signal' },
 ];
+const ACTIVE_CHANNEL_STORAGE_KEY = 'roomcast-active-channel';
+
+function readStoredActiveChannelId() {
+  try {
+    return localStorage.getItem(ACTIVE_CHANNEL_STORAGE_KEY) || null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function persistActiveChannelPreference(channelId) {
+  try {
+    if (channelId) {
+      localStorage.setItem(ACTIVE_CHANNEL_STORAGE_KEY, channelId);
+    } else {
+      localStorage.removeItem(ACTIVE_CHANNEL_STORAGE_KEY);
+    }
+  } catch (_) {
+    /* storage unavailable */
+  }
+}
 if (playerPanel) {
   playerPanel.addEventListener('pointerdown', handleCarouselPointerDown);
   playerPanel.addEventListener('pointermove', handleCarouselPointerMove);
@@ -168,7 +194,7 @@ let playerTick = null;
 let discoverAbortController = null;
 let discoverResultsCount = 0;
 let channelsCache = [];
-let activeChannelId = null;
+let activeChannelId = readStoredActiveChannelId();
 let channelFetchPromise = null;
 let spotifySettingsChannelId = null;
 const channelPendingEdits = new Map();
@@ -178,6 +204,8 @@ let nodeSettingsContent = null;
 let nodeSettingsTitle = null;
 let nodeSettingsNodeId = null;
 let lastCoverArtUrl = null;
+let confirmDialogResolver = null;
+let confirmDialogPreviousFocus = null;
 const PLAYLIST_PAGE_LIMIT = 50;
 const PLAYLIST_CACHE_TTL_MS = 60 * 60 * 1000;
 const PLAYLIST_TRACK_CACHE_TTL_MS = 60 * 60 * 1000;
@@ -530,7 +558,9 @@ function showError(msg) {
 }
 
 function showSuccess(msg) {
-  enqueueToast(successEl, msg, 3000);
+  if (msg) {
+    console.debug('Success:', msg);
+  }
 }
 
 function getErrorMessage(err) {
@@ -573,6 +603,87 @@ function showPersistentAlert(message, options = {}) {
   persistentAlertEl.hidden = false;
   persistentAlertEl.setAttribute('aria-hidden', 'false');
   persistentAlertState = { key, message };
+}
+
+function hideConfirmDialogOverlay() {
+  if (!confirmOverlay) return;
+  confirmOverlay.classList.remove('is-visible');
+  confirmOverlay.style.display = 'none';
+  confirmOverlay.hidden = true;
+  confirmOverlay.setAttribute('aria-hidden', 'true');
+  document.removeEventListener('keydown', handleConfirmDialogKeydown, true);
+  if (confirmDialogPreviousFocus?.focus) {
+    confirmDialogPreviousFocus.focus();
+  }
+  confirmDialogPreviousFocus = null;
+}
+
+function settleConfirmDialog(result) {
+  if (typeof confirmDialogResolver === 'function') {
+    confirmDialogResolver(result);
+    confirmDialogResolver = null;
+  }
+}
+
+function closeConfirmDialog(result = false) {
+  hideConfirmDialogOverlay();
+  settleConfirmDialog(result);
+}
+
+function handleConfirmDialogKeydown(event) {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    closeConfirmDialog(false);
+  }
+}
+
+function openConfirmDialog(options = {}) {
+  if (!confirmOverlay || !confirmModalTitle || !confirmModalMessage || !confirmModalAccept || !confirmModalCancel) {
+    const fallbackMessage = options.message || options.title || 'Are you sure?';
+    const confirmed = window.confirm(fallbackMessage || 'Are you sure?');
+    return Promise.resolve(confirmed);
+  }
+  if (confirmDialogResolver) {
+    closeConfirmDialog(false);
+  }
+  const {
+    title = 'Are you sure?',
+    message = '',
+    confirmLabel = 'Confirm',
+    cancelLabel = 'Cancel',
+    tone = 'default',
+  } = options;
+  confirmModalTitle.textContent = title;
+  confirmModalMessage.textContent = message;
+  confirmModalAccept.textContent = confirmLabel;
+  confirmModalCancel.textContent = cancelLabel;
+  confirmModalAccept.classList.toggle('danger-btn', tone === 'danger');
+  confirmOverlay.hidden = false;
+  confirmOverlay.style.display = 'flex';
+  confirmOverlay.setAttribute('aria-hidden', 'false');
+  requestAnimationFrame(() => confirmOverlay.classList.add('is-visible'));
+  confirmDialogPreviousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  document.addEventListener('keydown', handleConfirmDialogKeydown, true);
+  return new Promise(resolve => {
+    confirmDialogResolver = resolve;
+    setTimeout(() => {
+      confirmModalAccept.focus();
+    }, 30);
+  });
+}
+
+if (confirmOverlay) {
+  confirmOverlay.addEventListener('click', event => {
+    if (event.target === confirmOverlay) {
+      closeConfirmDialog(false);
+    }
+  });
+}
+if (confirmModalCancel) {
+  confirmModalCancel.addEventListener('click', () => closeConfirmDialog(false));
+}
+if (confirmModalAccept) {
+  confirmModalAccept.addEventListener('click', () => closeConfirmDialog(true));
 }
 
 function hidePersistentAlert() {
@@ -715,10 +826,6 @@ function getChannelAccentColor(channelId) {
 
 function getNodeChannelAccent(node) {
   if (!node) return DEFAULT_CHANNEL_COLOR;
-  if (node.type === 'browser') {
-    const activeColor = getActiveChannel()?.color;
-    return normalizeChannelColorInput(activeColor) || DEFAULT_CHANNEL_COLOR;
-  }
   const resolvedId = resolveNodeChannelId(node);
   return getChannelAccentColor(resolvedId) || DEFAULT_CHANNEL_COLOR;
 }
@@ -917,6 +1024,7 @@ function setActiveChannel(channelId, options = {}) {
   if (!targetChannel || !isChannelEnabled(targetChannel)) return;
   const previous = activeChannelId;
   activeChannelId = channelId;
+  persistActiveChannelPreference(activeChannelId);
   if (previous && options.animate !== false) {
     const direction = resolveChannelSwipeDirection(previous, channelId, options.direction);
     if (direction) {

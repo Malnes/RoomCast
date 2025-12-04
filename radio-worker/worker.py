@@ -123,6 +123,7 @@ class ChannelRunner:
         cmd = [
             FFMPEG_BIN,
             "-nostdin",
+            "-y",
             "-hide_banner",
             "-loglevel",
             os.getenv("FFMPEG_LOG_LEVEL", "warning"),

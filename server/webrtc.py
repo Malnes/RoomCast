@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import math
+import time
 from array import array
 from dataclasses import dataclass
 from fractions import Fraction
@@ -13,13 +14,17 @@ from aiortc.mediastreams import MediaStreamTrack
 
 log = logging.getLogger("roomcast.webrtc")
 
-SAMPLE_RATE = 48000
 BYTES_PER_SAMPLE = 2
 CHANNELS = 2
-SAMPLE_WIDTH = CHANNELS * BYTES_PER_SAMPLE
+SAMPLE_FORMAT = "16"
 FRAME_DURATION_MS = 20
-FRAME_SAMPLES = SAMPLE_RATE * FRAME_DURATION_MS // 1000
-FRAME_BYTES = FRAME_SAMPLES * SAMPLE_WIDTH
+SAMPLE_WIDTH = CHANNELS * BYTES_PER_SAMPLE
+
+def _frame_samples(sample_rate: int) -> int:
+    return sample_rate * FRAME_DURATION_MS // 1000
+
+def _frame_bytes(sample_rate: int) -> int:
+    return _frame_samples(sample_rate) * SAMPLE_WIDTH
 
 
 def _clamp_sample(value: int) -> int:
@@ -79,15 +84,26 @@ class SnapclientPump:
         port: int,
         broadcaster: AudioBroadcaster,
         latency_ms: int = 150,
+        sample_rate: int = 44100,
+        *,
+        client_id: Optional[str] = None,
+        stream_id: Optional[str] = None,
+        assign_stream: Optional[Callable[[str, str], Awaitable[None]]] = None,
     ) -> None:
         self.host = host
         self.port = port
         self.latency_ms = latency_ms
         self.broadcaster = broadcaster
+        self.sample_rate = max(8000, min(192000, int(sample_rate)))
+        self.client_id = client_id
+        self.stream_id = stream_id
+        self._assign_stream_cb = assign_stream
         self._task: Optional[asyncio.Task[None]] = None
         self._stop = asyncio.Event()
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._buffer = bytearray()
+        self._frame_bytes = _frame_bytes(self.sample_rate)
+        self._assign_task: Optional[asyncio.Task[None]] = None
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -107,6 +123,9 @@ class SnapclientPump:
         if self._task:
             await self._task
             self._task = None
+        if self._assign_task and not self._assign_task.done():
+            self._assign_task.cancel()
+        self._assign_task = None
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -121,6 +140,13 @@ class SnapclientPump:
                     await asyncio.sleep(2)
 
     async def _spawn(self) -> None:
+        channel_arg = "*"
+        if self.stream_id and ":" in self.stream_id:
+            _, _, chan_info = self.stream_id.partition(":")
+            channel_hint = chan_info.split(".")[-1]
+            if channel_hint.isdigit():
+                channel_arg = channel_hint
+
         args = [
             "snapclient",
             "-h",
@@ -130,7 +156,7 @@ class SnapclientPump:
             "--player",
             "file:filename=stdout",
             "--sampleformat",
-            f"{SAMPLE_RATE}:16:*",
+            f"{self.sample_rate}:{SAMPLE_FORMAT}:{channel_arg}",
             "--latency",
             str(self.latency_ms),
             "--logsink",
@@ -138,6 +164,8 @@ class SnapclientPump:
             "--logfilter",
             "*:warn",
         ]
+        if self.client_id:
+            args.extend(["--hostID", self.client_id])
         log.info("Starting snapclient pipe: %s", " ".join(args))
         self._proc = await asyncio.create_subprocess_exec(
             *args,
@@ -146,6 +174,39 @@ class SnapclientPump:
         )
         asyncio.create_task(self._log_stderr(self._proc.stderr))
         self._buffer.clear()
+        self._schedule_stream_assignment()
+
+    async def update_stream(self, stream_id: str) -> None:
+        if not stream_id or stream_id == self.stream_id:
+            self.stream_id = stream_id
+            return
+        self.stream_id = stream_id
+        self._schedule_stream_assignment()
+
+    def _schedule_stream_assignment(self) -> None:
+        if not self._assign_stream_cb or not self.client_id or not self.stream_id:
+            return
+        if self._assign_task and not self._assign_task.done():
+            self._assign_task.cancel()
+
+        async def _runner() -> None:
+            deadline = time.time() + 15
+            delay = 0.5
+            while not self._stop.is_set() and time.time() < deadline:
+                try:
+                    await self._assign_stream_cb(self.client_id, self.stream_id)  # type: ignore[arg-type]
+                    return
+                except Exception as exc:  # pragma: no cover - defensive logging
+                    log.warning(
+                        "Failed to assign snapclient %s to %s: %s",
+                        self.client_id,
+                        self.stream_id,
+                        exc,
+                    )
+                await asyncio.sleep(delay)
+                delay = min(delay * 1.5, 5)
+
+        self._assign_task = asyncio.create_task(_runner())
 
     async def _read_stdout(self) -> None:
         assert self._proc and self._proc.stdout
@@ -160,9 +221,9 @@ class SnapclientPump:
         await self._drain_buffer()
 
     async def _drain_buffer(self) -> None:
-        while len(self._buffer) >= FRAME_BYTES:
-            payload = bytes(self._buffer[:FRAME_BYTES])
-            del self._buffer[:FRAME_BYTES]
+        while len(self._buffer) >= self._frame_bytes:
+            payload = bytes(self._buffer[:self._frame_bytes])
+            del self._buffer[:self._frame_bytes]
             await self.broadcaster.publish(payload)
 
     async def _cleanup_proc(self) -> None:
@@ -185,20 +246,30 @@ class SnapclientPump:
 class WebAudioTrack(MediaStreamTrack):
     kind = "audio"
 
-    def __init__(self, broadcaster: AudioBroadcaster, pan: float = 0.0) -> None:
+    def __init__(self, relay: "WebAudioRelay", sample_rate: int, channel_id: str, pan: float = 0.0) -> None:
         super().__init__()
-        self._broadcaster = broadcaster
+        self._relay = relay
         self._queue: Optional[asyncio.Queue[bytes]] = None
         self._samples_sent = 0
         self._pan = float(pan)
+        self._sample_rate = max(8000, min(192000, int(sample_rate)))
+        self._channel_id = channel_id
 
     async def _ensure_queue(self) -> asyncio.Queue[bytes]:
         if not self._queue:
-            self._queue = await self._broadcaster.subscribe()
+            self._queue = await self._relay._subscribe_channel(self._channel_id)
         return self._queue
 
     def set_pan(self, pan: float) -> None:
         self._pan = max(-1.0, min(1.0, pan))
+
+    async def set_channel(self, channel_id: str) -> None:
+        if channel_id == self._channel_id:
+            return
+        if self._queue:
+            await self._relay._unsubscribe_channel(self._channel_id, self._queue)
+            self._queue = None
+        self._channel_id = channel_id
 
     async def recv(self) -> av.AudioFrame:
         queue = await self._ensure_queue()
@@ -207,8 +278,8 @@ class WebAudioTrack(MediaStreamTrack):
         samples = len(chunk) // SAMPLE_WIDTH
         frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
         frame.planes[0].update(chunk)
-        frame.sample_rate = SAMPLE_RATE
-        frame.time_base = Fraction(1, SAMPLE_RATE)
+        frame.sample_rate = self._sample_rate
+        frame.time_base = Fraction(1, self._sample_rate)
         frame.pts = self._samples_sent
         self._samples_sent += samples
         return frame
@@ -232,7 +303,7 @@ class WebAudioTrack(MediaStreamTrack):
 
     async def shutdown(self) -> None:
         if self._queue:
-            await self._broadcaster.unsubscribe(self._queue)
+            await self._relay._unsubscribe_channel(self._channel_id, self._queue)
             self._queue = None
 
     def stop(self) -> None:
@@ -244,6 +315,8 @@ class WebNodeSession:
     node_id: str
     pc: RTCPeerConnection
     track: WebAudioTrack
+    sample_rate: int
+    channel_id: str
 
     async def accept(self, sdp: str, sdp_type: str) -> RTCSessionDescription:
         offer = RTCSessionDescription(sdp=sdp, type=sdp_type)
@@ -292,7 +365,7 @@ class WebNodeSession:
                         "stereo": "1",
                         "sprop-stereo": "1",
                         "maxaveragebitrate": "256000",
-                        "maxplaybackrate": str(SAMPLE_RATE),
+                        "maxplaybackrate": str(self.sample_rate),
                         "ptime": str(FRAME_DURATION_MS),
                         "minptime": "10",
                         "useinbandfec": params.get("useinbandfec", "1"),
@@ -308,7 +381,7 @@ class WebNodeSession:
                     "stereo": "1",
                     "sprop-stereo": "1",
                     "maxaveragebitrate": "256000",
-                    "maxplaybackrate": str(SAMPLE_RATE),
+                    "maxplaybackrate": str(self.sample_rate),
                     "ptime": str(FRAME_DURATION_MS),
                     "minptime": "10",
                     "useinbandfec": "1",
@@ -350,6 +423,15 @@ class WebNodeSession:
         return None
 
 
+@dataclass
+class ChannelSource:
+    channel_id: str
+    stream_id: str
+    broadcaster: AudioBroadcaster
+    pump: SnapclientPump
+    ref_count: int = 0
+
+
 class WebAudioRelay:
     def __init__(
         self,
@@ -357,32 +439,51 @@ class WebAudioRelay:
         snap_port: int,
         *,
         latency_ms: int = 150,
+        sample_rate: int = 44100,
+        client_prefix: str = "roomcast-webrtc",
+        channel_idle_timeout: float = 10.0,
+        assign_stream: Optional[Callable[[str, str], Awaitable[None]]] = None,
         on_session_closed: Optional[Callable[[str], Awaitable[None]]] = None,
     ) -> None:
-        self._broadcaster = AudioBroadcaster()
-        self._pump = SnapclientPump(snap_host, snap_port, self._broadcaster, latency_ms)
+        self._sample_rate = max(8000, min(192000, int(sample_rate)))
         self._sessions: Dict[str, WebNodeSession] = {}
         self._on_session_closed = on_session_closed
         self._rtc_config = RTCConfiguration(iceServers=[RTCIceServer("stun:stun.l.google.com:19302")])
         self._lock = asyncio.Lock()
+        self._snap_host = snap_host
+        self._snap_port = snap_port
+        self._latency_ms = latency_ms
+        self._client_prefix = client_prefix
+        self._channel_idle_timeout = max(1.0, float(channel_idle_timeout))
+        self._assign_stream_cb = assign_stream
+        self._channel_sources: Dict[str, ChannelSource] = {}
+        self._channel_stop_tasks: Dict[str, asyncio.Task[None]] = {}
 
     async def start(self) -> None:
-        await self._pump.start()
+        return
 
     async def stop(self) -> None:
         async with self._lock:
             sessions = list(self._sessions.values())
             self._sessions.clear()
+            channels = list(self._channel_sources.items())
+            self._channel_sources.clear()
+            stop_tasks = list(self._channel_stop_tasks.values())
+            self._channel_stop_tasks.clear()
+        for task in stop_tasks:
+            task.cancel()
         for session in sessions:
             await session.close()
-        await self._pump.stop()
+        for _, source in channels:
+            await source.pump.stop()
 
-    async def create_session(self, node_id: str, pan: float = 0.0) -> WebNodeSession:
+    async def create_session(self, node_id: str, channel_id: str, stream_id: str, pan: float = 0.0) -> WebNodeSession:
+        await self._ensure_channel_source(channel_id, stream_id)
         async with self._lock:
             existing = self._sessions.get(node_id)
             if existing:
                 await existing.close()
-            track = WebAudioTrack(self._broadcaster, pan=pan)
+            track = WebAudioTrack(self, sample_rate=self._sample_rate, channel_id=channel_id, pan=pan)
             pc = RTCPeerConnection(configuration=self._rtc_config)
             sender = pc.addTrack(track)
             params = None
@@ -397,7 +498,13 @@ class WebAudioRelay:
                     await sender.setParameters(params)
                 except Exception:  # pragma: no cover - defensive for older aiortc
                     log.warning("Failed to set sender parameters; continuing with defaults")
-            session = WebNodeSession(node_id=node_id, pc=pc, track=track)
+            session = WebNodeSession(
+                node_id=node_id,
+                pc=pc,
+                track=track,
+                sample_rate=self._sample_rate,
+                channel_id=channel_id,
+            )
             self._sessions[node_id] = session
 
             @pc.on("connectionstatechange")
@@ -409,6 +516,19 @@ class WebAudioRelay:
 
     async def drop_session(self, node_id: str) -> None:
         await self._handle_session_closed(node_id)
+
+    async def update_session_channel(self, node_id: str, channel_id: str, stream_id: str) -> None:
+        await self._ensure_channel_source(channel_id, stream_id)
+        async with self._lock:
+            session = self._sessions.get(node_id)
+        if not session:
+            return
+        if session.channel_id == channel_id:
+            return
+        await session.track.set_channel(channel_id)
+        async with self._lock:
+            if self._sessions.get(node_id) is session:
+                session.channel_id = channel_id
 
     async def set_pan(self, node_id: str, pan: float) -> None:
         async with self._lock:
@@ -424,3 +544,78 @@ class WebAudioRelay:
         await session.close()
         if self._on_session_closed:
             await self._on_session_closed(node_id)
+
+    def _client_id_for_channel(self, channel_id: str) -> str:
+        return f"{self._client_prefix}-{channel_id}"
+
+    async def _ensure_channel_source(self, channel_id: str, stream_id: str) -> ChannelSource:
+        to_start: Optional[SnapclientPump] = None
+        to_update: Optional[SnapclientPump] = None
+        async with self._lock:
+            source = self._channel_sources.get(channel_id)
+            if source:
+                if stream_id and stream_id != source.stream_id:
+                    source.stream_id = stream_id
+                    to_update = source.pump
+            else:
+                broadcaster = AudioBroadcaster()
+                client_id = self._client_id_for_channel(channel_id)
+                pump = SnapclientPump(
+                    self._snap_host,
+                    self._snap_port,
+                    broadcaster,
+                    self._latency_ms,
+                    sample_rate=self._sample_rate,
+                    client_id=client_id,
+                    stream_id=stream_id,
+                    assign_stream=self._assign_stream_cb,
+                )
+                source = ChannelSource(channel_id=channel_id, stream_id=stream_id, broadcaster=broadcaster, pump=pump)
+                self._channel_sources[channel_id] = source
+                to_start = pump
+        if to_update:
+            await to_update.update_stream(stream_id)
+        if to_start:
+            await to_start.start()
+        async with self._lock:
+            return self._channel_sources[channel_id]
+
+    async def _subscribe_channel(self, channel_id: str) -> asyncio.Queue[bytes]:
+        async with self._lock:
+            source = self._channel_sources.get(channel_id)
+            if not source:
+                raise RuntimeError(f"Channel {channel_id} not initialized")
+            source.ref_count += 1
+            stop_task = self._channel_stop_tasks.pop(channel_id, None)
+        if stop_task:
+            stop_task.cancel()
+        return await source.broadcaster.subscribe()
+
+    async def _unsubscribe_channel(self, channel_id: str, queue: asyncio.Queue[bytes]) -> None:
+        async with self._lock:
+            source = self._channel_sources.get(channel_id)
+            if not source:
+                return
+            source.ref_count = max(0, source.ref_count - 1)
+            should_stop = source.ref_count == 0
+        await source.broadcaster.unsubscribe(queue)
+        if should_stop:
+            self._schedule_channel_stop(channel_id)
+
+    def _schedule_channel_stop(self, channel_id: str) -> None:
+        if channel_id in self._channel_stop_tasks:
+            return
+
+        async def _delayed_stop() -> None:
+            try:
+                await asyncio.sleep(self._channel_idle_timeout)
+                async with self._lock:
+                    source = self._channel_sources.get(channel_id)
+                    if not source or source.ref_count > 0:
+                        return
+                    self._channel_sources.pop(channel_id, None)
+                await source.pump.stop()
+            finally:
+                self._channel_stop_tasks.pop(channel_id, None)
+
+        self._channel_stop_tasks[channel_id] = asyncio.create_task(_delayed_stop())

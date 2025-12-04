@@ -224,22 +224,6 @@ async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
   }
 }
 
-async function setNodePan(nodeId, pan) {
-  const clamped = Math.max(-1, Math.min(1, Number(pan)));
-  try {
-    const res = await fetch(`/api/nodes/${nodeId}/pan`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ pan: clamped }),
-    });
-    await ensureOk(res);
-    showSuccess('Web node pan updated');
-  } catch (err) {
-    showError(`Failed to set pan: ${err.message}`);
-    throw err;
-  }
-}
-
 async function toggleMute(nodeId, btn) {
   const currentlyMuted = btn.dataset.muted === 'true';
   btn.disabled = true;

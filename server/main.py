@@ -4,6 +4,7 @@ import ipaddress
 import logging
 import os
 import secrets
+import socket
 import string
 import subprocess
 import threading
@@ -55,6 +56,7 @@ TOKEN_SIGNER = URLSafeSerializer(os.getenv("SPOTIFY_STATE_SECRET", "changeme"))
 NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
+WEBRTC_SAMPLE_RATE = int(os.getenv("WEBRTC_SAMPLE_RATE", "44100"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
 TRANSIENT_NODE_FIELDS = {"wifi"}
 AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.21").strip()
@@ -718,10 +720,6 @@ class EqPayload(BaseModel):
     preset: Optional[str] = None
     bands: list[EqBand] = Field(default_factory=list)
     band_count: int = Field(default=15, ge=1, le=31)
-
-
-class PanPayload(BaseModel):
-    pan: float = Field(ge=-1.0, le=1.0)
 
 
 class OutputSelectionPayload(BaseModel):
@@ -1585,33 +1583,88 @@ def _node_host_from_url(url: Optional[str]) -> Optional[str]:
     return parsed.hostname
 
 
+def _node_host_aliases(node_host: Optional[str]) -> set[str]:
+    aliases: set[str] = set()
+    if not node_host:
+        return aliases
+    host = node_host.strip()
+    if not host:
+        return aliases
+    normalized = host.lower()
+    aliases.add(normalized)
+    if normalized.startswith("[") and normalized.endswith("]"):
+        aliases.add(normalized[1:-1])
+    if ":" in normalized and normalized.count(":") > 1 and not normalized.startswith("["):
+        # Likely IPv6 without brackets; add raw form for matching
+        aliases.add(normalized)
+    if "." in normalized:
+        short = normalized.split(".", 1)[0]
+        if short:
+            aliases.add(short)
+    try:
+        resolved = socket.gethostbyname(host.strip("[]"))
+    except (socket.gaierror, UnicodeError):
+        resolved = None
+    if resolved:
+        aliases.add(resolved.strip().lower())
+    return {value for value in aliases if value}
+
+
 def _match_snapclient_for_node(node: dict, clients: list[dict]) -> Optional[dict]:
     if not clients:
         return None
+    fallback: Optional[dict] = None
+
+    def _consider(candidate: dict) -> Optional[dict]:
+        nonlocal fallback
+        if candidate.get("connected"):
+            return candidate
+        if fallback is None:
+            fallback = candidate
+        return None
+
     stored_id = (node.get("snapclient_id") or "").strip()
     if stored_id:
         for client in clients:
-            if client.get("id") == stored_id:
-                return client
+            if (client.get("id") or "").strip() == stored_id:
+                match = _consider(client)
+                if match:
+                    return match
     fingerprint = (node.get("fingerprint") or "").strip()
     if fingerprint:
         for client in clients:
-            if client.get("id") == fingerprint:
-                return client
-    node_host = _node_host_from_url(node.get("url"))
-    if node_host:
+            if (client.get("id") or "").strip() == fingerprint:
+                match = _consider(client)
+                if match:
+                    return match
+    host_aliases = _node_host_aliases(_node_host_from_url(node.get("url")))
+    if host_aliases:
         for client in clients:
             host = client.get("host") or {}
-            if host.get("ip") == node_host or host.get("name") == node_host:
-                return client
+            client_matches: set[str] = set()
+            name = (host.get("name") or "").strip().lower()
+            if name:
+                client_matches.add(name)
+                if "." in name:
+                    client_matches.add(name.split(".", 1)[0])
+            ip = (host.get("ip") or "").strip().lower()
+            if ip:
+                client_matches.add(ip)
+            if not (client_matches & host_aliases):
+                continue
+            match = _consider(client)
+            if match:
+                return match
     node_name = (node.get("name") or "").strip().lower()
     if node_name:
         for client in clients:
             config = client.get("config") or {}
             client_name = (config.get("name") or "").strip().lower()
             if client_name and client_name == node_name:
-                return client
-    return None
+                match = _consider(client)
+                if match:
+                    return match
+    return fallback
 
 
 def _register_node_internal(
@@ -1657,7 +1710,6 @@ def _register_node_internal(
         "url": normalized,
         "last_seen": now,
         "type": node_type,
-        "pan": previous.get("pan", 0.0),
         "eq": default_eq_state(),
         "agent_secret": previous.get("agent_secret"),
         "audio_configured": True if node_type == "browser" else previous.get("audio_configured", False),
@@ -1976,7 +2028,7 @@ def load_nodes() -> None:
         nodes = {}
         for item in data:
             item = dict(item)
-            item.setdefault("pan", 0.0)
+            item.pop("pan", None)
             eq = item.get("eq") or default_eq_state()
             eq.setdefault("bands", [])
             eq.setdefault("band_count", len(eq["bands"]) or 15)
@@ -2065,6 +2117,8 @@ async def _startup_events() -> None:
             snap_host=SNAPSERVER_HOST,
             snap_port=SNAPCLIENT_PORT,
             latency_ms=WEBRTC_LATENCY_MS,
+            sample_rate=WEBRTC_SAMPLE_RATE,
+            assign_stream=_assign_webrtc_stream,
             on_session_closed=_handle_webrtc_session_closed,
         )
         await webrtc_relay.start()
@@ -2432,6 +2486,15 @@ async def _get_agent(node: dict, path: str) -> dict:
     return resp.json()
 
 
+async def _assign_webrtc_stream(client_id: str, stream_id: str) -> None:
+    if not client_id or not stream_id:
+        return
+    try:
+        await snapcast.set_client_stream(client_id, stream_id)
+    except Exception as exc:  # pragma: no cover - network dependency
+        log.warning("Failed to assign web relay client %s to %s: %s", client_id, stream_id, exc)
+
+
 async def _ensure_snapclient_stream(node: dict, channel: dict) -> str:
     if node.get("type") != "agent":
         raise HTTPException(status_code=400, detail="Channel assignment only applies to hardware nodes")
@@ -2443,6 +2506,8 @@ async def _ensure_snapclient_stream(node: dict, channel: dict) -> str:
     client = _match_snapclient_for_node(node, clients)
     if not client:
         raise HTTPException(status_code=409, detail="Snapclient for this node is offline or unidentified")
+    if not client.get("connected"):
+        raise HTTPException(status_code=409, detail="Snapclient for this node is offline")
     stream_id = channel.get("snap_stream")
     if not stream_id:
         raise HTTPException(status_code=400, detail="Channel is missing snap_stream mapping")
@@ -2475,9 +2540,14 @@ async def _set_node_channel(node: dict, channel_id: str) -> None:
     if resolved == current:
         return
     channel = channels_by_id[resolved]
+    stream_id = channel.get("snap_stream")
+    if not stream_id:
+        raise HTTPException(status_code=400, detail="Channel is missing snap_stream mapping")
     if node.get("type") == "agent":
         client_id = await _ensure_snapclient_stream(node, channel)
         node["snapclient_id"] = client_id
+    elif node.get("type") == "browser" and webrtc_relay:
+        await webrtc_relay.update_session_channel(node["id"], resolved, stream_id)
     node["channel_id"] = resolved
 
 
@@ -2571,21 +2641,6 @@ async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
         result = await _call_agent(node, "/eq", eq_data)
     await broadcast_nodes()
     return {"ok": True, "result": result}
-
-
-@app.post("/api/nodes/{node_id}/pan")
-async def set_node_pan(node_id: str, payload: PanPayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") != "browser":
-        raise HTTPException(status_code=400, detail="Pan is only supported for web nodes")
-    node["pan"] = payload.pan
-    save_nodes()
-    if webrtc_relay:
-        await webrtc_relay.set_pan(node_id, payload.pan)
-    await broadcast_nodes()
-    return {"ok": True, "pan": payload.pan}
 
 
 @app.post("/api/nodes/{node_id}/pair")
@@ -2800,8 +2855,14 @@ async def web_node_session(payload: WebNodeOffer) -> dict:
         raise HTTPException(status_code=503, detail="Web nodes are disabled")
     name = payload.name.strip() or "Web node"
     node = create_browser_node(name)
+    channel_id = resolve_node_channel_id(node)
+    channel = channels_by_id.get(channel_id)
+    stream_id = channel.get("snap_stream") if channel else None
+    if not channel or not stream_id:
+        await teardown_browser_node(node["id"])
+        raise HTTPException(status_code=500, detail="Channel is missing snap_stream mapping")
     try:
-        session = await webrtc_relay.create_session(node["id"], pan=node.get("pan", 0.0))
+        session = await webrtc_relay.create_session(node["id"], channel_id, stream_id)
         answer = await session.accept(payload.sdp, payload.type)
     except Exception as exc:
         log.exception("Failed to establish web node session")
@@ -3378,6 +3439,56 @@ async def control_radio_playback(channel_id: str, payload: RadioPlaybackPayload)
     else:
         radio_runtime_status.pop(resolved, None)
     return {"ok": True, "radio_state": state, "previous": previous, "current": desired}
+
+
+@app.post("/api/playback/stop-all")
+async def stop_all_channel_playback() -> dict:
+    now = int(time.time())
+    spotify_stopped: list[str] = []
+    radio_stopped: list[str] = []
+    radio_states: dict[str, dict] = {}
+    errors: dict[str, str] = {}
+    radio_mutated = False
+    for cid in channel_order:
+        channel = channels_by_id.get(cid)
+        if not channel:
+            continue
+        source = (channel.get("source") or "spotify").lower()
+        if source == "radio":
+            state = _ensure_radio_state(channel)
+            if state.get("playback_enabled", True):
+                state["playback_enabled"] = False
+                state["updated_at"] = now
+                channel["radio_state"] = state
+                radio_runtime_status[cid] = {
+                    "state": "idle",
+                    "message": "Radio stopped",
+                    "bitrate": None,
+                    "station_id": state.get("station_id"),
+                    "metadata": None,
+                    "updated_at": now,
+                }
+                radio_states[cid] = state
+                radio_stopped.append(cid)
+                radio_mutated = True
+            continue
+        try:
+            await _spotify_control("/me/player/pause", "PUT", channel_id=cid)
+            spotify_stopped.append(cid)
+        except HTTPException as exc:
+            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
+            errors[cid] = detail or "Failed to pause Spotify playback"
+        except Exception as exc:  # pragma: no cover - defensive
+            errors[cid] = str(exc)
+    if radio_mutated:
+        save_channels()
+    return {
+        "ok": True,
+        "spotify_stopped": spotify_stopped,
+        "radio_stopped": radio_stopped,
+        "radio_states": radio_states,
+        "errors": errors,
+    }
 
 
 @app.get("/api/radio/worker/assignments")

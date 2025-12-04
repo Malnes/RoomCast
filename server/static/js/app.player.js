@@ -137,10 +137,18 @@ function renderRadioPlayer(channel, payload, options = {}) {
   const runtimeLabel = describeRadioRuntimeState(runtime.state);
   let titleBase = radioState.station_name || channel?.name || 'Radio channel';
   if (!hasStation) titleBase = channel?.name || 'Radio channel';
-  const metadata = radioState.last_metadata || {};
+  const runtimeMetadata = runtime.metadata && typeof runtime.metadata === 'object' ? runtime.metadata : {};
+  const stateMetadata = radioState.last_metadata && typeof radioState.last_metadata === 'object'
+    ? radioState.last_metadata
+    : {};
+  const metadata = Object.keys(runtimeMetadata).length || Object.keys(stateMetadata).length
+    ? { ...runtimeMetadata, ...stateMetadata }
+    : {};
   const metadataParts = [];
   if (metadata.artist) metadataParts.push(metadata.artist);
   if (metadata.title) metadataParts.push(metadata.title);
+  const streamTitle = metadata.streamTitle || metadata.StreamTitle;
+  if (streamTitle) metadataParts.push(streamTitle);
   if (!metadataParts.length && metadata.text) metadataParts.push(metadata.text);
   let subtitle = options.error || metadataParts.join(' – ');
   if (!subtitle) {
@@ -202,6 +210,76 @@ function renderRadioPlayer(channel, payload, options = {}) {
     enabled: !!enabled,
     runtimeState: runtime?.state || 'idle',
   };
+}
+
+const PLAYER_STOP_ALL_HOLD_MS = 1500;
+let playerPlayHoldTimer = null;
+let playerPlayHoldTriggered = false;
+
+function cancelPlayerHoldToStop(options = {}) {
+  if (playerPlayHoldTimer) {
+    clearTimeout(playerPlayHoldTimer);
+    playerPlayHoldTimer = null;
+  }
+  if (options.resetHold) {
+    playerPlayHoldTriggered = false;
+  }
+}
+
+function armPlayerHoldToStop() {
+  if (!playerPlay || playerPlay.disabled) return;
+  cancelPlayerHoldToStop();
+  playerPlayHoldTriggered = false;
+  playerPlayHoldTimer = setTimeout(async () => {
+    playerPlayHoldTimer = null;
+    playerPlayHoldTriggered = true;
+    await confirmStopAllPlayback();
+  }, PLAYER_STOP_ALL_HOLD_MS);
+}
+
+async function confirmStopAllPlayback() {
+  const confirmed = await openConfirmDialog({
+    title: 'Stop all playback?',
+    message: 'This will pause Spotify and stop radio streams on every channel.',
+    confirmLabel: 'Stop all playback',
+    cancelLabel: 'Keep playing',
+    tone: 'danger',
+  });
+  if (!confirmed) return;
+  await stopAllPlaybackStreams();
+}
+
+async function stopAllPlaybackStreams() {
+  try {
+    const res = await fetch('/api/playback/stop-all', { method: 'POST' });
+    await ensureOk(res);
+    const data = await res.json();
+    const radioCount = Array.isArray(data?.radio_stopped) ? data.radio_stopped.length : 0;
+    const spotifyCount = Array.isArray(data?.spotify_stopped) ? data.spotify_stopped.length : 0;
+    const totalStopped = radioCount + spotifyCount;
+    if (data?.radio_states && typeof data.radio_states === 'object') {
+      Object.entries(data.radio_states).forEach(([cid, state]) => updateChannelRadioState(cid, state));
+    }
+    const summaryParts = [];
+    if (spotifyCount) summaryParts.push(`${spotifyCount} Spotify channel${spotifyCount === 1 ? '' : 's'}`);
+    if (radioCount) summaryParts.push(`${radioCount} radio channel${radioCount === 1 ? '' : 's'}`);
+    const summaryText = summaryParts.length ? summaryParts.join(' and ') : 'No active playback';
+    const hasErrors = data?.errors && Object.keys(data.errors).length > 0;
+    if (hasErrors) {
+      const errorSummary = Object.entries(data.errors)
+        .map(([cid, detail]) => `${cid}: ${detail}`)
+        .join('; ');
+      showError(`Stopped ${summaryText}, but some channels failed: ${errorSummary}`);
+    } else if (totalStopped) {
+      showSuccess(`Stopped ${summaryText}.`);
+    } else {
+      showSuccess('No active playback to stop.');
+    }
+    await fetchPlayerStatus();
+    await refreshChannels({ force: true }).catch(() => {});
+  } catch (err) {
+    showError(`Failed to stop playback: ${err.message}`);
+  }
 }
 
 function renderPlayer(status) {
@@ -338,6 +416,22 @@ function buildPlayerActionPath(path, body, channelId) {
   return `${targetPath}${separator}device_id=${encodeURIComponent(deviceId)}`;
 }
 
+function parseSpotifyErrorDetail(detail) {
+  if (!detail || typeof detail !== 'string') return {};
+  const trimmed = detail.trim();
+  if (!trimmed.startsWith('{')) return {};
+  try {
+    const parsed = JSON.parse(trimmed);
+    const error = parsed?.error || {};
+    return {
+      message: typeof error.message === 'string' ? error.message : null,
+      reason: typeof error.reason === 'string' ? error.reason.toLowerCase() : null,
+    };
+  } catch (_) {
+    return {};
+  }
+}
+
 async function activateRoomcastDevice(play = false) {
   const channelId = getActiveChannelId();
   if (!channelId) {
@@ -379,10 +473,15 @@ async function playerAction(path, body, options = {}) {
       }
       const detail = await readResponseDetail(res);
       const normalizedDetail = (detail || '').toLowerCase();
+      const meta = parseSpotifyErrorDetail(detail);
+      const looksLikeNoDevice = normalizedDetail.includes('no active device');
+      const looksLikeRestriction = normalizedDetail.includes('restriction') || meta.reason === 'unknown';
       const canActivateRoomcast = allowRoomcastFallback
         && !attemptedRoomcastActivation
-        && res.status === 404
-        && normalizedDetail.includes('no active device');
+        && (
+          (res.status === 404 && looksLikeNoDevice)
+          || (res.status === 403 && looksLikeRestriction)
+        );
       if (canActivateRoomcast) {
         await activateRoomcastDevice(false);
         attemptedRoomcastActivation = true;
@@ -1039,12 +1138,49 @@ if (playerArt) {
 
 setPlayerArtInteractivity(false);
 
+if (playerPlay) {
+  playerPlay.addEventListener('pointerdown', event => {
+    if (playerPlay.disabled) return;
+    if (typeof event.button === 'number' && event.button !== 0) return;
+    armPlayerHoldToStop();
+  });
+  playerPlay.addEventListener('pointerup', () => {
+    cancelPlayerHoldToStop();
+  });
+  playerPlay.addEventListener('pointerleave', () => {
+    cancelPlayerHoldToStop({ resetHold: true });
+  });
+  playerPlay.addEventListener('pointercancel', () => {
+    cancelPlayerHoldToStop({ resetHold: true });
+  });
+  playerPlay.addEventListener('blur', () => {
+    cancelPlayerHoldToStop({ resetHold: true });
+  });
+  playerPlay.addEventListener('keydown', event => {
+    if (playerPlay.disabled) return;
+    if (event.repeat) return;
+    if (event.code === 'Space' || event.code === 'Enter') {
+      armPlayerHoldToStop();
+    }
+  });
+  playerPlay.addEventListener('keyup', event => {
+    if (event.code === 'Space' || event.code === 'Enter') {
+      cancelPlayerHoldToStop();
+    }
+  });
+}
+
 playerPrev.addEventListener('click', () => {
   if (playerPrev.disabled) return;
   playerAction('/api/spotify/player/previous');
 });
 playerPlay.addEventListener('click', () => {
+  cancelPlayerHoldToStop();
   if (playerPlay.disabled) return;
+  if (playerPlayHoldTriggered) {
+    playerPlayHoldTriggered = false;
+    return;
+  }
   const channel = getActiveChannel();
   if (isRadioChannel(channel)) {
     handleRadioPlayToggle(channel);

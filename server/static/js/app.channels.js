@@ -1,6 +1,7 @@
 function resetChannelUiState() {
   channelsCache = [];
   activeChannelId = null;
+  persistActiveChannelPreference(null);
   spotifySettingsChannelId = null;
   radioPlaybackState = null;
   channelPendingEdits.clear();
@@ -37,9 +38,20 @@ async function refreshChannels(options = {}) {
       const previousActive = activeChannelId;
       const list = Array.isArray(data?.channels) ? data.channels : [];
       channelsCache = list.slice().sort((a, b) => (a.order || 0) - (b.order || 0));
-      if (!channelsCache.some(ch => ch.id === activeChannelId)) {
-        activeChannelId = channelsCache[0]?.id || null;
+      const playableChannels = getPlayerChannels();
+      const hasCurrentActive = activeChannelId && playableChannels.some(ch => ch.id === activeChannelId);
+      if (!hasCurrentActive) {
+        const storedActiveId = readStoredActiveChannelId();
+        const storedActiveValid = storedActiveId && playableChannels.some(ch => ch.id === storedActiveId);
+        if (storedActiveValid) {
+          activeChannelId = storedActiveId;
+        } else if (playableChannels.length) {
+          activeChannelId = playableChannels[0].id;
+        } else {
+          activeChannelId = channelsCache[0]?.id || null;
+        }
       }
+      persistActiveChannelPreference(activeChannelId);
       if (!channelsCache.some(ch => ch.id === spotifySettingsChannelId)) {
         spotifySettingsChannelId = activeChannelId;
       }
@@ -405,13 +417,6 @@ async function readResponseDetail(res, fallback) {
     /* ignore body parse errors */
   }
   return detail;
-}
-
-function describePan(value) {
-  const num = typeof value === 'number' ? value : Number(value);
-  if (Number.isNaN(num) || Math.abs(num) < 0.01) return 'Center';
-  const pct = Math.round(Math.abs(num) * 100);
-  return num > 0 ? `Right ${pct}%` : `Left ${pct}%`;
 }
 
 function normalizePercent(value, fallback = 0) {

@@ -69,12 +69,16 @@ textarea { min-height: 64px; }
 .muted { opacity: 0.7; }
 .label { font-size: 13px; color: #cbd5e1; margin-top: 6px; }
 .toast { position: fixed; top: 20px; left: 50%; transform: translate(-50%, -8px); min-width: 240px; max-width: min(420px, calc(100vw - 32px)); z-index: 1100; transition: opacity 0.2s ease, transform 0.2s ease; text-align: center; }
-.error { background: #fecdd3; color: #7f1d1d; padding: 12px; border-radius: 12px; box-shadow: 0 15px 30px rgba(0,0,0,0.35); }
+.error { background: #0f172a; color: #fecaca; padding: 12px; border-radius: 12px; border: 1px solid rgba(248,113,113,0.65); box-shadow: 0 15px 30px rgba(0,0,0,0.45); }
 .success { background: rgba(var(--accent-rgb),0.14); color: #bbf7d0; padding: 12px; border-radius: 12px; box-shadow: 0 15px 30px rgba(0,0,0,0.35); }
 input[type=range] { accent-color: var(--range-accent, var(--accent)); }
 button { background: linear-gradient(135deg, var(--accent), var(--accent-dark)); color: #0b1020; border: none; padding: 10px 14px; border-radius: 12px; cursor: pointer; font-weight: 700; width: 100%; transition: transform 0.08s ease, filter 0.12s ease; }
 button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95); }
 .small-btn { width: auto; padding: 8px 12px; }
+.ghost-btn { background: rgba(15,23,42,0.65); color: #e2e8f0; border: 1px solid rgba(148,163,184,0.35); }
+.ghost-btn:hover { background: rgba(148,163,184,0.2); }
+.danger-btn { background: linear-gradient(135deg, #f97316, #ef4444); color: #fff; }
+.danger-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .icon-only-btn { width: 42px; height: 42px; border-radius: 999px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.08); color: #f8fafc; }
 .header-actions { display: flex; gap: 8px; align-items: center; }
 .header-actions > * {
@@ -176,6 +180,12 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 }
 .settings-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: none; align-items: flex-start; justify-content: center; overflow-y: auto; padding: 24px 12px; z-index: 200; }
 .settings-card { background: #0f172a; border: 1px solid rgba(255,255,255,0.08); border-radius: 18px; padding: 16px; width: min(960px, 95vw); box-shadow: 0 18px 40px rgba(0,0,0,0.35); }
+.confirm-overlay { align-items: center; }
+.confirm-overlay.is-visible { display: flex !important; }
+.confirm-card { width: min(420px, 92vw); padding: 20px; }
+.confirm-content .section-title { margin-bottom: 4px; }
+.confirm-message { font-size: 14px; color: #cbd5e1; line-height: 1.5; margin: 8px 0 20px; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap; }
 .settings-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
 .spinner { width: 18px; height: 18px; border: 3px solid rgba(255,255,255,0.2); border-top-color: var(--accent); border-radius: 50%; animation: spin 0.8s linear infinite; display: inline-block; vertical-align: middle; }
 @keyframes spin { to { transform: rotate(360deg); } }

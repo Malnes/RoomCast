@@ -1818,33 +1818,51 @@ function createNodeChannelSelector(node, options = {}) {
   const select = document.createElement('select');
   select.className = 'node-channel-select';
   select.setAttribute('aria-label', `Channel for ${node.name || 'node'}`);
-  channelsCache.forEach(channel => {
-    const option = document.createElement('option');
-    option.value = channel.id;
-    option.textContent = channel.name || channel.id;
-    select.appendChild(option);
-  });
-  const resolvedId = resolveNodeChannelId(node) || channelsCache[0]?.id;
+  const playableChannels = getPlayerChannels();
+  const hasPlayable = playableChannels.length > 0;
+  let resolvedId = resolveNodeChannelId(node) || null;
+  const resolvedPlayable = resolvedId && playableChannels.some(ch => ch.id === resolvedId);
+  if (!resolvedPlayable) {
+    resolvedId = hasPlayable ? playableChannels[0].id : null;
+  }
+  if (!hasPlayable) {
+    const placeholder = document.createElement('option');
+    placeholder.value = '';
+    placeholder.textContent = 'No enabled channels';
+    placeholder.disabled = true;
+    placeholder.selected = true;
+    select.appendChild(placeholder);
+  } else {
+    playableChannels.forEach(channel => {
+      const option = document.createElement('option');
+      option.value = channel.id;
+      option.textContent = channel.name || channel.id;
+      select.appendChild(option);
+    });
+  }
   if (resolvedId) {
     select.value = resolvedId;
     select.dataset.previousChannel = resolvedId;
     updateChannelDotColor(dot, resolvedId);
+  } else {
+    select.dataset.previousChannel = '';
+    updateChannelDotColor(dot, null);
   }
-  const shouldDisable = options.disabled || node.type === 'browser';
+  const shouldDisable = options.disabled || !hasPlayable;
   select.disabled = !!shouldDisable;
-  if (node.type === 'browser') {
-    select.title = 'Browser nodes mirror the controller stream';
-  }
   select.addEventListener('change', async () => {
     const targetChannel = select.value;
+    const previous = select.dataset.previousChannel || resolvedId;
     if (!targetChannel || select.disabled) {
-      if (resolvedId) select.value = resolvedId;
+      if (previous) {
+        select.value = previous;
+        updateChannelDotColor(dot, previous);
+      }
       return;
     }
     try {
       await setNodeChannel(node.id, targetChannel, select, dot);
     } catch (_) {
-      const previous = select.dataset.previousChannel || resolvedId;
       if (previous) {
         select.value = previous;
         updateChannelDotColor(dot, previous);
@@ -1995,12 +2013,7 @@ function commitRenderNodes(nodes) {
       const wifiIndicator = renderNodeWifiIndicator(n);
       title.appendChild(wifiIndicator);
     }
-    if (isBrowser) {
-      const browserPill = document.createElement('span');
-      browserPill.className = 'status-pill ok';
-      browserPill.textContent = 'Browser node';
-      statusRow.appendChild(browserPill);
-    } else if (!paired) {
+    if (!isBrowser && !paired) {
       const pairPill = document.createElement('span');
       pairPill.className = 'status-pill warn';
       pairPill.textContent = 'Pairing required';
@@ -2091,39 +2104,6 @@ function commitRenderNodes(nodes) {
       volRow.appendChild(volumeMeta);
     }
     wrapper.appendChild(volRow);
-
-    if (n.type === 'browser') {
-      const panLabel = document.createElement('div');
-      panLabel.className = 'label';
-      let currentPan = typeof n.pan === 'number' ? n.pan : 0;
-      panLabel.innerText = `Pan – ${describePan(currentPan)}`;
-      wrapper.appendChild(panLabel);
-
-      const panInput = document.createElement('input');
-      panInput.type = 'range';
-      panInput.min = -100;
-      panInput.max = 100;
-      panInput.step = 2;
-      panInput.value = Math.round(currentPan * 100);
-      setRangeProgress(panInput, panInput.value, panInput.max || 100);
-      panInput.addEventListener('input', () => {
-        const nextPan = Number(panInput.value) / 100;
-        panLabel.innerText = `Pan – ${describePan(nextPan)}`;
-        setRangeProgress(panInput, panInput.value, panInput.max || 100);
-      });
-      panInput.addEventListener('change', async () => {
-        const nextPan = Math.max(-1, Math.min(1, Number(panInput.value) / 100));
-        try {
-          await setNodePan(n.id, nextPan);
-          currentPan = nextPan;
-        } catch (err) {
-          panInput.value = Math.round(currentPan * 100);
-          panLabel.innerText = `Pan – ${describePan(currentPan)}`;
-        }
-        setRangeProgress(panInput, panInput.value, panInput.max || 100);
-      });
-      wrapper.appendChild(panInput);
-    }
 
     const actions = document.createElement('div');
     actions.className = 'node-actions';
