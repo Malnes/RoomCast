@@ -11,7 +11,7 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
-from typing import Dict, Optional, AsyncIterator, List, Callable, Any, Tuple
+from typing import Dict, Optional, AsyncIterator, List, Callable, Any, Tuple, Literal
 
 import httpx
 import asyncssh
@@ -89,6 +89,28 @@ PRIMARY_CHANNEL_ID = os.getenv("PRIMARY_CHANNEL_ID", "ch1").strip() or "ch1"
 CHANNEL_ID_PREFIX = os.getenv("CHANNEL_ID_PREFIX", "ch").strip() or "ch"
 PLAYER_SNAPSHOT_PATH = Path(os.getenv("PLAYER_SNAPSHOT_PATH", "/config/player-snapshots.json"))
 PLAYER_SNAPSHOT_PATH.parent.mkdir(parents=True, exist_ok=True)
+RADIO_CHANNEL_SLOTS = [
+    {
+        "suffix": 3,
+        "label": "Radio 1",
+        "snap_stream": "Radio_CH1",
+        "fifo_path": "/tmp/snapfifo-radio1",
+        "color": "#f97316",
+    },
+    {
+        "suffix": 4,
+        "label": "Radio 2",
+        "snap_stream": "Radio_CH2",
+        "fifo_path": "/tmp/snapfifo-radio2",
+        "color": "#a855f7",
+    },
+]
+RADIO_BROWSER_BASE_URL = os.getenv("RADIO_BROWSER_BASE_URL", "https://de1.api.radio-browser.info/json").rstrip("/")
+RADIO_BROWSER_TIMEOUT = float(os.getenv("RADIO_BROWSER_TIMEOUT", "8"))
+RADIO_BROWSER_CACHE_TTL = int(os.getenv("RADIO_BROWSER_CACHE_TTL", "300"))
+RADIO_BROWSER_USER_AGENT = os.getenv("RADIO_BROWSER_USER_AGENT", "RoomCast/Radio").strip() or "RoomCast/Radio"
+RADIO_WORKER_TOKEN = os.getenv("RADIO_WORKER_TOKEN", "").strip()
+RADIO_WORKER_PATH_PREFIX = "/api/radio/worker"
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -313,6 +335,12 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
         enabled = enabled_value.strip().lower() not in {"0", "false", "no"}
     else:
         enabled = bool(enabled_value)
+    source = (entry.get("source") or "spotify").strip().lower()
+    if source not in {"spotify", "radio"}:
+        source = "spotify"
+    radio_state = None
+    if source == "radio":
+        radio_state = _normalize_radio_state(entry.get("radio_state"))
     return {
         "id": channel_id,
         "name": name,
@@ -324,13 +352,57 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
         "status_path": status_path,
         "color": color,
         "enabled": enabled,
+        "source": source,
+        "radio_state": radio_state,
     }
 
 
+def _default_radio_state() -> dict:
+    return {
+        "station_id": None,
+        "station_name": None,
+        "stream_url": None,
+        "station_country": None,
+        "station_countrycode": None,
+        "station_favicon": None,
+        "station_homepage": None,
+        "bitrate": None,
+        "last_metadata": None,
+        "updated_at": None,
+        "tags": [],
+        "playback_enabled": True,
+    }
+
+
+def _normalize_radio_state(value: Optional[dict]) -> dict:
+    state = _default_radio_state()
+    if not isinstance(value, dict):
+        return state
+    for key in state.keys():
+        if key == "tags":
+            tags_value = value.get("tags")
+            if isinstance(tags_value, list):
+                state["tags"] = [str(tag).strip() for tag in tags_value if str(tag).strip()]
+            elif isinstance(tags_value, str):
+                state["tags"] = [segment.strip() for segment in tags_value.split(",") if segment.strip()]
+            else:
+                state["tags"] = []
+            continue
+        if key == "playback_enabled":
+            raw = value.get("playback_enabled")
+            if isinstance(raw, str):
+                state[key] = raw.strip().lower() not in {"0", "false", "no"}
+            else:
+                state[key] = bool(raw) if raw is not None else True
+            continue
+        state[key] = value.get(key)
+    return state
+
+
 def _default_channel_entries() -> list[dict]:
-    return [
+    defaults = [
         {
-            "id": "ch1",
+            "id": f"{CHANNEL_ID_PREFIX}1",
             "name": "Channel 1",
             "order": 1,
             "snap_stream": "Spotify_CH1",
@@ -340,9 +412,10 @@ def _default_channel_entries() -> list[dict]:
             "status_path": str(LIBRESPOT_STATUS_PATH),
             "color": "#22c55e",
             "enabled": True,
+            "source": "spotify",
         },
         {
-            "id": "ch2",
+            "id": f"{CHANNEL_ID_PREFIX}2",
             "name": "Channel 2",
             "order": 2,
             "snap_stream": "Spotify_CH2",
@@ -352,8 +425,66 @@ def _default_channel_entries() -> list[dict]:
             "status_path": "/config/librespot-status-ch2.json",
             "color": "#0ea5e9",
             "enabled": True,
+            "source": "spotify",
         },
     ]
+    defaults.extend(_radio_channel_templates())
+    return defaults
+
+
+def _radio_channel_templates() -> list[dict]:
+    templates: list[dict] = []
+    for idx, slot in enumerate(RADIO_CHANNEL_SLOTS, start=1):
+        templates.append({
+            "id": f"{CHANNEL_ID_PREFIX}{slot['suffix']}",
+            "name": slot["label"],
+            "order": slot["suffix"],
+            "snap_stream": slot["snap_stream"],
+            "fifo_path": slot["fifo_path"],
+            "color": slot["color"],
+            "enabled": False,
+            "source": "radio",
+            "radio_state": _default_radio_state(),
+        })
+    return templates
+
+
+def _ensure_radio_channels(entries: list[dict]) -> None:
+    existing_ids = {entry["id"] for entry in entries}
+    radio_entries = [entry for entry in entries if entry.get("source") == "radio"]
+    for template in _radio_channel_templates():
+        channel_id = template["id"]
+        if channel_id in existing_ids:
+            continue
+        normalized_entry = _normalize_channel_entry(template, fallback_order=template["order"])
+        entries.append(normalized_entry)
+        existing_ids.add(channel_id)
+        radio_entries.append(normalized_entry)
+    desired_radio_count = len(RADIO_CHANNEL_SLOTS)
+    next_suffix = max((slot["suffix"] for slot in RADIO_CHANNEL_SLOTS), default=2)
+    next_order = max((entry.get("order", 0) for entry in entries), default=0)
+    while len(radio_entries) < desired_radio_count:
+        next_suffix += 1
+        channel_id = f"{CHANNEL_ID_PREFIX}{next_suffix}"
+        if channel_id in existing_ids:
+            continue
+        next_order += 1
+        radio_index = len(radio_entries) + 1
+        template = {
+            "id": channel_id,
+            "name": f"Radio {radio_index}",
+            "order": next_order,
+            "snap_stream": f"Radio_CH{radio_index}",
+            "fifo_path": f"/tmp/snapfifo-radio{radio_index}",
+            "color": radio_index == 1 and "#f97316" or "#a855f7",
+            "enabled": False,
+            "source": "radio",
+            "radio_state": _default_radio_state(),
+        }
+        normalized_entry = _normalize_channel_entry(template, fallback_order=next_order)
+        entries.append(normalized_entry)
+        radio_entries.append(normalized_entry)
+        existing_ids.add(channel_id)
 
 
 def _hydrate_channels(raw_entries: list[Any]) -> list[dict]:
@@ -370,8 +501,45 @@ def _hydrate_channels(raw_entries: list[Any]) -> list[dict]:
         seen_ids.add(normalized_entry["id"])
     if not normalized:
         normalized = _default_channel_entries()
+    _ensure_radio_channels(normalized)
     normalized.sort(key=lambda item: item.get("order", 0))
     return normalized
+
+
+def _ensure_radio_state(channel: dict) -> dict:
+    state = channel.get("radio_state")
+    if isinstance(state, dict):
+        normalized = _normalize_radio_state(state)
+    else:
+        normalized = _default_radio_state()
+    channel["radio_state"] = normalized
+    return normalized
+
+
+def _get_radio_channel_or_404(channel_id: str) -> dict:
+    channel = get_channel(channel_id)
+    if channel.get("source") != "radio":
+        raise HTTPException(status_code=400, detail="Channel is not a radio channel")
+    return channel
+
+
+def _apply_radio_station(channel: dict, payload: "RadioStationSelectionPayload") -> dict:
+    state = _default_radio_state()
+    state.update({
+        "station_id": payload.station_id,
+        "station_name": payload.name,
+        "stream_url": payload.stream_url,
+        "station_country": payload.country,
+        "station_countrycode": payload.countrycode,
+        "station_favicon": payload.favicon,
+        "station_homepage": payload.homepage,
+        "bitrate": payload.bitrate,
+        "tags": payload.tags or [],
+        "updated_at": int(time.time()),
+        "playback_enabled": True,
+    })
+    channel["radio_state"] = state
+    return state
 
 
 def _write_channels_file(entries: list[dict]) -> None:
@@ -452,6 +620,8 @@ def channels_public() -> list[dict]:
             "fifo_path": entry["fifo_path"],
             "color": entry.get("color"),
             "enabled": entry.get("enabled", True),
+            "source": entry.get("source", "spotify"),
+            "radio_state": entry.get("radio_state"),
         })
     return items
 
@@ -472,6 +642,8 @@ def channel_detail(channel_id: str) -> dict:
         "token_path": entry["token_path"],
         "status_path": entry["status_path"],
         "enabled": entry.get("enabled", True),
+        "source": entry.get("source", "spotify"),
+        "radio_state": entry.get("radio_state"),
         "spotify": read_spotify_config(entry["id"]),
         "librespot_status": read_librespot_status(entry["id"]),
     }
@@ -611,6 +783,30 @@ class ChannelUpdatePayload(BaseModel):
     enabled: Optional[bool] = None
 
 
+class RadioStationSelectionPayload(BaseModel):
+    station_id: str = Field(min_length=1, max_length=160)
+    name: str = Field(min_length=1, max_length=200)
+    stream_url: str = Field(min_length=1, max_length=500)
+    country: Optional[str] = Field(default=None, max_length=120)
+    countrycode: Optional[str] = Field(default=None, max_length=4)
+    bitrate: Optional[int] = Field(default=None, ge=0, le=1536)
+    favicon: Optional[str] = Field(default=None, max_length=500)
+    homepage: Optional[str] = Field(default=None, max_length=500)
+    tags: Optional[List[str]] = None
+
+
+class RadioWorkerStatusPayload(BaseModel):
+    state: str = Field(pattern="^(idle|connecting|buffering|playing|error)$")
+    message: Optional[str] = Field(default=None, max_length=500)
+    bitrate: Optional[int] = Field(default=None, ge=0, le=1536)
+    metadata: Optional[dict] = None
+    station_id: Optional[str] = Field(default=None, max_length=160)
+
+
+class RadioPlaybackPayload(BaseModel):
+    action: Literal["start", "stop"]
+
+
 class SnapcastClient:
     def __init__(self, host: str, port: int = 1780) -> None:
         self.url = f"ws://{host}:{port}/jsonrpc"
@@ -690,7 +886,8 @@ async def session_middleware(request: Request, call_next):
     path = request.url.path
     token = request.cookies.get(SESSION_COOKIE_NAME)
     request.state.user = _resolve_session_user(token)
-    requires_auth = path.startswith("/api/") and path not in PUBLIC_API_PATHS
+    is_worker_endpoint = path.startswith(RADIO_WORKER_PATH_PREFIX)
+    requires_auth = path.startswith("/api/") and (not is_worker_endpoint) and path not in PUBLIC_API_PATHS
     if requires_auth:
         initialized = _is_initialized()
         if not initialized and path != "/api/auth/initialize":
@@ -722,10 +919,111 @@ terminal_sessions: Dict[str, dict] = {}
 auth_state: dict = {"server_name": SERVER_DEFAULT_NAME, "users": []}
 users_by_id: Dict[str, dict] = {}
 users_by_username: Dict[str, dict] = {}
+radio_browser_cache: Dict[str, Tuple[float, Any]] = {}
+radio_runtime_status: Dict[str, dict] = {}
 
 
 def default_eq_state() -> dict:
     return {"preset": DEFAULT_EQ_PRESET, "band_count": 15, "bands": []}
+
+
+def _make_radio_cache_key(path: str, params: Optional[dict]) -> str:
+    if not params:
+        return path
+    try:
+        serialized = json.dumps(sorted((params or {}).items()), separators=(",", ":"))
+    except TypeError:
+        serialized = json.dumps(str(params), ensure_ascii=False)
+    return f"{path}?{serialized}"
+
+
+def _radio_cache_get(key: str) -> Optional[Any]:
+    if not key:
+        return None
+    cached = radio_browser_cache.get(key)
+    if not cached:
+        return None
+    expires_at, payload = cached
+    if expires_at and expires_at < time.time():
+        radio_browser_cache.pop(key, None)
+        return None
+    return payload
+
+
+def _radio_cache_put(key: str, payload: Any, ttl: int) -> None:
+    if not key or ttl <= 0:
+        return
+    radio_browser_cache[key] = (time.time() + ttl, payload)
+
+
+async def _radio_browser_request(path: str, params: Optional[dict] = None, ttl: Optional[int] = None, cache_key: Optional[str] = None) -> Any:
+    resolved_path = path.lstrip("/")
+    ttl_value = RADIO_BROWSER_CACHE_TTL if ttl is None else ttl
+    key = cache_key or _make_radio_cache_key(resolved_path, params)
+    if ttl_value and key:
+        cached = _radio_cache_get(key)
+        if cached is not None:
+            return cached
+    url = f"{RADIO_BROWSER_BASE_URL}/{resolved_path}"
+    headers = {"User-Agent": RADIO_BROWSER_USER_AGENT}
+    try:
+        async with httpx.AsyncClient(timeout=RADIO_BROWSER_TIMEOUT) as client:
+            response = await client.get(url, params=params, headers=headers)
+            response.raise_for_status()
+            payload = response.json()
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail="Radio directory timeout")
+    except httpx.HTTPError as exc:
+        log.warning("Radio Browser request failed for %s: %s", resolved_path, exc)
+        raise HTTPException(status_code=502, detail="Radio directory unavailable") from exc
+    if ttl_value and key:
+        _radio_cache_put(key, payload, ttl_value)
+    return payload
+
+
+def _serialize_radio_station(item: Optional[dict]) -> dict:
+    if not isinstance(item, dict):
+        return {}
+    tags_value = item.get("tags") or ""
+    if isinstance(tags_value, str):
+        tags = [segment.strip() for segment in tags_value.split(",") if segment.strip()]
+    elif isinstance(tags_value, list):
+        tags = [str(segment).strip() for segment in tags_value if str(segment).strip()]
+    else:
+        tags = []
+    stream_url = (item.get("url_resolved") or item.get("url") or "").strip()
+    return {
+        "station_id": item.get("stationuuid") or item.get("id"),
+        "name": item.get("name"),
+        "stream_url": stream_url,
+        "codec": item.get("codec"),
+        "bitrate": item.get("bitrate"),
+        "country": item.get("country"),
+        "countrycode": item.get("countrycode"),
+        "state": item.get("state"),
+        "language": item.get("language"),
+        "homepage": item.get("homepage"),
+        "favicon": item.get("favicon"),
+        "tags": tags,
+    }
+
+
+def _require_radio_worker_token(request: Request) -> None:
+    if not RADIO_WORKER_TOKEN:
+        return
+    header = request.headers.get("x-radio-worker-token") or request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        header = header[7:]
+    candidate = header.strip()
+    if not candidate or not secrets.compare_digest(candidate, RADIO_WORKER_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid radio worker token")
+
+
+def _radio_runtime_payload(channel_id: str) -> dict:
+    status = radio_runtime_status.get(channel_id)
+    if not status:
+        return {"state": "idle", "message": None, "updated_at": None}
+    return status
 
 
 def _select_initial_channel_id(preferred: Optional[str] = None) -> str:
@@ -2946,6 +3244,185 @@ async def set_spotify_config(cfg: SpotifyConfig, channel_id: Optional[str] = Que
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps(payload, indent=2))
     return {"ok": True, "config": read_spotify_config(resolved)}
+
+
+@app.get("/api/radio/genres")
+async def list_radio_genres(limit: int = Query(default=50, ge=1, le=400)) -> dict:
+    data = await _radio_browser_request("/tags", ttl=3600, cache_key="radio:tags")
+    genres = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            count = int(entry.get("stationcount") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        genres.append({"name": name, "stationcount": count})
+    genres.sort(key=lambda item: item["stationcount"], reverse=True)
+    return {"genres": genres[:limit]}
+
+
+@app.get("/api/radio/countries")
+async def list_radio_countries(limit: int = Query(default=250, ge=1, le=400)) -> dict:
+    data = await _radio_browser_request("/countries", ttl=3600, cache_key="radio:countries")
+    countries = []
+    for entry in data:
+        if not isinstance(entry, dict):
+            continue
+        name = (entry.get("name") or "").strip()
+        if not name:
+            continue
+        try:
+            count = int(entry.get("stationcount") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        countries.append({
+            "name": name,
+            "iso_3166_1": (entry.get("iso_3166_1") or entry.get("countrycode") or "").strip() or None,
+            "stationcount": count,
+        })
+    countries.sort(key=lambda item: item["stationcount"], reverse=True)
+    return {"countries": countries[:limit]}
+
+
+@app.get("/api/radio/top")
+async def list_radio_top(metric: str = Query(default="votes", pattern="^(votes|clicks)$"), limit: int = Query(default=40, ge=1, le=200)) -> dict:
+    normalized = "vote" if metric == "votes" else "click"
+    path = f"/stations/top{normalized}/{limit}"
+    cache_key = f"radio:top:{metric}:{limit}"
+    data = await _radio_browser_request(path, ttl=120, cache_key=cache_key)
+    stations = [_serialize_radio_station(item) for item in data]
+    return {"stations": stations}
+
+
+@app.get("/api/radio/search")
+async def search_radio_stations(
+    query: Optional[str] = Query(default=None, max_length=200),
+    country: Optional[str] = Query(default=None, max_length=120),
+    countrycode: Optional[str] = Query(default=None, max_length=4),
+    tag: Optional[str] = Query(default=None, max_length=120),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> dict:
+    params = {"limit": limit, "hidebroken": "true"}
+    has_filter = False
+    if query:
+        params["name"] = query
+        has_filter = True
+    if country:
+        params["country"] = country
+        has_filter = True
+    if countrycode:
+        params["countrycode"] = countrycode
+        has_filter = True
+    if tag:
+        params["tag"] = tag
+        has_filter = True
+    if not has_filter:
+        raise HTTPException(status_code=400, detail="Provide a query or filter")
+    data = await _radio_browser_request("/stations/search", params=params, ttl=15)
+    stations = [_serialize_radio_station(item) for item in data]
+    return {"stations": stations[:limit]}
+
+
+@app.post("/api/radio/{channel_id}/station")
+async def assign_radio_station(channel_id: str, payload: RadioStationSelectionPayload, _: dict = Depends(require_admin)) -> dict:
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_radio_channel_or_404(resolved)
+    _apply_radio_station(channel, payload)
+    save_channels()
+    radio_runtime_status.pop(resolved, None)
+    return {"ok": True, "channel": channel_detail(resolved)}
+
+
+@app.get("/api/radio/status/{channel_id}")
+async def get_radio_status(channel_id: str) -> dict:
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_radio_channel_or_404(resolved)
+    state = _ensure_radio_state(channel)
+    runtime = _radio_runtime_payload(resolved)
+    return {
+        "channel_id": resolved,
+        "radio_state": state,
+        "runtime": runtime,
+        "enabled": channel.get("enabled", True),
+    }
+
+
+@app.post("/api/radio/{channel_id}/playback")
+async def control_radio_playback(channel_id: str, payload: RadioPlaybackPayload) -> dict:
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_radio_channel_or_404(resolved)
+    state = _ensure_radio_state(channel)
+    now = int(time.time())
+    action = payload.action
+    if action == "start" and not state.get("stream_url"):
+        raise HTTPException(status_code=400, detail="Tune a station before starting playback")
+    desired = action == "start"
+    previous = state.get("playback_enabled", True)
+    state["playback_enabled"] = desired
+    state["updated_at"] = now
+    channel["radio_state"] = state
+    save_channels()
+    if not desired:
+        radio_runtime_status[resolved] = {
+            "state": "idle",
+            "message": "Radio stopped",
+            "bitrate": None,
+            "station_id": state.get("station_id"),
+            "metadata": None,
+            "updated_at": now,
+        }
+    else:
+        radio_runtime_status.pop(resolved, None)
+    return {"ok": True, "radio_state": state, "previous": previous, "current": desired}
+
+
+@app.get("/api/radio/worker/assignments")
+async def radio_worker_assignments(request: Request) -> dict:
+    _require_radio_worker_token(request)
+    assignments = []
+    for cid in channel_order:
+        channel = channels_by_id.get(cid)
+        if not channel or channel.get("source") != "radio":
+            continue
+        state = _ensure_radio_state(channel)
+        assignments.append({
+            "channel_id": cid,
+            "enabled": channel.get("enabled", True),
+            "snap_stream": channel["snap_stream"],
+            "fifo_path": channel["fifo_path"],
+            "stream_url": state.get("stream_url"),
+            "station_id": state.get("station_id"),
+            "updated_at": state.get("updated_at"),
+            "playback_enabled": state.get("playback_enabled", True),
+        })
+    return {"assignments": assignments}
+
+
+@app.post("/api/radio/worker/status/{channel_id}")
+async def radio_worker_status(channel_id: str, payload: RadioWorkerStatusPayload, request: Request) -> dict:
+    _require_radio_worker_token(request)
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_radio_channel_or_404(resolved)
+    status_payload = {
+        "state": payload.state,
+        "message": payload.message,
+        "bitrate": payload.bitrate,
+        "station_id": payload.station_id or (channel.get("radio_state") or {}).get("station_id"),
+        "metadata": payload.metadata,
+        "updated_at": int(time.time()),
+    }
+    radio_runtime_status[resolved] = status_payload
+    if payload.metadata:
+        state = _ensure_radio_state(channel)
+        state["last_metadata"] = payload.metadata
+        state["updated_at"] = status_payload["updated_at"]
+        channel["radio_state"] = state
+        save_channels()
+    return {"ok": True}
 
 
 @app.get("/api/librespot/status")

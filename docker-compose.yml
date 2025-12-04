@@ -26,6 +26,7 @@ services:
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
       SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:8000/api/spotify/callback}
+      RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
     depends_on:
       - snapserver
       - librespot_ch1
@@ -41,6 +42,10 @@ services:
       - pipe:///tmp/snapfifo-ch1?name=Spotify_CH1&sampleformat=44100:16:2&codec=pcm
       - --stream.source
       - pipe:///tmp/snapfifo-ch2?name=Spotify_CH2&sampleformat=44100:16:2&codec=pcm
+      - --stream.source
+      - pipe:///tmp/snapfifo-radio1?name=Radio_CH1&sampleformat=48000:16:2&codec=pcm
+      - --stream.source
+      - pipe:///tmp/snapfifo-radio2?name=Radio_CH2&sampleformat=48000:16:2&codec=pcm
       - --http-cors
       - '*'
     volumes:
@@ -64,6 +69,19 @@ services:
       STATUS_PATH: /config/librespot-status-ch2.json
       FIFO_PATH: /tmp/snapfifo-ch2
       LIBRESPOT_FALLBACK_NAME: ${LIBRESPOT_NAME_CH2:-RoomCast CH2}
+
+  radio_worker:
+    build: ./radio-worker
+    network_mode: host
+    depends_on:
+      - controller
+      - snapserver
+    environment:
+      CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://127.0.0.1:8000}
+      RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
+      RADIO_ASSIGNMENT_INTERVAL: ${RADIO_ASSIGNMENT_INTERVAL:-10}
+    volumes:
+      - snapfifo:/tmp
 
 volumes:
   snapfifo:

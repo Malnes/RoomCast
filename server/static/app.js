@@ -81,6 +81,25 @@ const playlistSearchInput = document.getElementById('playlist-search');
 const playlistSortSelect = document.getElementById('playlist-sort');
 const channelsPanel = document.getElementById('channels-panel');
 const spotifyChannelSelect = document.getElementById('spotify-channel-select');
+const radioOverlay = document.getElementById('radio-overlay');
+const radioCloseBtn = document.getElementById('radio-close');
+const radioTabs = Array.from(document.querySelectorAll('.radio-tab'));
+const radioPanes = Array.from(document.querySelectorAll('[data-radio-pane]'));
+const radioPaneMap = radioPanes.reduce((acc, pane) => {
+  const key = pane?.dataset?.radioPane;
+  if (key) acc[key] = pane;
+  return acc;
+}, {});
+const radioGenreList = document.getElementById('radio-genre-list');
+const radioTopButtons = Array.from(document.querySelectorAll('.radio-top-btn'));
+const radioCountrySelect = document.getElementById('radio-country-select');
+const radioSearchForm = document.getElementById('radio-search-form');
+const radioSearchInput = document.getElementById('radio-search-input');
+const radioResults = document.getElementById('radio-results');
+const radioResultsStatus = document.getElementById('radio-results-status');
+const radioResultsList = document.getElementById('radio-results-list');
+const radioModalChannelName = document.getElementById('radio-modal-channel-name');
+const radioModalSubtitle = document.getElementById('radio-modal-subtitle');
 const DEFAULT_CHANNEL_COLOR = '#22c55e';
 const WIFI_SIGNAL_THRESHOLDS = [
   { min: 75, bars: 4, label: 'Excellent signal' },
@@ -142,6 +161,7 @@ const coverArtBackdrop = document.getElementById('cover-art-backdrop');
 const coverArtBackgroundToggle = document.getElementById('cover-art-background');
 const collapsiblePanels = Array.from(document.querySelectorAll('[data-collapsible]'));
 let playerStatus = null;
+let radioPlaybackState = null;
 let activeDeviceId = null;
 let playerTick = null;
 let discoverAbortController = null;
@@ -183,6 +203,18 @@ let lastSearchQuery = '';
 let searchHasAttempted = false;
 let searchResultsState = defaultSearchBuckets();
 let searchAbortController = null;
+const RADIO_TABS = ['genres', 'top', 'countries', 'search'];
+let radioActiveTab = 'genres';
+let radioActiveChannelId = null;
+let radioTopMetric = 'votes';
+const radioDataCache = {
+  genres: null,
+  countries: null,
+  top: { votes: null, clicks: null },
+};
+let radioResultsAbortController = null;
+let radioCurrentResults = [];
+let radioResultsContextLabel = '';
 const playerCarouselCards = new Map();
 const playerCarouselIndicatorRefs = new Map();
 // Runtime data for the swipeable player carousel.
@@ -613,6 +645,39 @@ function getChannelById(channelId) {
 
 function isChannelEnabled(channel) {
   return channel?.enabled !== false;
+}
+
+function isRadioChannel(channel) {
+  if (!channel) return false;
+  return (channel.source || '').toLowerCase() === 'radio';
+}
+
+function getRadioState(channel) {
+  if (!isRadioChannel(channel)) return null;
+  return channel.radio_state || null;
+}
+
+function updateChannelRadioState(channelId, radioState) {
+  if (!channelId) return;
+  const idx = channelsCache.findIndex(ch => ch.id === channelId);
+  if (idx === -1) return;
+  channelsCache[idx] = { ...channelsCache[idx], radio_state: radioState || null };
+}
+
+function resolveRadioPlaybackSnapshot(channel) {
+  if (!channel || !channel.id) {
+    return { channelId: null, playbackEnabled: false, hasStation: false, enabled: false };
+  }
+  if (radioPlaybackState && radioPlaybackState.channelId === channel.id) {
+    return { ...radioPlaybackState };
+  }
+  const state = getRadioState(channel) || {};
+  return {
+    channelId: channel.id,
+    playbackEnabled: state.playback_enabled !== false,
+    hasStation: !!state.stream_url,
+    enabled: channel.enabled !== false,
+  };
 }
 
 function getPlayerChannels() {
@@ -1386,6 +1451,7 @@ function resetChannelUiState() {
   channelsCache = [];
   activeChannelId = null;
   spotifySettingsChannelId = null;
+  radioPlaybackState = null;
   channelPendingEdits.clear();
   channelFormRefs.clear();
   if (channelsPanel) channelsPanel.innerHTML = '<div class="muted">No channels configured yet.</div>';
@@ -1401,6 +1467,7 @@ function resetChannelUiState() {
     playerCarouselIndicators.innerHTML = '';
     playerCarouselIndicators.hidden = true;
   }
+  if (playerPlay) playerPlay.dataset.radioChannelId = '';
   renderPlayerCarousel();
   setPlayerIdleState('Create a channel to control playback', { forceClear: true });
   refreshNodeVolumeAccents();
@@ -1492,6 +1559,11 @@ function resetChannelScopedState() {
 function onActiveChannelChanged(previousId, nextId) {
   if (previousId === nextId) return;
   resetChannelScopedState();
+  const nextChannel = getChannelById(nextId);
+  updatePlayerDiscoveryButtons(nextChannel);
+  if (!isRadioChannel(nextChannel) && isRadioOverlayOpen()) {
+    closeRadioOverlay();
+  }
   if (!nextId) {
     setPlayerIdleState('Select a channel to control playback', { forceClear: true });
     return;
@@ -1504,6 +1576,36 @@ function onActiveChannelChanged(previousId, nextId) {
     fetchQueue();
   }
   refreshNodeVolumeAccents();
+}
+
+function updatePlayerDiscoveryButtons(channel) {
+  const radio = isRadioChannel(channel);
+  if (playerPlaylistsBtn) {
+    playerPlaylistsBtn.setAttribute('aria-label', radio ? 'Discover radio stations' : 'Browse playlists');
+  }
+  if (playerSearchBtn) {
+    playerSearchBtn.setAttribute('aria-label', radio ? 'Search radio stations' : 'Search Spotify');
+  }
+}
+
+function handlePlayerPlaylistsClick() {
+  setVolumeSliderOpen(false);
+  const channel = getActiveChannel();
+  if (isRadioChannel(channel)) {
+    openRadioOverlay({ channel });
+  } else {
+    openPlaylistOverlay();
+  }
+}
+
+function handlePlayerSearchClick() {
+  setVolumeSliderOpen(false);
+  const channel = getActiveChannel();
+  if (isRadioChannel(channel)) {
+    openRadioOverlay({ channel, tab: 'search', focusSearch: true });
+  } else {
+    openSearchOverlay();
+  }
 }
 
 function reportSpotifyError(detail) {
@@ -1763,10 +1865,22 @@ function setRangeProgress(el, value, maxOverride) {
   el.style.background = `linear-gradient(90deg, ${accent} 0%, ${accent} ${percent}%, ${inactive} ${percent}%, ${inactive} 100%)`;
 }
 
-function setPlayButtonIcon(playing) {
+function setPlayButtonIcon(playing, options = {}) {
   if (!playerPlay) return;
+  const variant = options.variant === 'radio' ? 'radio' : 'default';
+  if (variant === 'radio') {
+    const label = options.label || (playing ? 'Stop radio' : 'Play radio');
+    playerPlay.innerHTML = playing ? ICON_STOP : ICON_PLAY;
+    playerPlay.setAttribute('aria-label', label);
+    playerPlay.title = label;
+    playerPlay.dataset.playerVariant = 'radio';
+    return;
+  }
+  const label = options.label || (playing ? 'Pause' : 'Play');
   playerPlay.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
-  playerPlay.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+  playerPlay.setAttribute('aria-label', label);
+  playerPlay.title = label;
+  playerPlay.dataset.playerVariant = 'default';
 }
 
 function setShuffleActive(active) {
@@ -2044,6 +2158,382 @@ function sortPlaylists(items) {
   sorted.sort((a, b) => (a?._order ?? 0) - (b?._order ?? 0));
   return sorted;
 }
+
+function setRadioOverlayOpen(open) {
+  if (!radioOverlay) return;
+  const next = !!open;
+  radioOverlay.classList.toggle('is-open', next);
+  radioOverlay.setAttribute('aria-hidden', next ? 'false' : 'true');
+  if (playerPlaylistsBtn) playerPlaylistsBtn.setAttribute('aria-expanded', next ? 'true' : 'false');
+  if (playerSearchBtn) playerSearchBtn.setAttribute('aria-expanded', next ? 'true' : 'false');
+  if (next) {
+    document.addEventListener('keydown', handleRadioOverlayKey, true);
+  } else {
+    document.removeEventListener('keydown', handleRadioOverlayKey, true);
+    radioResultsAbortController?.abort();
+    radioResultsAbortController = null;
+    radioResultsList && (radioResultsList.innerHTML = '');
+    setRadioResultsStatus('Select a genre, list, or search to see stations.');
+    radioActiveChannelId = null;
+  }
+}
+
+function isRadioOverlayOpen() {
+  return !!radioOverlay?.classList.contains('is-open');
+}
+
+function handleRadioOverlayKey(evt) {
+  if (evt.key === 'Escape' && isRadioOverlayOpen()) {
+    evt.stopPropagation();
+    closeRadioOverlay();
+  }
+}
+
+function getRadioOverlayChannel() {
+  if (!radioActiveChannelId) return null;
+  return getChannelById(radioActiveChannelId);
+}
+
+function openRadioOverlay(options = {}) {
+  const channel = options.channel || getActiveChannel();
+  if (!channel || !isRadioChannel(channel)) {
+    showError('Switch to a radio channel to browse stations.');
+    return;
+  }
+  radioActiveChannelId = channel.id;
+  radioActiveTab = RADIO_TABS.includes(options.tab) ? options.tab : (radioActiveTab || 'genres');
+  if (radioModalChannelName) radioModalChannelName.textContent = channel.name || channel.id;
+  if (radioModalSubtitle) {
+    radioModalSubtitle.textContent = `Assign a station to ${channel.name || 'this channel'}.`;
+  }
+  setRadioOverlayOpen(true);
+  setRadioActiveTab(radioActiveTab, { focusSearch: options.tab === 'search' || options.focusSearch });
+  if (options.focusSearch && radioSearchInput) {
+    setTimeout(() => radioSearchInput.focus({ preventScroll: true }), 50);
+  }
+}
+
+function closeRadioOverlay() {
+  setRadioOverlayOpen(false);
+}
+
+function setRadioActiveTab(tabId, options = {}) {
+  const normalized = RADIO_TABS.includes(tabId) ? tabId : 'genres';
+  radioActiveTab = normalized;
+  radioTabs.forEach(btn => {
+    if (!btn?.dataset?.radioTab) return;
+    const isActive = btn.dataset.radioTab === normalized;
+    btn.classList.toggle('is-active', isActive);
+    btn.setAttribute('aria-selected', isActive ? 'true' : 'false');
+  });
+  radioPanes.forEach(pane => {
+    if (!pane?.dataset?.radioPane) return;
+    const match = pane.dataset.radioPane === normalized;
+    pane.hidden = !match;
+  });
+  if (normalized === 'genres') {
+    ensureRadioGenres();
+  } else if (normalized === 'countries') {
+    ensureRadioCountries();
+  } else if (normalized === 'top') {
+    loadRadioTopStations(radioTopMetric);
+  } else if (normalized === 'search' && options.focusSearch && radioSearchInput) {
+    setTimeout(() => radioSearchInput.focus({ preventScroll: true }), 50);
+  }
+}
+
+async function ensureRadioGenres(force = false) {
+  if (!radioGenreList) return;
+  if (radioDataCache.genres && !force) {
+    renderRadioGenres(radioDataCache.genres);
+    return;
+  }
+  radioGenreList.textContent = 'Loading genres…';
+  try {
+    const res = await fetch('/api/radio/genres');
+    await ensureOk(res);
+    const data = await res.json();
+    radioDataCache.genres = Array.isArray(data?.genres) ? data.genres : [];
+    renderRadioGenres(radioDataCache.genres);
+  } catch (err) {
+    radioGenreList.textContent = 'Unable to load genres.';
+    showError(`Failed to load radio genres: ${err.message}`);
+  }
+}
+
+function renderRadioGenres(genres) {
+  if (!radioGenreList) return;
+  radioGenreList.innerHTML = '';
+  const list = Array.isArray(genres) ? genres : [];
+  list.slice(0, 60).forEach(entry => {
+    if (!entry?.name) return;
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.textContent = entry.stationcount ? `${entry.name} (${entry.stationcount})` : entry.name;
+    btn.addEventListener('click', () => {
+      runRadioSearch({ tag: entry.name }, { context: `genre “${entry.name}”` });
+    });
+    radioGenreList.appendChild(btn);
+  });
+  if (!radioGenreList.children.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted';
+    empty.textContent = 'No genres available right now.';
+    radioGenreList.appendChild(empty);
+  }
+}
+
+async function ensureRadioCountries(force = false) {
+  if (!radioCountrySelect) return;
+  if (radioDataCache.countries && !force) {
+    renderRadioCountries(radioDataCache.countries);
+    return;
+  }
+  radioCountrySelect.innerHTML = '<option>Loading countries…</option>';
+  try {
+    const res = await fetch('/api/radio/countries');
+    await ensureOk(res);
+    const data = await res.json();
+    radioDataCache.countries = Array.isArray(data?.countries) ? data.countries : [];
+    renderRadioCountries(radioDataCache.countries);
+  } catch (err) {
+    radioCountrySelect.innerHTML = '<option>Unable to load countries</option>';
+    showError(`Failed to load radio countries: ${err.message}`);
+  }
+}
+
+function renderRadioCountries(countries) {
+  if (!radioCountrySelect) return;
+  radioCountrySelect.innerHTML = '<option value="">Select a country…</option>';
+  const list = Array.isArray(countries) ? countries : [];
+  list.forEach(entry => {
+    if (!entry?.name) return;
+    const option = document.createElement('option');
+    option.value = entry.name;
+    option.textContent = entry.stationcount ? `${entry.name} (${entry.stationcount})` : entry.name;
+    if (entry.iso_3166_1) option.dataset.countrycode = entry.iso_3166_1;
+    radioCountrySelect.appendChild(option);
+  });
+}
+
+function handleRadioCountryChange() {
+  if (!radioCountrySelect) return;
+  const country = radioCountrySelect.value || '';
+  const selectedOption = radioCountrySelect.selectedOptions?.[0];
+  const code = selectedOption?.dataset?.countrycode || null;
+  if (!country) {
+    setRadioResultsStatus('Select a genre, list, or search to see stations.');
+    radioResultsList && (radioResultsList.innerHTML = '');
+    return;
+  }
+  const context = code ? `${country} (${code})` : country;
+  runRadioSearch({ country, countrycode: code }, { context: `country ${context}` });
+}
+
+function setRadioTopMetric(metric) {
+  const normalized = metric === 'clicks' ? 'clicks' : 'votes';
+  radioTopMetric = normalized;
+  radioTopButtons.forEach(btn => {
+    if (!btn?.dataset?.radioTopMetric) return;
+    const isActive = btn.dataset.radioTopMetric === normalized;
+    btn.classList.toggle('is-active', isActive);
+  });
+}
+
+async function loadRadioTopStations(metric = radioTopMetric) {
+  setRadioTopMetric(metric);
+  setRadioResultsStatus('Loading top stations…');
+  radioResultsList && (radioResultsList.innerHTML = '');
+  try {
+    const res = await fetch(`/api/radio/top?metric=${encodeURIComponent(metric)}`);
+    await ensureOk(res);
+    const data = await res.json();
+    const stations = Array.isArray(data?.stations) ? data.stations : [];
+    renderRadioStations(stations, { context: metric === 'votes' ? 'Most voted' : 'Most popular' });
+  } catch (err) {
+    setRadioResultsStatus('Unable to load top stations.');
+    showError(`Failed to load top stations: ${err.message}`);
+  }
+}
+
+function setRadioResultsStatus(message) {
+  if (!radioResultsStatus) return;
+  radioResultsStatus.textContent = message || '';
+}
+
+async function runRadioSearch(filters = {}, options = {}) {
+  const params = new URLSearchParams();
+  if (filters.query) params.set('query', filters.query);
+  if (filters.country) params.set('country', filters.country);
+  if (filters.countrycode) params.set('countrycode', filters.countrycode);
+  if (filters.tag) params.set('tag', filters.tag);
+  if (!params.toString()) {
+    setRadioResultsStatus('Enter a search term or choose a filter to see stations.');
+    radioResultsList && (radioResultsList.innerHTML = '');
+    return;
+  }
+  if (radioResults) radioResults.scrollTop = 0;
+  setRadioResultsStatus(options.loadingMessage || 'Searching stations…');
+  radioResultsList && (radioResultsList.innerHTML = '');
+  radioResultsAbortController?.abort();
+  const controller = new AbortController();
+  radioResultsAbortController = controller;
+  try {
+    const res = await fetch(`/api/radio/search?${params.toString()}`, { signal: controller.signal });
+    await ensureOk(res);
+    const data = await res.json();
+    const stations = Array.isArray(data?.stations) ? data.stations : [];
+    renderRadioStations(stations, { context: options.context });
+  } catch (err) {
+    if (err.name === 'AbortError') return;
+    setRadioResultsStatus('Unable to load stations right now.');
+    showError(`Radio search failed: ${err.message}`);
+  } finally {
+    if (radioResultsAbortController === controller) radioResultsAbortController = null;
+  }
+}
+
+function renderRadioStations(stations, options = {}) {
+  if (!radioResultsList) return;
+  radioResultsList.innerHTML = '';
+  const list = Array.isArray(stations) ? stations : [];
+  radioCurrentResults = list.slice();
+  radioResultsContextLabel = options.context || '';
+  const channel = getRadioOverlayChannel();
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted';
+    empty.textContent = 'No stations found.';
+    radioResultsList.appendChild(empty);
+    setRadioResultsStatus('No stations found.');
+    return;
+  }
+  list.forEach(station => {
+    const card = buildRadioStationCard(station, channel);
+    if (card) radioResultsList.appendChild(card);
+  });
+  const suffix = options.context ? ` for ${options.context}` : '';
+  setRadioResultsStatus(`Showing ${list.length} station${list.length === 1 ? '' : 's'}${suffix}.`);
+}
+
+function buildRadioStationCard(station, channel) {
+  if (!station) return null;
+  const card = document.createElement('div');
+  card.className = 'radio-station-card';
+  const header = document.createElement('div');
+  header.className = 'radio-station-card-header';
+  const info = document.createElement('div');
+  info.className = 'radio-station-info';
+  const name = document.createElement('div');
+  name.className = 'radio-station-name';
+  name.textContent = station.name || 'Untitled station';
+  info.appendChild(name);
+  const meta = document.createElement('div');
+  meta.className = 'radio-station-meta';
+  const metaParts = [];
+  if (station.country) metaParts.push(station.country);
+  if (station.language) metaParts.push(station.language);
+  if (station.codec) metaParts.push((station.codec || '').toUpperCase());
+  if (Number.isFinite(station.bitrate) && station.bitrate > 0) metaParts.push(`${station.bitrate} kbps`);
+  meta.textContent = metaParts.length ? metaParts.join(' • ') : '—';
+  info.appendChild(meta);
+  header.appendChild(info);
+  const activeStationId = getRadioState(channel)?.station_id || null;
+  const isActive = activeStationId && station.station_id && activeStationId === station.station_id;
+  if (isActive) {
+    const badge = document.createElement('span');
+    badge.className = 'status-pill ok';
+    badge.textContent = 'Currently tuned';
+    header.appendChild(badge);
+  }
+  card.appendChild(header);
+  if (Array.isArray(station.tags) && station.tags.length) {
+    const tagsWrap = document.createElement('div');
+    tagsWrap.className = 'radio-station-tags';
+    station.tags.slice(0, 6).forEach(tag => {
+      const tagEl = document.createElement('span');
+      tagEl.className = 'radio-station-tag';
+      tagEl.textContent = tag;
+      tagsWrap.appendChild(tagEl);
+    });
+    card.appendChild(tagsWrap);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'radio-station-actions';
+  const canTune = isAdminUser();
+  const tuneBtn = document.createElement('button');
+  tuneBtn.type = 'button';
+  tuneBtn.className = 'small-btn';
+  tuneBtn.textContent = isActive ? 'Tuned' : `Tune ${channel?.name || 'channel'}`;
+  tuneBtn.disabled = !canTune || isActive || !station.stream_url;
+  tuneBtn.addEventListener('click', () => {
+    if (!radioActiveChannelId) {
+      showError('No radio channel selected.');
+      return;
+    }
+    tuneRadioStation(radioActiveChannelId, station, tuneBtn);
+  });
+  actions.appendChild(tuneBtn);
+  if (station.homepage) {
+    const openBtn = document.createElement('button');
+    openBtn.type = 'button';
+    openBtn.className = 'small-btn';
+    openBtn.textContent = 'Open homepage';
+    openBtn.addEventListener('click', () => window.open(station.homepage, '_blank'));
+    actions.appendChild(openBtn);
+  }
+  card.appendChild(actions);
+  return card;
+}
+
+async function tuneRadioStation(channelId, station, btn) {
+  if (!channelId || !station?.station_id || !station?.stream_url) {
+    showError('Select a valid station to tune.');
+    return;
+  }
+  if (!isAdminUser()) {
+    showError('Only admins can change radio stations.');
+    return;
+  }
+  const targetBtn = btn;
+  const previousLabel = targetBtn?.textContent;
+  if (targetBtn) {
+    targetBtn.disabled = true;
+    targetBtn.textContent = 'Tuning…';
+  }
+  try {
+    const payload = {
+      station_id: station.station_id,
+      name: station.name || 'Radio station',
+      stream_url: station.stream_url,
+      country: station.country,
+      countrycode: station.countrycode,
+      bitrate: station.bitrate,
+      favicon: station.favicon,
+      homepage: station.homepage,
+      tags: Array.isArray(station.tags) ? station.tags : [],
+    };
+    const res = await fetch(`/api/radio/${encodeURIComponent(channelId)}/station`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await ensureOk(res);
+    await res.json();
+    showSuccess(`Tuned ${station.name || 'station'} on this channel.`);
+    await refreshChannels({ force: true }).catch(() => {});
+    renderRadioStations(radioCurrentResults, { context: radioResultsContextLabel });
+    fetchPlayerStatus();
+  } catch (err) {
+    showError(`Failed to tune station: ${err.message}`);
+  } finally {
+    if (targetBtn) {
+      targetBtn.textContent = previousLabel || 'Tune channel';
+      targetBtn.disabled = false;
+    }
+  }
+}
+
 function extractSpotifyPlaylistId(value) {
   if (!value || typeof value !== 'string') return null;
   const uriMatch = value.match(/^spotify:playlist:([A-Za-z0-9]+)$/);
@@ -3336,6 +3826,7 @@ const ICON_PREV = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" st
 const ICON_NEXT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="9 18 15 12 9 6 9 18"/><line x1="18" y1="6" x2="18" y2="18"/></svg>`;
 const ICON_PLAY = `<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="8,5 20,12 8,19"/></svg>`;
 const ICON_PAUSE = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="7" y="5" width="4" height="14" rx="1"/><rect x="13" y="5" width="4" height="14" rx="1"/></svg>`;
+const ICON_STOP = `<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>`;
 const TRACK_PLAY_ICON = '<svg viewBox="0 0 24 24" fill="currentColor" role="img" aria-hidden="true"><polygon points="9,6 19,12 9,18"/></svg>';
 const ICON_REPEAT = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 014-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 01-4 4H3"/></svg>`;
 const PLAYLIST_FALLBACK_COVER = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" preserveAspectRatio="xMidYMid meet"><defs><linearGradient id="g" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="%2322c55e" stop-opacity="0.35"/><stop offset="100%" stop-color="%230f172a"/></linearGradient></defs><rect width="300" height="300" fill="url(%23g)"/><text x="150" y="160" text-anchor="middle" font-size="90" fill="%23f8fafc">&#9835;</text></svg>';
@@ -5291,6 +5782,7 @@ function buildPlayerResumePayload() {
 
 function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   if (!playerPanel) return;
+  radioPlaybackState = null;
   if (playerTick) {
     clearInterval(playerTick);
     playerTick = null;
@@ -5332,6 +5824,7 @@ function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   playerPrev.disabled = true;
   playerPlay.disabled = true;
   playerNext.disabled = true;
+  if (playerPlay) playerPlay.dataset.radioChannelId = '';
   if (playerShuffleBtn) playerShuffleBtn.disabled = true;
   if (playerRepeatBtn) playerRepeatBtn.disabled = true;
   setShuffleActive(false);
@@ -5341,11 +5834,20 @@ function setPlayerIdleState(message = 'Player unavailable', options = {}) {
 
 async function fetchPlayerStatus() {
   if (!isAuthenticated()) return;
-  const channelId = getActiveChannelId();
-  if (!channelId) {
+  const channel = getActiveChannel();
+  if (!channel) {
     setPlayerIdleState('Select a channel to control playback', { forceClear: true });
     return;
   }
+  if (isRadioChannel(channel)) {
+    await fetchRadioPlaybackStatus(channel);
+    return;
+  }
+  await fetchSpotifyPlayerStatus(channel.id);
+}
+
+async function fetchSpotifyPlayerStatus(channelId) {
+  if (!channelId) return;
   try {
     const res = await fetch(withChannel('/api/spotify/player/status', channelId));
     await ensureOk(res);
@@ -5375,7 +5877,120 @@ async function fetchPlayerStatus() {
   }
 }
 
+async function fetchRadioPlaybackStatus(channel) {
+  if (!channel?.id) return;
+  try {
+    const res = await fetch(`/api/radio/status/${encodeURIComponent(channel.id)}`);
+    await ensureOk(res);
+    const payload = await res.json();
+    renderRadioPlayer(channel, payload);
+  } catch (err) {
+    renderRadioPlayer(channel, null, { error: err.message || 'Radio status unavailable' });
+  }
+}
+
+function describeRadioRuntimeState(state) {
+  if (!state) return '';
+  switch (state) {
+    case 'playing':
+      return 'Live';
+    case 'connecting':
+      return 'Connecting';
+    case 'buffering':
+      return 'Buffering';
+    case 'error':
+      return 'Error';
+    case 'idle':
+    default:
+      return state.charAt(0).toUpperCase() + state.slice(1);
+  }
+}
+
+function renderRadioPlayer(channel, payload, options = {}) {
+  if (!playerPanel) return;
+  playerStatus = null;
+  playerPanel.style.display = 'flex';
+  const radioState = payload?.radio_state || getRadioState(channel) || {};
+  if (channel?.id) {
+    updateChannelRadioState(channel.id, radioState);
+  }
+  const runtime = payload?.runtime || {};
+  const enabled = payload?.enabled ?? channel?.enabled ?? true;
+  const hasStation = !!radioState.stream_url;
+  const playbackEnabled = radioState.playback_enabled !== false;
+  const canToggle = enabled && hasStation;
+  const runtimeLabel = describeRadioRuntimeState(runtime.state);
+  let titleBase = radioState.station_name || channel?.name || 'Radio channel';
+  if (!hasStation) titleBase = channel?.name || 'Radio channel';
+  const metadata = radioState.last_metadata || {};
+  const metadataParts = [];
+  if (metadata.artist) metadataParts.push(metadata.artist);
+  if (metadata.title) metadataParts.push(metadata.title);
+  if (!metadataParts.length && metadata.text) metadataParts.push(metadata.text);
+  let subtitle = options.error || metadataParts.join(' – ');
+  if (!subtitle) {
+    const fallbackParts = [];
+    if (radioState.station_country) fallbackParts.push(radioState.station_country);
+    if (radioState.bitrate) fallbackParts.push(`${radioState.bitrate} kbps`);
+    if (runtime.message) fallbackParts.push(runtime.message);
+    subtitle = fallbackParts.join(' • ');
+  }
+  if (!enabled) subtitle = 'Enable this channel in Settings to start playback.';
+  else if (!hasStation && !options.error) subtitle = 'Select a station to start playback.';
+  if (!subtitle) subtitle = hasStation ? 'Streaming radio' : 'Radio offline';
+  playerTitle.textContent = runtimeLabel && hasStation ? `${titleBase} (${runtimeLabel})` : titleBase;
+  playerArtist.textContent = subtitle;
+  if (radioState.station_favicon) {
+    playerArt.src = radioState.station_favicon;
+    playerArt.alt = radioState.station_name ? `${radioState.station_name} artwork` : 'Station artwork';
+    playerArt.style.display = 'block';
+  } else {
+    playerArt.style.display = 'none';
+    playerArt.alt = '';
+  }
+  setPlayerArtInteractivity(false);
+  lastCoverArtUrl = radioState.station_favicon || null;
+  applyCoverArtBackground();
+  playerSeek.disabled = true;
+  playerSeek.value = 0;
+  setRangeProgress(playerSeek, 0, playerSeek.max || 1);
+  playerTimeCurrent.textContent = '—';
+  playerTimeTotal.textContent = hasStation ? 'Live' : '0:00';
+  let buttonLabel;
+  if (!enabled) buttonLabel = 'Enable this channel in Settings to start radio';
+  else if (!hasStation) buttonLabel = 'Select a station to start radio';
+  else buttonLabel = playbackEnabled ? 'Stop radio' : 'Play radio';
+  setPlayButtonIcon(playbackEnabled && hasStation && enabled, { variant: 'radio', label: buttonLabel });
+  if (playerPlay) {
+    playerPlay.disabled = !canToggle;
+    playerPlay.dataset.radioChannelId = channel?.id || '';
+  }
+  playerPrev.disabled = true;
+  playerNext.disabled = true;
+  if (playerShuffleBtn) {
+    playerShuffleBtn.disabled = true;
+    setShuffleActive(false);
+  }
+  if (playerRepeatBtn) {
+    playerRepeatBtn.disabled = true;
+    setRepeatMode('off');
+  }
+  if (playerTick) {
+    clearInterval(playerTick);
+    playerTick = null;
+  }
+  setTakeoverBannerVisible(false);
+  radioPlaybackState = {
+    channelId: channel?.id || null,
+    playbackEnabled,
+    hasStation,
+    enabled: !!enabled,
+    runtimeState: runtime?.state || 'idle',
+  };
+}
+
 function renderPlayer(status) {
+  radioPlaybackState = null;
   const item = status?.item || {};
   const active = !!status?.active;
   const resumeAvailable = !!status?.allowResume && !active;
@@ -5422,6 +6037,9 @@ function renderPlayer(status) {
   setPlayButtonIcon(playing);
   playerPrev.disabled = !active;
   playerPlay.disabled = !showMeta;
+  if (playerPlay && playerPlay.dataset.radioChannelId) {
+    playerPlay.dataset.radioChannelId = '';
+  }
   playerNext.disabled = !active;
   playerSeek.disabled = !active;
   if (playerShuffleBtn) {
@@ -5454,6 +6072,41 @@ function renderPlayer(status) {
       playerTimeTotal.textContent = msToTime(dur);
     }, 1000);
   }
+}
+
+async function handleRadioPlayToggle(channel) {
+  if (!channel || !channel.id) {
+    showError('Select a radio channel before toggling playback.');
+    return;
+  }
+  const snapshot = resolveRadioPlaybackSnapshot(channel);
+  if (!snapshot.hasStation) {
+    showError('Select a station to start radio playback.');
+    return;
+  }
+  if (!snapshot.enabled) {
+    showError('Enable this channel in Settings to control radio playback.');
+    return;
+  }
+  const action = snapshot.playbackEnabled ? 'stop' : 'start';
+  if (playerPlay) {
+    playerPlay.disabled = true;
+  }
+  try {
+    const res = await fetch(`/api/radio/${encodeURIComponent(channel.id)}/playback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    updateChannelRadioState(channel.id, data?.radio_state || null);
+  } catch (err) {
+    if (playerPlay) playerPlay.disabled = false;
+    showError(`Failed to ${action === 'start' ? 'start' : 'stop'} radio: ${err.message}`);
+    return;
+  }
+  await fetchRadioPlaybackStatus(getChannelById(channel.id) || channel);
 }
 
 function buildPlayerActionPath(path, body, channelId) {
@@ -6073,8 +6726,43 @@ if (playlistOverlay) {
     if (evt.target === playlistOverlay) closePlaylistOverlay();
   });
 }
+if (radioOverlay) {
+  radioOverlay.addEventListener('click', evt => {
+    if (evt.target === radioOverlay) closeRadioOverlay();
+  });
+}
+if (radioCloseBtn) {
+  radioCloseBtn.addEventListener('click', closeRadioOverlay);
+}
+radioTabs.forEach(btn => {
+  if (!btn?.dataset?.radioTab) return;
+  btn.addEventListener('click', () => {
+    setRadioActiveTab(btn.dataset.radioTab, { focusSearch: btn.dataset.radioTab === 'search' });
+  });
+});
+radioTopButtons.forEach(btn => {
+  if (!btn?.dataset?.radioTopMetric) return;
+  btn.addEventListener('click', () => {
+    loadRadioTopStations(btn.dataset.radioTopMetric);
+  });
+});
+if (radioCountrySelect) {
+  radioCountrySelect.addEventListener('change', handleRadioCountryChange);
+}
+if (radioSearchForm) {
+  radioSearchForm.addEventListener('submit', evt => {
+    evt.preventDefault();
+    const query = (radioSearchInput?.value || '').trim();
+    if (!query) {
+      setRadioResultsStatus('Enter a keyword to search stations.');
+      if (radioResultsList) radioResultsList.innerHTML = '';
+      return;
+    }
+    runRadioSearch({ query }, { context: `search “${query}”` });
+  });
+}
 if (playerPlaylistsBtn) playerPlaylistsBtn.setAttribute('aria-expanded', 'false');
-if (playerPlaylistsBtn) playerPlaylistsBtn.addEventListener('click', openPlaylistOverlay);
+if (playerPlaylistsBtn) playerPlaylistsBtn.addEventListener('click', handlePlayerPlaylistsClick);
 if (playlistCloseBtn) playlistCloseBtn.addEventListener('click', closePlaylistOverlay);
 if (playlistBackBtn) playlistBackBtn.addEventListener('click', handlePlaylistBack);
 if (playlistSearchInput) {
@@ -6093,10 +6781,7 @@ if (playlistSortSelect) {
 
 if (playerSearchBtn) playerSearchBtn.setAttribute('aria-expanded', 'false');
 if (playerSearchBtn) {
-  playerSearchBtn.addEventListener('click', () => {
-    setVolumeSliderOpen(false);
-    openSearchOverlay();
-  });
+  playerSearchBtn.addEventListener('click', handlePlayerSearchClick);
 }
 if (searchCloseBtn) searchCloseBtn.addEventListener('click', closeSearchOverlay);
 if (searchOverlay) {
@@ -6146,6 +6831,11 @@ playerPrev.addEventListener('click', () => {
 });
 playerPlay.addEventListener('click', () => {
   if (playerPlay.disabled) return;
+  const channel = getActiveChannel();
+  if (isRadioChannel(channel)) {
+    handleRadioPlayToggle(channel);
+    return;
+  }
   if (playerStatus?.is_playing) playerAction('/api/spotify/player/pause');
   else {
     const resumePayload = playerStatus?.allowResume ? buildPlayerResumePayload() : null;
