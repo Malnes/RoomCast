@@ -1,5 +1,6 @@
 function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   if (!playerPanel) return;
+  optimisticSeekState = null;
   radioPlaybackState = null;
   if (playerTick) {
     clearInterval(playerTick);
@@ -123,6 +124,7 @@ function describeRadioRuntimeState(state) {
 
 function renderRadioPlayer(channel, payload, options = {}) {
   if (!playerPanel) return;
+  optimisticSeekState = null;
   playerStatus = null;
   playerPanel.style.display = 'flex';
   const radioState = payload?.radio_state || getRadioState(channel) || {};
@@ -213,8 +215,11 @@ function renderRadioPlayer(channel, payload, options = {}) {
 }
 
 const PLAYER_STOP_ALL_HOLD_MS = 1500;
+const PLAYER_SEEK_OPTIMISTIC_WINDOW_MS = 3000;
+const PLAYER_SEEK_TOLERANCE_MS = 750;
 let playerPlayHoldTimer = null;
 let playerPlayHoldTriggered = false;
+let optimisticSeekState = null;
 
 function cancelPlayerHoldToStop(options = {}) {
   if (playerPlayHoldTimer) {
@@ -235,6 +240,58 @@ function armPlayerHoldToStop() {
     playerPlayHoldTriggered = true;
     await confirmStopAllPlayback();
   }, PLAYER_STOP_ALL_HOLD_MS);
+}
+
+function clampSeekProgress(value, duration) {
+  const safeValue = Number.isFinite(value) ? value : 0;
+  if (!Number.isFinite(duration) || duration <= 0) return Math.max(0, safeValue);
+  return Math.min(Math.max(safeValue, 0), duration);
+}
+
+function resolveOptimisticSeekProgress(progress, duration, status) {
+  if (!optimisticSeekState) return { progress, pending: false };
+  if (!status?.active || !playerSeek) {
+    optimisticSeekState = null;
+    return { progress, pending: false };
+  }
+  const activeChannelId = getActiveChannelId();
+  if (!activeChannelId || optimisticSeekState.channelId !== activeChannelId) {
+    optimisticSeekState = null;
+    return { progress, pending: false };
+  }
+  const now = Date.now();
+  if (now - optimisticSeekState.requestedAt > PLAYER_SEEK_OPTIMISTIC_WINDOW_MS) {
+    optimisticSeekState = null;
+    return { progress, pending: false };
+  }
+  if (progress >= (optimisticSeekState.requestedProgress - PLAYER_SEEK_TOLERANCE_MS)) {
+    optimisticSeekState = null;
+    return { progress, pending: false };
+  }
+  const capped = clampSeekProgress(optimisticSeekState.requestedProgress, duration);
+  return { progress: capped, pending: true };
+}
+
+function noteOptimisticSeek(requestedProgress) {
+  if (!playerSeek) return;
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    optimisticSeekState = null;
+    return;
+  }
+  const duration = Number(playerSeek.max) || playerStatus?.item?.duration_ms || 0;
+  const clamped = clampSeekProgress(Number(requestedProgress) || 0, duration);
+  optimisticSeekState = {
+    channelId,
+    requestedProgress: clamped,
+    requestedAt: Date.now(),
+  };
+  playerSeek.value = clamped;
+  setRangeProgress(playerSeek, clamped, duration || 1);
+  playerTimeCurrent.textContent = msToTime(clamped);
+  if (playerStatus) {
+    playerStatus.progress_ms = clamped;
+  }
 }
 
 async function confirmStopAllPlayback() {
@@ -324,11 +381,13 @@ function renderPlayer(status) {
   lastCoverArtUrl = art || null;
   applyCoverArtBackground();
   const duration = item.duration_ms || 0;
-  const progress = status?.progress_ms || 0;
+  const baseProgress = status?.progress_ms || 0;
+  const { progress: displayProgress } = resolveOptimisticSeekProgress(baseProgress, duration, status);
   playerSeek.max = duration || 1;
-  playerSeek.value = progress;
-  setRangeProgress(playerSeek, progress, duration || 1);
-  playerTimeCurrent.textContent = msToTime(progress);
+  playerSeek.value = displayProgress;
+  setRangeProgress(playerSeek, displayProgress, duration || 1);
+  playerTimeCurrent.textContent = msToTime(displayProgress);
+  status.progress_ms = displayProgress;
   playerTimeTotal.textContent = msToTime(duration);
   const playing = !!status?.is_playing && active;
   setPlayButtonIcon(playing);
@@ -1196,8 +1255,18 @@ playerNext.addEventListener('click', () => {
   if (playerNext.disabled) return;
   playerAction('/api/spotify/player/next');
 });
-playerSeek.addEventListener('input', () => setRangeProgress(playerSeek, playerSeek.value, playerSeek.max || 1));
-playerSeek.addEventListener('change', () => playerAction('/api/spotify/player/seek', { position_ms: Number(playerSeek.value) }));
+playerSeek.addEventListener('input', () => {
+  const value = Number(playerSeek.value);
+  const safeValue = Number.isFinite(value) ? value : 0;
+  setRangeProgress(playerSeek, safeValue, playerSeek.max || 1);
+  playerTimeCurrent.textContent = msToTime(safeValue);
+});
+playerSeek.addEventListener('change', () => {
+  const parsed = Number(playerSeek.value);
+  const targetPosition = Number.isFinite(parsed) ? parsed : 0;
+  noteOptimisticSeek(targetPosition);
+  playerAction('/api/spotify/player/seek', { position_ms: targetPosition });
+});
 playerShuffleBtn.addEventListener('click', () => {
   if (playerShuffleBtn.disabled) return;
   const current = typeof playerStatus?.shuffle_state === 'boolean'
