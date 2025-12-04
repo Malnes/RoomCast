@@ -198,8 +198,15 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 .collapsible-panel[data-open="true"] .collapsible-content { display: block; }
 .channels-settings { display: flex; flex-direction: column; gap: 12px; }
 .channel-card { border: 1px solid rgba(255,255,255,0.08); border-radius: 16px; background: rgba(6,10,22,0.7); padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.channel-card[data-channel-enabled="false"] { opacity: 0.65; border-style: dashed; }
 .channel-card[data-dirty="true"] { border-color: rgba(var(--accent-rgb),0.5); box-shadow: 0 0 0 1px rgba(var(--accent-rgb),0.2); }
 .channel-card-header { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; align-items: end; }
+.channel-card-availability { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.04); }
+.channel-availability-meta { flex: 1; }
+.channel-availability-help { font-size: 12px; color: #94a3b8; margin-top: 4px; }
+.channel-availability-control { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+.channel-availability-control input[type="checkbox"] { width: auto; }
+.channel-availability-state { font-size: 13px; color: #e2e8f0; }
 .channel-color-inputs { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 .channel-color-inputs input[type="text"] { flex: 1 0 110px; min-width: 90px; }
 .channel-color-inputs input[type="color"] { width: 48px; height: 38px; padding: 0; border-radius: 10px; border: 1px solid rgba(255,255,255,0.2); background: transparent; cursor: pointer; }

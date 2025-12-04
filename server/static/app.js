@@ -611,6 +611,14 @@ function getChannelById(channelId) {
   return channelsCache.find(ch => ch.id === channelId) || null;
 }
 
+function isChannelEnabled(channel) {
+  return channel?.enabled !== false;
+}
+
+function getPlayerChannels() {
+  return channelsCache.filter(isChannelEnabled);
+}
+
 function getChannelAccentColor(channelId) {
   const channel = getChannelById(channelId);
   return normalizeChannelColorInput(channel?.color);
@@ -662,6 +670,8 @@ function resolveNodeChannelId(node) {
   if (node?.channel_id && channelsCache.some(ch => ch.id === node.channel_id)) {
     return node.channel_id;
   }
+  const playable = getPlayerChannels();
+  if (playable.length) return playable[0].id;
   return channelsCache[0]?.id || null;
 }
 
@@ -672,10 +682,15 @@ function updateChannelDotColor(target, channelId) {
 }
 
 function getActiveChannelId() {
-  if (activeChannelId && channelsCache.some(ch => ch.id === activeChannelId)) {
+  const playable = getPlayerChannels();
+  if (!playable.length) {
+    activeChannelId = null;
+    return null;
+  }
+  if (activeChannelId && playable.some(ch => ch.id === activeChannelId)) {
     return activeChannelId;
   }
-  activeChannelId = channelsCache[0]?.id || null;
+  activeChannelId = playable[0].id;
   return activeChannelId;
 }
 
@@ -689,8 +704,9 @@ function resolveChannelSwipeDirection(previousId, nextId, hintedDirection) {
     return hintedDirection;
   }
   if (!previousId || !nextId || previousId === nextId) return null;
-  const prevIndex = channelsCache.findIndex(ch => ch.id === previousId);
-  const nextIndex = channelsCache.findIndex(ch => ch.id === nextId);
+  const playable = getPlayerChannels();
+  const prevIndex = playable.findIndex(ch => ch.id === previousId);
+  const nextIndex = playable.findIndex(ch => ch.id === nextId);
   if (prevIndex === -1 || nextIndex === -1) return null;
   return nextIndex > prevIndex ? PLAYER_SWIPE_DIRECTIONS.FORWARD : PLAYER_SWIPE_DIRECTIONS.BACKWARD;
 }
@@ -808,7 +824,8 @@ function resetPlayerPanelSwipeEffects() {
 
 function setActiveChannel(channelId, options = {}) {
   if (!channelId || channelId === activeChannelId) return;
-  if (!channelsCache.some(ch => ch.id === channelId)) return;
+  const targetChannel = getChannelById(channelId);
+  if (!targetChannel || !isChannelEnabled(targetChannel)) return;
   const previous = activeChannelId;
   activeChannelId = channelId;
   if (previous && options.animate !== false) {
@@ -852,12 +869,13 @@ function updatePlayerCarouselIndicators() {
   if (!playerCarouselIndicators) return;
   playerCarouselIndicators.innerHTML = '';
   playerCarouselIndicatorRefs.clear();
-  if (channelsCache.length <= 1) {
+  const playableChannels = getPlayerChannels();
+  if (playableChannels.length <= 1) {
     playerCarouselIndicators.hidden = true;
     return;
   }
   playerCarouselIndicators.hidden = false;
-  channelsCache.forEach(channel => {
+  playableChannels.forEach(channel => {
     if (!channel?.id) return;
     const btn = document.createElement('button');
     btn.type = 'button';
@@ -875,8 +893,9 @@ function updatePlayerCarouselIndicators() {
 
 function getActiveChannelIndex() {
   const activeId = getActiveChannelId();
-  if (!activeId) return 0;
-  const idx = channelsCache.findIndex(ch => ch.id === activeId);
+  const playable = getPlayerChannels();
+  if (!activeId || !playable.length) return 0;
+  const idx = playable.findIndex(ch => ch.id === activeId);
   return idx === -1 ? 0 : idx;
 }
 
@@ -902,15 +921,16 @@ function syncPlayerCarouselToActive(options = {}) {
   updatePlayerCarouselIndicatorState();
   updatePlayerCarouselPosition(getActiveChannelIndex(), animate);
   if (playerPanel) {
-    playerPanel.classList.toggle('is-carousel-enabled', channelsCache.length > 1);
+    playerPanel.classList.toggle('is-carousel-enabled', getPlayerChannels().length > 1);
   }
 }
 
 function renderPlayerCarousel() {
   if (!playerCarouselTrack) return;
-  if (!channelsCache.length) {
+  const playableChannels = getPlayerChannels();
+  if (!playableChannels.length) {
     if (playerCarouselTrack) {
-      playerCarouselTrack.innerHTML = '<div class="player-carousel-empty">Add a channel in Settings to begin playback.</div>';
+      playerCarouselTrack.innerHTML = '<div class="player-carousel-empty">Enable a channel in Settings to begin playback.</div>';
     }
     playerCarouselCards.clear();
     updatePlayerCarouselIndicators();
@@ -920,7 +940,7 @@ function renderPlayerCarousel() {
   }
   const fragment = document.createDocumentFragment();
   const seen = new Set();
-  channelsCache.forEach(channel => {
+  playableChannels.forEach(channel => {
     if (!channel?.id) return;
     const card = updatePlayerCarouselCards(channel);
     if (card) fragment.appendChild(card);
@@ -939,11 +959,14 @@ function renderPlayerCarousel() {
 }
 
 function selectAdjacentChannel(step) {
-  if (!channelsCache.length) return false;
-  const currentIdx = getActiveChannelIndex();
-  const nextIdx = step < 0 ? Math.max(0, currentIdx - 1) : Math.min(channelsCache.length - 1, currentIdx + 1);
+  const playable = getPlayerChannels();
+  if (!playable.length) return false;
+  const activeId = getActiveChannelId();
+  const currentIdx = playable.findIndex(ch => ch.id === activeId);
+  if (currentIdx === -1) return false;
+  const nextIdx = step < 0 ? Math.max(0, currentIdx - 1) : Math.min(playable.length - 1, currentIdx + 1);
   if (nextIdx === currentIdx) return false;
-  const nextChannel = channelsCache[nextIdx];
+  const nextChannel = playable[nextIdx];
   if (nextChannel?.id) {
     const direction = step < 0 ? PLAYER_SWIPE_DIRECTIONS.BACKWARD : PLAYER_SWIPE_DIRECTIONS.FORWARD;
     setActiveChannel(nextChannel.id, { direction });
@@ -1092,15 +1115,14 @@ function renderChannelsPanel() {
     const nameValue = Object.prototype.hasOwnProperty.call(pending, 'name')
       ? pending.name
       : channel.name || '';
-    const snapValue = Object.prototype.hasOwnProperty.call(pending, 'snap_stream')
-      ? pending.snap_stream
-      : channel.snap_stream || '';
     const hasPendingColor = Object.prototype.hasOwnProperty.call(pending, 'color');
     const colorValue = hasPendingColor ? pending.color : channel.color;
+    const enabled = isChannelEnabled(channel);
 
     const card = document.createElement('div');
     card.className = 'channel-card';
     card.dataset.channelId = channel.id;
+    card.dataset.channelEnabled = enabled ? 'true' : 'false';
 
     const header = document.createElement('div');
     header.className = 'channel-card-header';
@@ -1113,15 +1135,6 @@ function renderChannelsPanel() {
     nameGroup.appendChild(nameLabel);
     nameGroup.appendChild(nameInput);
     header.appendChild(nameGroup);
-
-    const snapGroup = document.createElement('div');
-    const snapLabel = document.createElement('label');
-    snapLabel.textContent = 'Snapcast stream';
-    const snapInput = document.createElement('input');
-    snapInput.value = snapValue;
-    snapGroup.appendChild(snapLabel);
-    snapGroup.appendChild(snapInput);
-    header.appendChild(snapGroup);
 
     const colorGroup = document.createElement('div');
     const colorLabel = document.createElement('label');
@@ -1143,6 +1156,36 @@ function renderChannelsPanel() {
 
     card.appendChild(header);
 
+  const availability = document.createElement('div');
+  availability.className = 'channel-card-availability';
+
+  const availabilityMeta = document.createElement('div');
+  availabilityMeta.className = 'channel-availability-meta';
+  const availabilityLabel = document.createElement('div');
+  availabilityLabel.className = 'label';
+  availabilityLabel.textContent = 'Channel availability';
+  const availabilityHelp = document.createElement('div');
+  availabilityHelp.className = 'channel-availability-help';
+  availabilityHelp.textContent = 'Hidden from the player carousel when disabled.';
+  availabilityMeta.appendChild(availabilityLabel);
+  availabilityMeta.appendChild(availabilityHelp);
+
+  const availabilityControl = document.createElement('div');
+  availabilityControl.className = 'channel-availability-control';
+  const availabilityToggle = document.createElement('input');
+  availabilityToggle.type = 'checkbox';
+  availabilityToggle.checked = enabled;
+  availabilityToggle.setAttribute('aria-label', `Toggle ${nameValue || channel.id} availability`);
+  const availabilityState = document.createElement('span');
+  availabilityState.className = 'channel-availability-state';
+  availabilityState.textContent = enabled ? 'Enabled' : 'Disabled';
+  availabilityControl.appendChild(availabilityToggle);
+  availabilityControl.appendChild(availabilityState);
+
+  availability.appendChild(availabilityMeta);
+  availability.appendChild(availabilityControl);
+  card.appendChild(availability);
+
     const status = document.createElement('div');
     status.className = 'channel-card-status';
     status.textContent = 'Synced';
@@ -1163,16 +1206,16 @@ function renderChannelsPanel() {
     const refs = {
       card,
       nameInput,
-      snapInput,
       colorPicker,
       colorTextInput: colorText,
       saveButton: saveBtn,
       statusEl: status,
+      availabilityToggle,
+      availabilityState,
     };
     channelFormRefs.set(channel.id, refs);
 
     nameInput.addEventListener('input', () => updateChannelCardState(channel.id));
-    snapInput.addEventListener('input', () => updateChannelCardState(channel.id));
     colorPicker.addEventListener('input', () => {
       colorText.value = colorPicker.value;
       updateChannelCardState(channel.id);
@@ -1184,6 +1227,7 @@ function renderChannelsPanel() {
       }
       updateChannelCardState(channel.id);
     });
+    availabilityToggle.addEventListener('change', () => handleChannelAvailabilityChange(channel.id, availabilityToggle));
     saveBtn.addEventListener('click', () => saveChannelChanges(channel.id));
 
     updateChannelCardState(channel.id);
@@ -1194,8 +1238,8 @@ function updateChannelCardState(channelId) {
   const refs = channelFormRefs.get(channelId);
   if (!refs) return;
   const base = getChannelById(channelId) || {};
+  const channelEnabled = isChannelEnabled(base);
   const nameValue = (refs.nameInput.value || '').trim();
-  const snapValue = (refs.snapInput.value || '').trim();
   const colorRaw = (refs.colorTextInput.value || '').trim();
   const normalizedColor = colorRaw ? normalizeChannelColorInput(colorRaw) : null;
   if (colorRaw && !normalizedColor) {
@@ -1212,21 +1256,10 @@ function updateChannelCardState(channelId) {
     channelPendingEdits.delete(channelId);
     return;
   }
-  if (!snapValue) {
-    refs.statusEl.textContent = 'Snap stream required';
-    refs.card.dataset.dirty = 'false';
-    refs.saveButton.disabled = true;
-    channelPendingEdits.delete(channelId);
-    return;
-  }
   const pending = {};
   let hasDiff = false;
   if (nameValue !== base.name) {
     pending.name = nameValue;
-    hasDiff = true;
-  }
-  if (snapValue !== base.snap_stream) {
-    pending.snap_stream = snapValue;
     hasDiff = true;
   }
   const baseColor = base.color || null;
@@ -1243,7 +1276,7 @@ function updateChannelCardState(channelId) {
   } else {
     channelPendingEdits.delete(channelId);
     refs.card.dataset.dirty = 'false';
-    refs.statusEl.textContent = 'Synced';
+    refs.statusEl.textContent = channelEnabled ? 'Channel enabled' : 'Channel disabled';
     refs.saveButton.disabled = true;
   }
 }
@@ -1284,6 +1317,68 @@ async function saveChannelChanges(channelId) {
       refs.saveButton.textContent = 'Save changes';
       refs.saveButton.disabled = !channelPendingEdits.has(channelId);
     }
+  }
+}
+
+async function handleChannelAvailabilityChange(channelId, checkboxEl) {
+  const refs = channelFormRefs.get(channelId);
+  if (!checkboxEl) return;
+  const nextEnabled = checkboxEl.checked;
+  const previousActiveId = getActiveChannelId();
+  const canUpdateStatus = !channelPendingEdits.has(channelId);
+  checkboxEl.disabled = true;
+  if (refs?.availabilityState) {
+    refs.availabilityState.textContent = nextEnabled ? 'Enabling…' : 'Disabling…';
+  }
+  if (canUpdateStatus && refs?.statusEl) {
+    refs.statusEl.textContent = nextEnabled ? 'Enabling…' : 'Disabling…';
+  }
+  try {
+    const res = await fetch(`/api/channels/${encodeURIComponent(channelId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: nextEnabled }),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    let updatedChannel = data?.channel || null;
+    const idx = channelsCache.findIndex(ch => ch.id === channelId);
+    if (idx !== -1) {
+      updatedChannel = updatedChannel || { ...channelsCache[idx], enabled: nextEnabled };
+      channelsCache[idx] = updatedChannel;
+    }
+    if (refs) {
+      refs.card.dataset.channelEnabled = nextEnabled ? 'true' : 'false';
+      if (refs.availabilityState) {
+        refs.availabilityState.textContent = nextEnabled ? 'Enabled' : 'Disabled';
+      }
+      if (canUpdateStatus && refs.statusEl) {
+        refs.statusEl.textContent = nextEnabled ? 'Channel enabled' : 'Channel disabled';
+      }
+    }
+    const nextActiveId = getActiveChannelId();
+    renderPlayerCarousel();
+    populateSpotifyChannelSelect();
+    refreshNodeVolumeAccents();
+    applyChannelTheme(getActiveChannel());
+    if (!getPlayerChannels().length) {
+      setPlayerIdleState('Enable a channel to control playback', { forceClear: true });
+    }
+    if (previousActiveId !== nextActiveId) {
+      onActiveChannelChanged(previousActiveId, nextActiveId);
+    }
+    showSuccess(nextEnabled ? 'Channel enabled' : 'Channel disabled');
+  } catch (err) {
+    checkboxEl.checked = !nextEnabled;
+    if (refs?.availabilityState) {
+      refs.availabilityState.textContent = isChannelEnabled(getChannelById(channelId)) ? 'Enabled' : 'Disabled';
+    }
+    if (refs?.statusEl && canUpdateStatus) {
+      refs.statusEl.textContent = `Toggle failed: ${err.message}`;
+    }
+    showError(`Failed to ${nextEnabled ? 'enable' : 'disable'} channel: ${err.message}`);
+  } finally {
+    checkboxEl.disabled = false;
   }
 }
 

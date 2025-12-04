@@ -57,7 +57,7 @@ WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", 
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
 TRANSIENT_NODE_FIELDS = {"wifi"}
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.20").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.21").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
@@ -306,6 +306,13 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
     token_path = str(entry.get("token_path") or f"/config/spotify-token-{channel_id}.json")
     status_path = str(entry.get("status_path") or f"/config/librespot-status-{channel_id}.json")
     color = _sanitize_channel_color(entry.get("color"))
+    enabled_value = entry.get("enabled")
+    if enabled_value is None:
+        enabled = True
+    elif isinstance(enabled_value, str):
+        enabled = enabled_value.strip().lower() not in {"0", "false", "no"}
+    else:
+        enabled = bool(enabled_value)
     return {
         "id": channel_id,
         "name": name,
@@ -316,6 +323,7 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
         "token_path": token_path,
         "status_path": status_path,
         "color": color,
+        "enabled": enabled,
     }
 
 
@@ -331,6 +339,7 @@ def _default_channel_entries() -> list[dict]:
             "token_path": str(SPOTIFY_TOKEN_PATH),
             "status_path": str(LIBRESPOT_STATUS_PATH),
             "color": "#22c55e",
+            "enabled": True,
         },
         {
             "id": "ch2",
@@ -342,6 +351,7 @@ def _default_channel_entries() -> list[dict]:
             "token_path": "/config/spotify-token-ch2.json",
             "status_path": "/config/librespot-status-ch2.json",
             "color": "#0ea5e9",
+            "enabled": True,
         },
     ]
 
@@ -441,6 +451,7 @@ def channels_public() -> list[dict]:
             "snap_stream": entry["snap_stream"],
             "fifo_path": entry["fifo_path"],
             "color": entry.get("color"),
+            "enabled": entry.get("enabled", True),
         })
     return items
 
@@ -460,6 +471,7 @@ def channel_detail(channel_id: str) -> dict:
         "config_path": entry["config_path"],
         "token_path": entry["token_path"],
         "status_path": entry["status_path"],
+        "enabled": entry.get("enabled", True),
         "spotify": read_spotify_config(entry["id"]),
         "librespot_status": read_librespot_status(entry["id"]),
     }
@@ -484,6 +496,8 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
         if not snap_stream:
             raise HTTPException(status_code=400, detail="Snapstream name cannot be empty")
         channel["snap_stream"] = snap_stream
+    if "enabled" in updates:
+        channel["enabled"] = bool(updates.get("enabled"))
     if "order" in updates:
         try:
             channel["order"] = max(1, int(updates["order"]))
@@ -594,6 +608,7 @@ class ChannelUpdatePayload(BaseModel):
     color: Optional[str] = Field(default=None, min_length=1, max_length=7)
     order: Optional[int] = Field(default=None, ge=1, le=50)
     snap_stream: Optional[str] = Field(default=None, min_length=1, max_length=160)
+    enabled: Optional[bool] = None
 
 
 class SnapcastClient:
