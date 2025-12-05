@@ -859,6 +859,46 @@ app = FastAPI(title="RoomCast Controller", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
+async def _collect_channel_listener_counts() -> tuple[dict[str, int], bool]:
+    """Return (per-channel listeners, has_any_data)."""
+    counts: dict[str, int] = {cid: 0 for cid in channel_order}
+    stream_to_channel: dict[str, str] = {}
+    for cid in channel_order:
+        channel = channels_by_id.get(cid)
+        if not channel:
+            continue
+        stream_id = (channel.get("snap_stream") or "").strip()
+        if stream_id:
+            stream_to_channel[stream_id] = cid
+    data_sources = 0
+    try:
+        clients = await snapcast.list_clients()
+    except Exception as exc:  # pragma: no cover - network dependency
+        log.warning("Channel idle monitor: failed to list snapclients: %s", exc)
+        clients = None
+    if clients is not None:
+        data_sources += 1
+        for client in clients:
+            stream_id = client.get("_stream_id")
+            if not stream_id:
+                continue
+            cid = stream_to_channel.get(stream_id)
+            if not cid or not client.get("connected"):
+                continue
+            counts[cid] = counts.get(cid, 0) + 1
+    if webrtc_relay:
+        try:
+            webrtc_counts = await webrtc_relay.channel_listener_counts()
+        except Exception as exc:  # pragma: no cover - defensive logging
+            log.warning("Channel idle monitor: failed to read WebRTC listeners: %s", exc)
+        else:
+            data_sources += 1
+            for cid, value in (webrtc_counts or {}).items():
+                if value:
+                    counts[cid] = counts.get(cid, 0) + int(value)
+    return counts, data_sources > 0
+
+
 def _is_rpc_method_not_found_error(exc: Exception) -> bool:
     if isinstance(exc, RuntimeError):
         payload = exc.args[0] if exc.args else None
@@ -927,6 +967,8 @@ radio_assignment_waiters: set[asyncio.Future] = set()
 RADIO_ASSIGNMENT_DEFAULT_WAIT = float(os.getenv("RADIO_ASSIGNMENT_WAIT", "10"))
 RADIO_ASSIGNMENT_DEFAULT_WAIT = max(1.0, min(RADIO_ASSIGNMENT_DEFAULT_WAIT, 30.0))
 RADIO_ASSIGNMENT_MAX_WAIT = 30.0
+channel_idle_task: Optional[asyncio.Task] = None
+channel_idle_state: Dict[str, dict] = {}
 
 
 def _mark_radio_assignments_dirty() -> None:
@@ -2151,7 +2193,7 @@ async def _spotify_refresh_loop() -> None:
 
 @app.on_event("startup")
 async def _startup_events() -> None:
-    global webrtc_relay, node_health_task, spotify_refresh_task
+    global webrtc_relay, node_health_task, spotify_refresh_task, channel_idle_task
     if WEBRTC_ENABLED:
         webrtc_relay = WebAudioRelay(
             snap_host=SNAPSERVER_HOST,
@@ -2166,11 +2208,13 @@ async def _startup_events() -> None:
         node_health_task = asyncio.create_task(_node_health_loop())
     if spotify_refresh_task is None:
         spotify_refresh_task = asyncio.create_task(_spotify_refresh_loop())
+    if channel_idle_task is None:
+        channel_idle_task = asyncio.create_task(_channel_idle_loop())
 
 
 @app.on_event("shutdown")
 async def _shutdown_events() -> None:
-    global node_health_task, spotify_refresh_task
+    global node_health_task, spotify_refresh_task, channel_idle_task
     if webrtc_relay:
         await webrtc_relay.stop()
     if node_health_task:
@@ -2187,6 +2231,13 @@ async def _shutdown_events() -> None:
         except asyncio.CancelledError:
             pass
         spotify_refresh_task = None
+    if channel_idle_task:
+        channel_idle_task.cancel()
+        try:
+            await channel_idle_task
+        except asyncio.CancelledError:
+            pass
+        channel_idle_task = None
     await stop_local_agent()
 
 
@@ -2880,6 +2931,111 @@ async def _node_health_loop() -> None:
         while True:
             await _refresh_all_agent_nodes()
             await asyncio.sleep(max(5, NODE_HEALTH_INTERVAL))
+    except asyncio.CancelledError:
+        pass
+
+
+def _channel_should_monitor(channel: dict) -> bool:
+    if not channel.get("enabled", True):
+        return False
+    if not channel.get("snap_stream"):
+        return False
+    source = (channel.get("source") or "spotify").lower()
+    if source == "radio":
+        state = _ensure_radio_state(channel)
+        return bool(state.get("playback_enabled", True) and state.get("stream_url"))
+    return True
+
+
+async def _stop_channel_due_to_idle(channel: dict) -> bool:
+    cid = channel.get("id") or ""
+    if not cid:
+        return False
+    source = (channel.get("source") or "spotify").lower()
+    if source == "radio":
+        state = _ensure_radio_state(channel)
+        if not state.get("playback_enabled", True):
+            return False
+        now = int(time.time())
+        state["playback_enabled"] = False
+        state["updated_at"] = now
+        channel["radio_state"] = state
+        save_channels()
+        _mark_radio_assignments_dirty()
+        radio_runtime_status[cid] = {
+            "state": "idle",
+            "message": "Radio stopped (no listeners)",
+            "bitrate": None,
+            "station_id": state.get("station_id"),
+            "metadata": None,
+            "updated_at": now,
+        }
+        log.info("Auto-stopped radio channel %s after %.0f seconds without listeners", cid, CHANNEL_IDLE_TIMEOUT)
+        return True
+    try:
+        await _spotify_control("/me/player/pause", "PUT", channel_id=cid)
+        log.info("Auto-paused Spotify channel %s after %.0f seconds without listeners", cid, CHANNEL_IDLE_TIMEOUT)
+        return True
+    except HTTPException as exc:
+        parsed = _parse_spotify_error(exc.detail)
+        reason = (parsed.get("reason") or "").strip().lower()
+        message = (parsed.get("message") or "").strip()
+        detail_text = message or (exc.detail if isinstance(exc.detail, str) else str(exc.detail))
+        if reason == "no_active_device" or (
+            isinstance(detail_text, str) and "no active device" in detail_text.lower()
+        ):
+            log.debug("Auto-stop skipped for Spotify channel %s: no active device", cid)
+            return True
+        log.warning("Auto-stop failed for Spotify channel %s: %s", cid, detail_text)
+        return False
+    except Exception as exc:  # pragma: no cover - defensive
+        log.exception("Auto-stop failed for Spotify channel %s", cid)
+        return False
+
+
+async def _evaluate_channel_idle() -> None:
+    counts, has_data = await _collect_channel_listener_counts()
+    if not has_data:
+        return
+    now = time.time()
+    tracked: set[str] = set()
+    for cid in channel_order:
+        channel = channels_by_id.get(cid)
+        if not channel:
+            channel_idle_state.pop(cid, None)
+            continue
+        if not _channel_should_monitor(channel):
+            channel_idle_state.pop(cid, None)
+            continue
+        tracked.add(cid)
+        listeners = counts.get(cid, 0)
+        state = channel_idle_state.setdefault(cid, {"idle_since": None, "stopped": False})
+        if listeners > 0:
+            state["idle_since"] = None
+            state["stopped"] = False
+            state["last_active"] = now
+            continue
+        if state.get("idle_since") is None:
+            state["idle_since"] = now
+        idle_for = now - (state.get("idle_since") or now)
+        if idle_for < CHANNEL_IDLE_TIMEOUT or state.get("stopped"):
+            continue
+        stopped = await _stop_channel_due_to_idle(channel)
+        if stopped:
+            state["stopped"] = True
+    for cid in list(channel_idle_state.keys()):
+        if cid not in tracked:
+            channel_idle_state.pop(cid, None)
+
+
+async def _channel_idle_loop() -> None:
+    try:
+        while True:
+            try:
+                await _evaluate_channel_idle()
+            except Exception:
+                log.exception("Channel idle monitor iteration failed")
+            await asyncio.sleep(CHANNEL_IDLE_POLL_INTERVAL)
     except asyncio.CancelledError:
         pass
 

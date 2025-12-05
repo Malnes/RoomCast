@@ -510,6 +510,19 @@ async function activateRoomcastDevice(play = false) {
   return data;
 }
 
+async function prepareRoomcastDeviceForResume(resumePayload) {
+  if (!resumePayload) return;
+  if (playerStatus?.active) return;
+  if (playerStatus?.device_is_roomcast === false) return;
+  const deviceId = getActiveDeviceId();
+  if (deviceId) return;
+  try {
+    await activateRoomcastDevice(false);
+  } catch (err) {
+    console.warn('RoomCast device activation before resume failed:', err);
+  }
+}
+
 async function playerAction(path, body, options = {}) {
   const channelId = getActiveChannelId();
   if (!channelId) {
@@ -1233,7 +1246,7 @@ playerPrev.addEventListener('click', () => {
   if (playerPrev.disabled) return;
   playerAction('/api/spotify/player/previous');
 });
-playerPlay.addEventListener('click', () => {
+playerPlay.addEventListener('click', async () => {
   cancelPlayerHoldToStop();
   if (playerPlay.disabled) return;
   if (playerPlayHoldTriggered) {
@@ -1248,6 +1261,7 @@ playerPlay.addEventListener('click', () => {
   if (playerStatus?.is_playing) playerAction('/api/spotify/player/pause');
   else {
     const resumePayload = playerStatus?.allowResume ? buildPlayerResumePayload() : null;
+    await prepareRoomcastDeviceForResume(resumePayload);
     playerAction('/api/spotify/player/play', resumePayload || undefined);
   }
 });

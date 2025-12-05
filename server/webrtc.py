@@ -617,5 +617,8 @@ class WebAudioRelay:
                 await source.pump.stop()
             finally:
                 self._channel_stop_tasks.pop(channel_id, None)
-
         self._channel_stop_tasks[channel_id] = asyncio.create_task(_delayed_stop())
+
+    async def channel_listener_counts(self) -> dict[str, int]:
+        async with self._lock:
+            return {cid: source.ref_count for cid, source in self._channel_sources.items()}
