@@ -327,6 +327,9 @@ function setRangeProgress(el, value, maxOverride) {
   const { accent } = resolveRangeAccent(el);
   const inactive = 'rgba(255,255,255,0.12)';
   el.style.background = `linear-gradient(90deg, ${accent} 0%, ${accent} ${percent}%, ${inactive} ${percent}%, ${inactive} 100%)`;
+  el.style.backgroundSize = '100% 4px';
+  el.style.backgroundPosition = 'center';
+  el.style.backgroundRepeat = 'no-repeat';
 }
 
 function isAuthenticated() {
