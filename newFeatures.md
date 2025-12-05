@@ -13,6 +13,5 @@ Player action failed: {
 app.player.js:459  POST http://localhost:8000/api/spotify/player/play?channel_id=ch1&device_id=e95cac33a09bbc4ceefd021e01d132bc9fedabb7 403 (Forbidden)
 If i however press the same button once more, it starts playing. I assume the issue is that it tries to play the placeholder instead of an actual track or something like that. Please investigate
 
-- when i stop the radio channel, it takes a long time to actually stop. Its like it keeps playing what has been buffered
+- Is there any safeguards to stop playing a strem if no nodes is using that stream? if not, then i want it to be like this: if a player is active but no nodes is actually outputting any audio, then stop the stream after 30 minutes. 
 
-- the clickable area for the track seek area is to thin. Make it wider so its easier to hit

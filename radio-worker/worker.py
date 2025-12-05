@@ -65,8 +65,12 @@ class ControllerClient:
             headers["X-Radio-Worker-Token"] = RADIO_WORKER_TOKEN
         return headers
 
-    async def fetch_assignments(self) -> list[Assignment]:
-        resp = await self._client.get("/api/radio/worker/assignments", headers=self._headers())
+    async def fetch_assignments(self, since: Optional[int] = None, wait: int = POLL_INTERVAL) -> tuple[list[Assignment], Optional[int]]:
+        params = {}
+        if since is not None:
+            params["since"] = since
+            params["wait"] = max(1, min(wait, 30))
+        resp = await self._client.get("/api/radio/worker/assignments", params=params or None, headers=self._headers())
         resp.raise_for_status()
         payload = resp.json()
         assignments = []
@@ -75,7 +79,12 @@ class ControllerClient:
                 assignments.append(Assignment.from_dict(entry))
             except Exception as exc:  # pragma: no cover - defensive
                 log.warning("Invalid assignment payload skipped: %s", exc)
-        return assignments
+        version_raw = payload.get("version")
+        try:
+            version = int(version_raw)
+        except (TypeError, ValueError):
+            version = None
+        return assignments, version
 
     async def send_status(self, channel_id: str, state: str, *, message: Optional[str] = None, metadata: Optional[dict] = None) -> None:
         body = {"state": state}
@@ -196,9 +205,12 @@ class RadioManager:
     def __init__(self, controller: ControllerClient) -> None:
         self.controller = controller
         self.runners: Dict[str, ChannelRunner] = {}
+        self.version: Optional[int] = None
 
     async def sync(self) -> None:
-        assignments = await self.controller.fetch_assignments()
+        assignments, version = await self.controller.fetch_assignments(self.version, POLL_INTERVAL)
+        if version is not None:
+            self.version = version
         seen = set()
         for assignment in assignments:
             if not assignment.channel_id:
@@ -251,17 +263,16 @@ async def run_worker() -> None:
             signal.signal(sig, _handle_signal)
 
     try:
+        backoff = max(1, min(5, POLL_INTERVAL))
         while not stop_event.is_set():
             try:
                 await manager.sync()
             except httpx.HTTPError as exc:
                 log.warning("Assignment sync failed: %s", exc)
+                await asyncio.sleep(backoff)
             except Exception as exc:  # pragma: no cover - defensive
                 log.exception("Unexpected error during sync: %s", exc)
-            try:
-                await asyncio.wait_for(stop_event.wait(), timeout=POLL_INTERVAL)
-            except asyncio.TimeoutError:
-                continue
+                await asyncio.sleep(backoff)
     finally:
         await manager.shutdown()
         await controller.close()

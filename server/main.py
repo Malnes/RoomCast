@@ -658,6 +658,7 @@ def all_channel_details() -> list[dict]:
 
 def update_channel_metadata(channel_id: str, updates: dict) -> dict:
     channel = get_channel(channel_id)
+    is_radio_channel = channel.get("source") == "radio"
     if "name" in updates:
         name = (updates.get("name") or "").strip()
         if not name:
@@ -678,6 +679,8 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
         except (TypeError, ValueError):
             raise HTTPException(status_code=400, detail="Order must be a positive integer")
     save_channels()
+    if is_radio_channel:
+        _mark_radio_assignments_dirty()
     return channel
 
 
@@ -919,6 +922,43 @@ users_by_id: Dict[str, dict] = {}
 users_by_username: Dict[str, dict] = {}
 radio_browser_cache: Dict[str, Tuple[float, Any]] = {}
 radio_runtime_status: Dict[str, dict] = {}
+radio_assignments_version = 1
+radio_assignment_waiters: set[asyncio.Future] = set()
+RADIO_ASSIGNMENT_DEFAULT_WAIT = float(os.getenv("RADIO_ASSIGNMENT_WAIT", "10"))
+RADIO_ASSIGNMENT_DEFAULT_WAIT = max(1.0, min(RADIO_ASSIGNMENT_DEFAULT_WAIT, 30.0))
+RADIO_ASSIGNMENT_MAX_WAIT = 30.0
+
+
+def _mark_radio_assignments_dirty() -> None:
+    global radio_assignments_version
+    radio_assignments_version += 1
+    waiters = list(radio_assignment_waiters)
+    radio_assignment_waiters.clear()
+    for waiter in waiters:
+        if waiter.done():
+            continue
+        waiter.set_result(True)
+
+
+async def _wait_for_radio_assignments_change(since: Optional[int], timeout: float = RADIO_ASSIGNMENT_DEFAULT_WAIT) -> int:
+    current = radio_assignments_version
+    if since is None or since != current:
+        return current
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    radio_assignment_waiters.add(future)
+    # Re-check after registering in case a change happened before we awaited.
+    current = radio_assignments_version
+    if since != current:
+        radio_assignment_waiters.discard(future)
+        if not future.done():
+            future.cancel()
+        return current
+    try:
+        await asyncio.wait_for(future, timeout)
+    except asyncio.TimeoutError:
+        radio_assignment_waiters.discard(future)
+    return radio_assignments_version
 
 
 def default_eq_state() -> dict:
@@ -3394,6 +3434,7 @@ async def assign_radio_station(channel_id: str, payload: RadioStationSelectionPa
     channel = _get_radio_channel_or_404(resolved)
     _apply_radio_station(channel, payload)
     save_channels()
+    _mark_radio_assignments_dirty()
     radio_runtime_status.pop(resolved, None)
     return {"ok": True, "channel": channel_detail(resolved)}
 
@@ -3427,6 +3468,7 @@ async def control_radio_playback(channel_id: str, payload: RadioPlaybackPayload)
     state["updated_at"] = now
     channel["radio_state"] = state
     save_channels()
+    _mark_radio_assignments_dirty()
     if not desired:
         radio_runtime_status[resolved] = {
             "state": "idle",
@@ -3476,12 +3518,20 @@ async def stop_all_channel_playback() -> dict:
             await _spotify_control("/me/player/pause", "PUT", channel_id=cid)
             spotify_stopped.append(cid)
         except HTTPException as exc:
-            detail = exc.detail if isinstance(exc.detail, str) else str(exc.detail)
-            errors[cid] = detail or "Failed to pause Spotify playback"
+            raw_detail = exc.detail
+            parsed = _parse_spotify_error(raw_detail)
+            reason = (parsed.get("reason") or "").strip().lower()
+            message = (parsed.get("message") or "").strip()
+            detail_text = message or (raw_detail if isinstance(raw_detail, str) else str(raw_detail))
+            if reason == "no_active_device" or "no active device" in detail_text.lower():
+                log.debug("Skipping Spotify pause for %s: no active device", cid)
+                continue
+            errors[cid] = detail_text or "Failed to pause Spotify playback"
         except Exception as exc:  # pragma: no cover - defensive
             errors[cid] = str(exc)
     if radio_mutated:
         save_channels()
+        _mark_radio_assignments_dirty()
     return {
         "ok": True,
         "spotify_stopped": spotify_stopped,
@@ -3492,8 +3542,17 @@ async def stop_all_channel_playback() -> dict:
 
 
 @app.get("/api/radio/worker/assignments")
-async def radio_worker_assignments(request: Request) -> dict:
+async def radio_worker_assignments(
+    request: Request,
+    since: Optional[int] = Query(None),
+    wait: Optional[float] = Query(None),
+) -> dict:
     _require_radio_worker_token(request)
+    timeout = RADIO_ASSIGNMENT_DEFAULT_WAIT if wait is None else float(wait)
+    timeout = max(1.0, min(timeout, RADIO_ASSIGNMENT_MAX_WAIT))
+    version = radio_assignments_version
+    if since is not None:
+        version = await _wait_for_radio_assignments_change(since, timeout)
     assignments = []
     for cid in channel_order:
         channel = channels_by_id.get(cid)
@@ -3510,7 +3569,7 @@ async def radio_worker_assignments(request: Request) -> dict:
             "updated_at": state.get("updated_at"),
             "playback_enabled": state.get("playback_enabled", True),
         })
-    return {"assignments": assignments}
+    return {"assignments": assignments, "version": version}
 
 
 @app.post("/api/radio/worker/status/{channel_id}")
@@ -3671,6 +3730,32 @@ async def _spotify_control(
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     return {"ok": True}
+
+
+def _parse_spotify_error(detail: Any) -> dict:
+    message = None
+    reason = None
+    payload = None
+    if isinstance(detail, dict):
+        payload = detail
+    else:
+        text = str(detail or "").strip()
+        if text:
+            try:
+                payload = json.loads(text)
+            except json.JSONDecodeError:
+                message = text
+    if isinstance(payload, dict):
+        error_block = payload.get("error") if isinstance(payload.get("error"), dict) else payload
+        if isinstance(error_block, dict):
+            message = message or error_block.get("message")
+            reason = error_block.get("reason") or reason
+    normalized = {}
+    if message:
+        normalized["message"] = message
+    if reason:
+        normalized["reason"] = reason
+    return normalized
 
 
 @app.post("/api/spotify/player/activate-roomcast")
