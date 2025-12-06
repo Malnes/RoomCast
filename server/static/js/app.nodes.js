@@ -10,6 +10,23 @@ async function fetchNodes(options = {}) {
   }
 }
 
+async function fetchWebNodeRequests(options = {}) {
+  if (!isAdminUser()) {
+    setWebNodeRequests([]);
+    return;
+  }
+  try {
+    const res = await fetch('/api/web-nodes/requests');
+    await ensureOk(res);
+    const data = await res.json();
+    setWebNodeRequests(data.requests || [], { forceOpen: options.forceOpen === true });
+  } catch (err) {
+    if (!options.silent) {
+      console.warn('Failed to load web node requests:', err);
+    }
+  }
+}
+
 async function fetchSpotifyConfig(targetChannelId = getSettingsChannelId()) {
   if (!targetChannelId) {
     if (spotifyLinkStatus) {

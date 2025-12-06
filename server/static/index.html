@@ -58,6 +58,7 @@
             <button id="add-hardware-node" type="button" role="menuitem">Add hardware node</button>
             <button id="add-controller-node" type="button" role="menuitem">Add server as node</button>
             <button id="create-web-node" type="button" role="menuitem">Create web node</button>
+            <button id="review-web-node-requests" type="button" role="menuitem" hidden>Review web node requests</button>
           </div>
         </div>
         <button id="open-settings" class="icon-btn gear-btn" aria-label="Settings">⚙︎</button>
@@ -318,6 +319,29 @@
       <div class="radio-results" id="radio-results">
         <div id="radio-results-status" class="radio-results-status muted">Select a genre, list, or search to see stations.</div>
         <div id="radio-results-list" class="radio-results-list"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="web-node-approval-overlay" class="settings-overlay" aria-hidden="true" hidden>
+    <div class="settings-card web-node-approval-card" role="dialog" aria-modal="true" aria-labelledby="web-node-approval-title">
+      <div class="settings-header">
+        <div>
+          <div class="section-title" id="web-node-approval-title">Approve web node</div>
+          <div class="muted" id="web-node-approval-subtitle">Review the connection request.</div>
+        </div>
+        <button id="web-node-approval-close" class="icon-btn" type="button" aria-label="Close approval dialog">✕</button>
+      </div>
+      <div class="web-node-approval-content">
+        <div class="web-node-approval-meta">
+          <div id="web-node-approval-name">Unnamed browser</div>
+          <div id="web-node-approval-info" class="muted">Waiting for details…</div>
+        </div>
+        <div id="web-node-approval-queue" class="web-node-approval-queue muted" role="status" aria-live="polite"></div>
+      </div>
+      <div class="confirm-actions">
+        <button id="web-node-approval-approve" class="small-btn" type="button">Approve</button>
+        <button id="web-node-approval-deny" class="small-btn danger-btn" type="button">Deny</button>
       </div>
     </div>
   </div>

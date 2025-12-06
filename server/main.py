@@ -117,6 +117,8 @@ CHANNEL_IDLE_TIMEOUT = float(os.getenv("CHANNEL_IDLE_TIMEOUT", "600"))
 CHANNEL_IDLE_TIMEOUT = max(30.0, CHANNEL_IDLE_TIMEOUT)
 CHANNEL_IDLE_POLL_INTERVAL = float(os.getenv("CHANNEL_IDLE_POLL_INTERVAL", "15"))
 CHANNEL_IDLE_POLL_INTERVAL = max(1.0, min(CHANNEL_IDLE_POLL_INTERVAL, CHANNEL_IDLE_TIMEOUT))
+WEB_NODE_APPROVAL_TIMEOUT = int(os.getenv("WEB_NODE_APPROVAL_TIMEOUT", "75"))
+WEB_NODE_APPROVAL_TIMEOUT = max(10, WEB_NODE_APPROVAL_TIMEOUT)
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -739,6 +741,11 @@ class WebNodeOffer(BaseModel):
     type: str
 
 
+class WebNodeRequestDecisionPayload(BaseModel):
+    action: Literal["approve", "deny"]
+    reason: Optional[str] = Field(default=None, max_length=200)
+
+
 class NodeChannelPayload(BaseModel):
     channel_id: Optional[str] = Field(default=None, max_length=120)
 
@@ -1076,6 +1083,7 @@ RADIO_ASSIGNMENT_DEFAULT_WAIT = max(1.0, min(RADIO_ASSIGNMENT_DEFAULT_WAIT, 30.0
 RADIO_ASSIGNMENT_MAX_WAIT = 30.0
 channel_idle_task: Optional[asyncio.Task] = None
 channel_idle_state: Dict[str, dict] = {}
+pending_web_node_requests: Dict[str, dict] = {}
 
 
 def _mark_radio_assignments_dirty() -> None:
@@ -1209,7 +1217,7 @@ def _require_radio_worker_token(request: Request) -> None:
 def _radio_runtime_payload(channel_id: str) -> dict:
     status = radio_runtime_status.get(channel_id)
     if not status:
-        return {"state": "idle", "message": None, "updated_at": None}
+        return {"state": "idle", "message": None, "updated_at": None, "started_at": None}
     return status
 
 
@@ -1741,10 +1749,28 @@ def _map_spotify_search_bucket(payload: Optional[dict], mapper: Callable[[dict],
     }
 
 
-async def broadcast_nodes() -> None:
+def _get_web_node_snapshot(entry: dict) -> dict:
+    snapshot = entry.get("snapshot")
+    if snapshot:
+        return snapshot
+    snapshot = {
+        "id": entry["id"],
+        "name": entry.get("name"),
+        "client_host": entry.get("client_host"),
+        "requested_at": entry.get("created_at"),
+    }
+    entry["snapshot"] = snapshot
+    return snapshot
+
+
+def _pending_web_node_snapshots() -> list[dict]:
+    entries = sorted(pending_web_node_requests.values(), key=lambda item: item.get("created_at", 0))
+    return [_get_web_node_snapshot(entry) for entry in entries]
+
+
+async def _broadcast_to_node_watchers(payload: dict) -> None:
     if not node_watchers:
         return
-    payload = {"type": "nodes", "nodes": public_nodes()}
     dead: list[WebSocket] = []
     for ws in list(node_watchers):
         try:
@@ -1753,6 +1779,59 @@ async def broadcast_nodes() -> None:
             dead.append(ws)
     for ws in dead:
         node_watchers.discard(ws)
+
+
+async def broadcast_nodes() -> None:
+    await _broadcast_to_node_watchers({"type": "nodes", "nodes": public_nodes()})
+
+
+async def _broadcast_web_node_request_event(
+    action: str,
+    *,
+    snapshot: Optional[dict] = None,
+    request_id: Optional[str] = None,
+    status: Optional[str] = None,
+    reason: Optional[str] = None,
+) -> None:
+    payload: dict[str, Any] = {"type": "web_node_request", "action": action}
+    if snapshot:
+        payload["request"] = snapshot
+    if request_id:
+        payload["request_id"] = request_id
+    if status:
+        payload["status"] = status
+    if reason:
+        payload["reason"] = reason
+    await _broadcast_to_node_watchers(payload)
+
+
+def _pop_pending_web_node_request(request_id: str) -> dict:
+    pending = pending_web_node_requests.pop(request_id, None)
+    if not pending:
+        raise HTTPException(status_code=404, detail="Web node request not found or already resolved")
+    return pending
+
+
+async def _establish_web_node_session_for_request(pending: dict) -> dict:
+    if not WEBRTC_ENABLED or not webrtc_relay:
+        raise HTTPException(status_code=503, detail="Web nodes are disabled")
+    name = pending.get("name") or "Web node"
+    node = create_browser_node(name)
+    channel_id = resolve_node_channel_id(node)
+    channel = channels_by_id.get(channel_id) if channel_id else None
+    stream_id = channel.get("snap_stream") if channel else None
+    if channel_id and (not channel or not stream_id):
+        await teardown_browser_node(node["id"])
+        raise HTTPException(status_code=500, detail="Channel is missing snap_stream mapping")
+    try:
+        session = await webrtc_relay.create_session(node["id"], channel_id, stream_id)
+        answer = await session.accept(pending["offer_sdp"], pending["offer_type"])
+    except Exception as exc:  # pragma: no cover - defensive logging
+        log.exception("Failed to establish web node session")
+        await teardown_browser_node(node["id"])
+        raise HTTPException(status_code=500, detail=f"Failed to start WebRTC session: {exc}")
+    await broadcast_nodes()
+    return {"node": node, "answer": answer.sdp, "answer_type": answer.type}
 
 
 def _normalize_node_url(raw: str) -> str:
@@ -3126,6 +3205,7 @@ async def _stop_channel_due_to_idle(channel: dict) -> bool:
             "station_id": state.get("station_id"),
             "metadata": None,
             "updated_at": now,
+            "started_at": None,
         }
         log.info("Auto-stopped radio channel %s after %.0f seconds without listeners", cid, CHANNEL_IDLE_TIMEOUT)
         return True
@@ -3293,26 +3373,88 @@ async def stream_diagnostics(channel_id: Optional[str] = Query(None)) -> dict:
 
 
 @app.post("/api/web-nodes/session")
-async def web_node_session(payload: WebNodeOffer) -> dict:
+async def web_node_session(payload: WebNodeOffer, request: Request) -> dict:
     if not WEBRTC_ENABLED or not webrtc_relay:
         raise HTTPException(status_code=503, detail="Web nodes are disabled")
     name = payload.name.strip() or "Web node"
-    node = create_browser_node(name)
-    channel_id = resolve_node_channel_id(node)
-    channel = channels_by_id.get(channel_id) if channel_id else None
-    stream_id = channel.get("snap_stream") if channel else None
-    if channel_id and (not channel or not stream_id):
-        await teardown_browser_node(node["id"])
-        raise HTTPException(status_code=500, detail="Channel is missing snap_stream mapping")
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    request_id = secrets.token_urlsafe(16)
+    client_host = request.client.host if request.client else None
+    entry = {
+        "id": request_id,
+        "name": name,
+        "offer_sdp": payload.sdp,
+        "offer_type": payload.type,
+        "future": future,
+        "client_host": client_host,
+        "created_at": time.time(),
+    }
+    snapshot = _get_web_node_snapshot(entry)
+    pending_web_node_requests[request_id] = entry
+    await _broadcast_web_node_request_event("created", snapshot=snapshot)
     try:
-        session = await webrtc_relay.create_session(node["id"], channel_id, stream_id)
-        answer = await session.accept(payload.sdp, payload.type)
-    except Exception as exc:
-        log.exception("Failed to establish web node session")
-        await teardown_browser_node(node["id"])
-        raise HTTPException(status_code=500, detail=f"Failed to start WebRTC session: {exc}")
-    await broadcast_nodes()
-    return {"node": node, "answer": answer.sdp, "answer_type": answer.type}
+        result = await asyncio.wait_for(future, timeout=WEB_NODE_APPROVAL_TIMEOUT)
+    except asyncio.TimeoutError:
+        pending = pending_web_node_requests.pop(request_id, None)
+        pending_snapshot = _get_web_node_snapshot(pending) if pending else snapshot
+        if pending and not pending["future"].done():
+            pending["future"].set_result({"status": "expired", "status_code": 408})
+        await _broadcast_web_node_request_event("resolved", snapshot=pending_snapshot, status="expired")
+        raise HTTPException(status_code=408, detail="Approval timed out")
+    except HTTPException as exc:
+        raise exc
+    except Exception as exc:  # pragma: no cover - defensive
+        raise HTTPException(status_code=500, detail=str(exc))
+    finally:
+        pending_web_node_requests.pop(request_id, None)
+    if result.get("status") != "approved":
+        status_code = result.get("status_code", 403)
+        detail = result.get("message") or "Web node request denied"
+        raise HTTPException(status_code=status_code, detail=detail)
+    return {
+        "node": result["node"],
+        "answer": result["answer"],
+        "answer_type": result["answer_type"],
+    }
+
+
+@app.get("/api/web-nodes/requests")
+async def list_web_node_requests(_: dict = Depends(require_admin)) -> dict:
+    return {"requests": _pending_web_node_snapshots()}
+
+
+@app.post("/api/web-nodes/requests/{request_id}")
+async def decide_web_node_request(
+    request_id: str,
+    payload: WebNodeRequestDecisionPayload,
+    _: dict = Depends(require_admin),
+) -> dict:
+    action = payload.action.lower().strip()
+    pending = _pop_pending_web_node_request(request_id)
+    snapshot = _get_web_node_snapshot(pending)
+    future: asyncio.Future = pending.get("future")
+    if action == "approve":
+        try:
+            result = await _establish_web_node_session_for_request(pending)
+        except HTTPException as exc:
+            if future and not future.done():
+                future.set_result({
+                    "status": "failed",
+                    "status_code": exc.status_code,
+                    "message": exc.detail,
+                })
+            await _broadcast_web_node_request_event("resolved", snapshot=snapshot, status="failed", reason=exc.detail)
+            raise
+        if future and not future.done():
+            future.set_result({"status": "approved", **result})
+        await _broadcast_web_node_request_event("resolved", snapshot=snapshot, status="approved")
+        return {"ok": True, "status": "approved"}
+    reason = (payload.reason or "Request denied").strip() or "Request denied"
+    if future and not future.done():
+        future.set_result({"status": "denied", "message": reason, "status_code": 403})
+    await _broadcast_web_node_request_event("resolved", snapshot=snapshot, status="denied", reason=reason)
+    return {"ok": True, "status": "denied"}
 
 
 @app.websocket("/ws/web-node")
@@ -3344,6 +3486,7 @@ async def nodes_ws(ws: WebSocket):
     node_watchers.add(ws)
     try:
         await ws.send_json({"type": "nodes", "nodes": public_nodes()})
+        await ws.send_json({"type": "web_node_requests", "requests": _pending_web_node_snapshots()})
         while True:
             await ws.receive_text()
     except WebSocketDisconnect:
@@ -3880,6 +4023,7 @@ async def control_radio_playback(channel_id: str, payload: RadioPlaybackPayload)
             "station_id": state.get("station_id"),
             "metadata": None,
             "updated_at": now,
+            "started_at": None,
         }
     else:
         radio_runtime_status.pop(resolved, None)
@@ -3912,6 +4056,7 @@ async def stop_all_channel_playback() -> dict:
                     "station_id": state.get("station_id"),
                     "metadata": None,
                     "updated_at": now,
+                    "started_at": None,
                 }
                 radio_states[cid] = state
                 radio_stopped.append(cid)
@@ -3980,14 +4125,28 @@ async def radio_worker_status(channel_id: str, payload: RadioWorkerStatusPayload
     _require_radio_worker_token(request)
     resolved = resolve_channel_id(channel_id)
     channel = _get_radio_channel_or_404(resolved)
+    previous = radio_runtime_status.get(resolved) or {}
+    prev_state = previous.get("state")
+    prev_started_raw = previous.get("started_at")
+    prev_started = int(prev_started_raw) if isinstance(prev_started_raw, (int, float)) else None
+    now = int(time.time())
+    started_at = None
+    if payload.state == "playing":
+        if prev_state == "playing" and prev_started:
+            started_at = prev_started
+        else:
+            started_at = now
     status_payload = {
         "state": payload.state,
         "message": payload.message,
         "bitrate": payload.bitrate,
         "station_id": payload.station_id or (channel.get("radio_state") or {}).get("station_id"),
         "metadata": payload.metadata,
-        "updated_at": int(time.time()),
+        "updated_at": now,
+        "started_at": started_at,
     }
+    if payload.state != "playing":
+        status_payload["started_at"] = None
     radio_runtime_status[resolved] = status_payload
     if payload.metadata:
         state = _ensure_radio_state(channel)

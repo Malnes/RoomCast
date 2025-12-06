@@ -5,11 +5,13 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>RoomCast Web Node</title>
   <style>
+    *, *::before, *::after { box-sizing: border-box; }
     :root { --channel-accent:#22c55e; }
     body { background:#0b1020; color:#e2e8f0; font-family: system-ui, -apple-system, sans-serif; padding:24px; }
     .panel { background: rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:16px; max-width:640px; margin:auto; box-shadow:0 14px 36px rgba(0,0,0,0.3); }
     label { display:block; margin-bottom:6px; color:#cbd5e1; }
     input { width:100%; padding:10px 12px; border-radius:12px; border:1px solid rgba(255,255,255,0.12); background:rgba(255,255,255,0.06); color:#e2e8f0; }
+    input[type="range"] { padding:0; border:none; background:transparent; width:100%; }
     button { margin-top:10px; padding:10px 14px; border:none; border-radius:12px; background:linear-gradient(135deg,#22c55e,#16a34a); color:#0b1020; font-weight:700; cursor:pointer; width:100%; }
     .muted { color:#94a3b8; font-size:14px; }
     .stream-meta { display:flex; gap:16px; align-items:center; margin-top:16px; padding:12px; border-radius:16px; border:1px solid rgba(148,163,184,0.18); background:rgba(15,23,42,0.75); }

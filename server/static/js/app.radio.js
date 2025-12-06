@@ -1786,6 +1786,27 @@ function handleNodesSocketMessage(event) {
   }
   if (payload?.type === 'nodes' && Array.isArray(payload.nodes)) {
     renderNodes(payload.nodes);
+    return;
+  }
+  if (payload?.type === 'web_node_requests' && Array.isArray(payload.requests)) {
+    setWebNodeRequests(payload.requests, { forceOpen: true });
+    return;
+  }
+  if (payload?.type === 'web_node_request') {
+    handleWebNodeRequestBroadcast(payload);
+  }
+}
+
+function handleWebNodeRequestBroadcast(payload) {
+  if (!payload || typeof payload !== 'object') return;
+  const action = payload.action;
+  if (action === 'created' && payload.request) {
+    upsertWebNodeRequest(payload.request);
+    return;
+  }
+  if (action === 'resolved') {
+    const resolvedId = payload.request?.id || payload.request_id;
+    if (resolvedId) removeWebNodeRequest(resolvedId);
   }
 }
 

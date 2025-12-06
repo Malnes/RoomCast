@@ -182,9 +182,30 @@ function renderRadioPlayer(channel, payload, options = {}) {
   lastCoverArtUrl = radioState.station_favicon || null;
   applyCoverArtBackground();
   playerSeek.disabled = true;
-  playerSeek.value = 0;
-  setRangeProgress(playerSeek, 0, playerSeek.max || 1);
+  playerSeek.max = 100;
+  const liveSliderMax = Number(playerSeek.max) || 100;
+  const liveSliderValue = hasStation && playbackEnabled ? liveSliderMax : 0;
+  playerSeek.value = liveSliderValue;
+  setRangeProgress(playerSeek, liveSliderValue, liveSliderMax);
+  const startedAtRaw = Number(runtime?.started_at);
+  const hasStartedAt = Number.isFinite(startedAtRaw) && startedAtRaw > 0;
+  const startedAtMs = hasStartedAt ? startedAtRaw * 1000 : null;
+  const shouldShowUptime = Boolean(
+    hasStartedAt && hasStation && playbackEnabled && enabled && runtime.state === 'playing',
+  );
   playerTimeCurrent.textContent = '—';
+  if (playerTick) {
+    clearInterval(playerTick);
+    playerTick = null;
+  }
+  if (shouldShowUptime && startedAtMs) {
+    const updateRadioUptime = () => {
+      const elapsed = Math.max(0, Date.now() - startedAtMs);
+      playerTimeCurrent.textContent = msToTime(elapsed);
+    };
+    updateRadioUptime();
+    playerTick = setInterval(updateRadioUptime, 1000);
+  }
   playerTimeTotal.textContent = hasStation ? 'Live' : '0:00';
   let buttonLabel;
   if (!enabled) buttonLabel = 'Enable this channel in Settings to start radio';
@@ -205,10 +226,6 @@ function renderRadioPlayer(channel, payload, options = {}) {
     playerRepeatBtn.disabled = true;
     setRepeatMode('off');
   }
-  if (playerTick) {
-    clearInterval(playerTick);
-    playerTick = null;
-  }
   setTakeoverBannerVisible(false);
   radioPlaybackState = {
     channelId: channel?.id || null,
@@ -216,6 +233,7 @@ function renderRadioPlayer(channel, payload, options = {}) {
     hasStation,
     enabled: !!enabled,
     runtimeState: runtime?.state || 'idle',
+    startedAt: hasStartedAt ? startedAtRaw : null,
   };
 }
 

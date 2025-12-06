@@ -12,6 +12,7 @@ const addNodeMenu = document.getElementById('add-node-menu');
 const addHardwareNodeBtn = document.getElementById('add-hardware-node');
 const addControllerNodeBtn = document.getElementById('add-controller-node');
 const createWebNodeBtn = document.getElementById('create-web-node');
+const reviewWebNodeRequestsBtn = document.getElementById('review-web-node-requests');
 const saveSpotifyBtn = document.getElementById('save-spotify');
 const spClientId = document.getElementById('sp-client-id');
 const spClientSecret = document.getElementById('sp-client-secret');
@@ -34,6 +35,14 @@ const discoverSpinner = document.getElementById('discover-spinner');
 const discoverStatus = document.getElementById('discover-status');
 const discoverList = document.getElementById('discover-list');
 const startDiscoverBtn = document.getElementById('start-discover');
+const webNodeApprovalOverlay = document.getElementById('web-node-approval-overlay');
+const webNodeApprovalSubtitle = document.getElementById('web-node-approval-subtitle');
+const webNodeApprovalName = document.getElementById('web-node-approval-name');
+const webNodeApprovalInfo = document.getElementById('web-node-approval-info');
+const webNodeApprovalQueue = document.getElementById('web-node-approval-queue');
+const webNodeApprovalCloseBtn = document.getElementById('web-node-approval-close');
+const webNodeApprovalApproveBtn = document.getElementById('web-node-approval-approve');
+const webNodeApprovalDenyBtn = document.getElementById('web-node-approval-deny');
 const masterVolume = document.getElementById('master-volume');
 setRangeProgress(masterVolume, masterVolume?.value || 0, masterVolume?.max || 100);
 const playerVolumeInline = document.getElementById('player-volume-inline');
@@ -340,6 +349,10 @@ let nodesSocketConnected = false;
 let nodesSocketRetryTimer = null;
 let nodesSocketRetryAttempt = 0;
 let nodesSocketShouldConnect = false;
+let webNodeRequestQueue = [];
+let webNodeActiveRequestId = null;
+let webNodeApprovalBusy = false;
+let webNodeApprovalManuallyHidden = false;
 
 function setRangeProgress(el, value, maxOverride) {
   if (!el) return;
@@ -439,6 +452,7 @@ function stopDataPolling() {
     playerPollTimer = null;
   }
   stopNodeSocket();
+  setWebNodeRequests([]);
   resetChannelUiState();
 }
 
@@ -458,6 +472,9 @@ function startDataPolling() {
     playerPollTimer = setInterval(fetchPlayerStatus, 4000);
   }
   fetchStatus();
+  if (isAdminUser() && typeof fetchWebNodeRequests === 'function') {
+    fetchWebNodeRequests({ forceOpen: true, silent: true });
+  }
 }
 
   if (playerText) {
@@ -559,6 +576,7 @@ const SPOTIFY_ALERT_KEY = 'spotify';
 const SPOTIFY_ALERT_HELP = 'Open Settings > Spotify setup and tap "Save Spotify config" to reconnect.';
 const PWA_UPDATE_ALERT_KEY = 'pwa-update';
 const PWA_UPDATE_ACTION_LABEL = 'Update now';
+const WEB_NODE_ALERT_KEY = 'web-node-request';
 let persistentAlertActionHandler = null;
 const DEFAULT_ALERT_DISMISS_LABEL = persistentAlertDismiss?.textContent || '✕';
 const DEFAULT_ALERT_DISMISS_ARIA = persistentAlertDismiss?.getAttribute('aria-label') || 'Dismiss alert';
@@ -1149,6 +1167,305 @@ function hidePersistentAlert() {
     persistentAlertDismiss.setAttribute('aria-label', DEFAULT_ALERT_DISMISS_ARIA);
   }
   persistentAlertState = null;
+}
+
+function normalizeWebNodeRequest(entry) {
+  if (!entry || typeof entry !== 'object' || !entry.id) return null;
+  const requestedAt = typeof entry.requested_at === 'number'
+    ? entry.requested_at
+    : typeof entry.created_at === 'number'
+      ? entry.created_at
+      : null;
+  return {
+    id: entry.id,
+    name: (entry.name || 'Web node').trim() || 'Web node',
+    client_host: entry.client_host || null,
+    requested_at: requestedAt,
+  };
+}
+
+function sortWebNodeRequests(list) {
+  return list.slice().sort((a, b) => (a.requested_at || 0) - (b.requested_at || 0));
+}
+
+function getActiveWebNodeRequest() {
+  if (!webNodeRequestQueue.length) return null;
+  const current = webNodeRequestQueue.find(req => req.id === webNodeActiveRequestId);
+  return current || webNodeRequestQueue[0] || null;
+}
+
+function setWebNodeRequests(requests, options = {}) {
+  const normalized = sortWebNodeRequests((Array.isArray(requests) ? requests : [])
+    .map(normalizeWebNodeRequest)
+    .filter(Boolean));
+  webNodeRequestQueue = normalized;
+  if (!webNodeRequestQueue.some(req => req.id === webNodeActiveRequestId)) {
+    webNodeActiveRequestId = webNodeRequestQueue[0]?.id || null;
+  }
+  if (!webNodeRequestQueue.length) {
+    webNodeApprovalManuallyHidden = false;
+  }
+  syncWebNodeApprovalState({ forceOpen: options.forceOpen === true });
+}
+
+function upsertWebNodeRequest(entry) {
+  const normalized = normalizeWebNodeRequest(entry);
+  if (!normalized) return;
+  const idx = webNodeRequestQueue.findIndex(req => req.id === normalized.id);
+  if (idx === -1) {
+    webNodeRequestQueue = sortWebNodeRequests([...webNodeRequestQueue, normalized]);
+    if (!webNodeActiveRequestId) {
+      webNodeActiveRequestId = normalized.id;
+    }
+    webNodeApprovalManuallyHidden = false;
+    clearPersistentAlertSuppression(WEB_NODE_ALERT_KEY);
+    syncWebNodeApprovalState({ forceOpen: true });
+    return;
+  }
+  webNodeRequestQueue[idx] = normalized;
+  webNodeRequestQueue = sortWebNodeRequests(webNodeRequestQueue);
+  syncWebNodeApprovalState({});
+}
+
+function removeWebNodeRequest(requestId) {
+  if (!requestId) return;
+  const next = webNodeRequestQueue.filter(req => req.id !== requestId);
+  if (next.length === webNodeRequestQueue.length) return;
+  webNodeRequestQueue = sortWebNodeRequests(next);
+  if (!webNodeRequestQueue.some(req => req.id === webNodeActiveRequestId)) {
+    webNodeActiveRequestId = webNodeRequestQueue[0]?.id || null;
+  }
+  if (!webNodeRequestQueue.length) {
+    webNodeApprovalManuallyHidden = false;
+  }
+  syncWebNodeApprovalState({});
+}
+
+function updateReviewWebNodeRequestsButton() {
+  if (!reviewWebNodeRequestsBtn) return;
+  const count = isAdminUser() ? webNodeRequestQueue.length : 0;
+  if (!count) {
+    reviewWebNodeRequestsBtn.hidden = true;
+    reviewWebNodeRequestsBtn.setAttribute('aria-hidden', 'true');
+    reviewWebNodeRequestsBtn.dataset.count = '0';
+    return;
+  }
+  reviewWebNodeRequestsBtn.hidden = false;
+  reviewWebNodeRequestsBtn.setAttribute('aria-hidden', 'false');
+  reviewWebNodeRequestsBtn.dataset.count = String(count);
+  reviewWebNodeRequestsBtn.textContent = count === 1
+    ? 'Review web node request'
+    : `Review ${count} web node requests`;
+}
+
+function describeWebNodeRequest(request) {
+  if (!request) return 'Waiting for approval';
+  const parts = [];
+  if (typeof request.requested_at === 'number') {
+    parts.push(`Requested ${formatRelativeTime(request.requested_at)}`);
+  }
+  if (request.client_host) {
+    parts.push(`From ${request.client_host}`);
+  }
+  return parts.length ? parts.join(' · ') : 'Waiting for approval';
+}
+
+function renderWebNodeApprovalContent() {
+  if (!webNodeApprovalOverlay) return;
+  const request = getActiveWebNodeRequest();
+  const hasRequest = !!request;
+  if (webNodeApprovalName) {
+    webNodeApprovalName.textContent = request?.name || 'Web node';
+  }
+  if (webNodeApprovalInfo) {
+    webNodeApprovalInfo.textContent = hasRequest ? describeWebNodeRequest(request) : 'No pending web nodes.';
+  }
+  if (webNodeApprovalSubtitle) {
+    webNodeApprovalSubtitle.textContent = isAdminUser()
+      ? 'Approve to let this browser listen.'
+      : 'Sign in as an admin to manage web nodes.';
+  }
+  if (webNodeApprovalQueue) {
+    const others = hasRequest ? webNodeRequestQueue.filter(entry => entry.id !== request.id) : webNodeRequestQueue;
+    if (!others.length) {
+      webNodeApprovalQueue.textContent = 'No other requests waiting.';
+    } else {
+      const names = others.slice(0, 3).map(entry => entry.name || 'Web node');
+      const summary = others.length === 1
+        ? '1 more request waiting'
+        : `${others.length} more requests waiting`;
+      const suffix = others.length > names.length ? `${names.join(', ')}…` : names.join(', ');
+      webNodeApprovalQueue.textContent = `${summary}: ${suffix}`;
+    }
+  }
+  const disableActions = !hasRequest || !isAdminUser() || webNodeApprovalBusy;
+  if (webNodeApprovalApproveBtn) {
+    webNodeApprovalApproveBtn.disabled = disableActions;
+  }
+  if (webNodeApprovalDenyBtn) {
+    webNodeApprovalDenyBtn.disabled = disableActions;
+  }
+}
+
+function isWebNodeApprovalOpen() {
+  return !!(webNodeApprovalOverlay && webNodeApprovalOverlay.classList.contains('is-open'));
+}
+
+function openWebNodeApprovalOverlay() {
+  if (!webNodeApprovalOverlay || !webNodeRequestQueue.length) return;
+  webNodeApprovalOverlay.hidden = false;
+  webNodeApprovalOverlay.style.display = 'flex';
+  webNodeApprovalOverlay.classList.add('is-open');
+  webNodeApprovalOverlay.setAttribute('aria-hidden', 'false');
+  webNodeApprovalManuallyHidden = false;
+  renderWebNodeApprovalContent();
+  if (webNodeApprovalApproveBtn) {
+    setTimeout(() => webNodeApprovalApproveBtn.focus({ preventScroll: true }), 50);
+  }
+}
+
+function closeWebNodeApprovalOverlay(options = {}) {
+  if (!webNodeApprovalOverlay) return;
+  webNodeApprovalOverlay.classList.remove('is-open');
+  webNodeApprovalOverlay.style.display = 'none';
+  webNodeApprovalOverlay.hidden = true;
+  webNodeApprovalOverlay.setAttribute('aria-hidden', 'true');
+  if (options.manual && webNodeRequestQueue.length) {
+    webNodeApprovalManuallyHidden = true;
+  } else if (!webNodeRequestQueue.length) {
+    webNodeApprovalManuallyHidden = false;
+  }
+}
+
+function updateWebNodeRequestAlert() {
+  const count = webNodeRequestQueue.length;
+  if (!count || !isAdminUser()) {
+    if (persistentAlertState?.key === WEB_NODE_ALERT_KEY) {
+      hidePersistentAlert();
+    }
+    return;
+  }
+  if (persistentAlertState && persistentAlertState.key && persistentAlertState.key !== WEB_NODE_ALERT_KEY) {
+    return;
+  }
+  const activeRequest = getActiveWebNodeRequest();
+  const name = activeRequest?.name || 'Web node';
+  const message = count === 1
+    ? `${name} is waiting for approval.`
+    : `${count} web nodes are waiting for approval.`;
+  showPersistentAlert(message, {
+    key: WEB_NODE_ALERT_KEY,
+    actionLabel: 'Review request',
+    dismissLabel: 'Later',
+    dismissAriaLabel: 'Hide approval reminder',
+    onAction: () => openWebNodeApprovalOverlay(),
+  });
+}
+
+function syncWebNodeApprovalState(options = {}) {
+  updateReviewWebNodeRequestsButton();
+  renderWebNodeApprovalContent();
+  const hasRequests = webNodeRequestQueue.length > 0;
+  if (!hasRequests) {
+    closeWebNodeApprovalOverlay({ manual: false });
+    if (persistentAlertState?.key === WEB_NODE_ALERT_KEY) {
+      hidePersistentAlert();
+    }
+    return;
+  }
+  updateWebNodeRequestAlert();
+  if (!isAdminUser()) {
+    closeWebNodeApprovalOverlay({ manual: false });
+    return;
+  }
+  if (!webNodeApprovalManuallyHidden || options.forceOpen) {
+    openWebNodeApprovalOverlay();
+  }
+}
+
+async function sendWebNodeRequestDecision(action, options = {}) {
+  const request = getActiveWebNodeRequest();
+  if (!request) return;
+  if (!isAdminUser()) {
+    showError('Only admins can manage web node approvals.');
+    return;
+  }
+  if (webNodeApprovalBusy) return;
+  webNodeApprovalBusy = true;
+  renderWebNodeApprovalContent();
+  try {
+    const res = await fetch(`/api/web-nodes/requests/${encodeURIComponent(request.id)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action,
+        reason: options.reason || undefined,
+      }),
+    });
+    await ensureOk(res);
+    const verb = action === 'approve' ? 'Approved' : 'Denied';
+    showSuccess(`${verb} ${request.name}.`);
+  } catch (err) {
+    showError(`Failed to ${action} request: ${err.message}`);
+  } finally {
+    webNodeApprovalBusy = false;
+    renderWebNodeApprovalContent();
+  }
+}
+
+async function handleWebNodeApprovalApprove(event) {
+  event?.preventDefault();
+  await sendWebNodeRequestDecision('approve');
+}
+
+async function handleWebNodeApprovalDeny(event) {
+  event?.preventDefault();
+  const request = getActiveWebNodeRequest();
+  if (!request) return;
+  const confirmed = await openConfirmDialog({
+    title: 'Deny web node?',
+    message: `Block ${request.name} from connecting?`,
+    confirmLabel: 'Deny',
+    cancelLabel: 'Keep waiting',
+    tone: 'danger',
+  });
+  if (!confirmed) return;
+  await sendWebNodeRequestDecision('deny');
+}
+
+function handleWebNodeApprovalOverlayClick(event) {
+  if (!webNodeApprovalOverlay || event.target !== webNodeApprovalOverlay) return;
+  closeWebNodeApprovalOverlay({ manual: true });
+}
+
+function handleWebNodeApprovalKeydown(event) {
+  if (event.key !== 'Escape') return;
+  if (!isWebNodeApprovalOpen()) return;
+  event.preventDefault();
+  closeWebNodeApprovalOverlay({ manual: true });
+}
+
+if (webNodeApprovalOverlay) {
+  webNodeApprovalOverlay.addEventListener('click', handleWebNodeApprovalOverlayClick);
+}
+if (webNodeApprovalCloseBtn) {
+  webNodeApprovalCloseBtn.addEventListener('click', () => closeWebNodeApprovalOverlay({ manual: true }));
+}
+if (webNodeApprovalApproveBtn) {
+  webNodeApprovalApproveBtn.addEventListener('click', handleWebNodeApprovalApprove);
+}
+if (webNodeApprovalDenyBtn) {
+  webNodeApprovalDenyBtn.addEventListener('click', handleWebNodeApprovalDeny);
+}
+document.addEventListener('keydown', handleWebNodeApprovalKeydown, true);
+if (reviewWebNodeRequestsBtn) {
+  reviewWebNodeRequestsBtn.addEventListener('click', () => {
+    if (!webNodeRequestQueue.length) {
+      showError('No pending web node requests.');
+      return;
+    }
+    openWebNodeApprovalOverlay();
+  });
 }
 
 function suppressPersistentAlert(key) {
