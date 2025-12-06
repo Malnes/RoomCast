@@ -1597,8 +1597,28 @@ function applyMuteButtonState(btn, muted) {
   }
 }
 
+function queueNodeVolumeUpdate(nodeId, value) {
+  if (!nodeId) return;
+  const pending = nodeVolumeUpdateTimers.get(nodeId);
+  if (pending) clearTimeout(pending);
+  const timer = setTimeout(() => {
+    nodeVolumeUpdateTimers.delete(nodeId);
+    setNodeVolume(nodeId, value, { silent: true });
+  }, NODE_VOLUME_PUSH_DEBOUNCE_MS);
+  nodeVolumeUpdateTimers.set(nodeId, timer);
+}
+
+function flushPendingNodeVolumeUpdate(nodeId) {
+  const pending = nodeVolumeUpdateTimers.get(nodeId);
+  if (!pending) return;
+  clearTimeout(pending);
+  nodeVolumeUpdateTimers.delete(nodeId);
+}
+
 let nodesCache = [];
 const nodeVolumeSliderRefs = new Map();
+const nodeVolumeUpdateTimers = new Map();
+const NODE_VOLUME_PUSH_DEBOUNCE_MS = 150;
 let pendingNodesRender = null;
 let pendingNodesForce = false;
 const eqState = {};
@@ -1840,53 +1860,43 @@ function createNodeChannelSelector(node, options = {}) {
   select.setAttribute('aria-label', `Channel for ${node.name || 'node'}`);
   const playableChannels = getPlayerChannels();
   const hasPlayable = playableChannels.length > 0;
-  let resolvedId = resolveNodeChannelId(node) || null;
-  const resolvedPlayable = resolvedId && playableChannels.some(ch => ch.id === resolvedId);
-  if (!resolvedPlayable) {
-    resolvedId = hasPlayable ? playableChannels[0].id : null;
-  }
+  const resolvedId = resolveNodeChannelId(node) || '';
+  const unassignedOption = document.createElement('option');
+  unassignedOption.value = '';
+  unassignedOption.textContent = hasPlayable ? 'Unassigned' : 'No enabled channels';
   if (!hasPlayable) {
-    const placeholder = document.createElement('option');
-    placeholder.value = '';
-    placeholder.textContent = 'No enabled channels';
-    placeholder.disabled = true;
-    placeholder.selected = true;
-    select.appendChild(placeholder);
-  } else {
-    playableChannels.forEach(channel => {
-      const option = document.createElement('option');
-      option.value = channel.id;
-      option.textContent = channel.name || channel.id;
-      select.appendChild(option);
-    });
+    unassignedOption.disabled = true;
   }
-  if (resolvedId) {
+  select.appendChild(unassignedOption);
+  playableChannels.forEach(channel => {
+    const option = document.createElement('option');
+    option.value = channel.id;
+    option.textContent = channel.name || channel.id;
+    select.appendChild(option);
+  });
+  const validResolved = resolvedId && playableChannels.some(channel => channel.id === resolvedId);
+  if (validResolved) {
     select.value = resolvedId;
-    select.dataset.previousChannel = resolvedId;
-    updateChannelDotColor(dot, resolvedId);
   } else {
-    select.dataset.previousChannel = '';
-    updateChannelDotColor(dot, null);
+    select.value = '';
   }
-  const shouldDisable = options.disabled || !hasPlayable;
+  select.dataset.previousChannel = select.value;
+  updateChannelDotColor(dot, validResolved ? resolvedId : null);
+  const shouldDisable = options.disabled || (!hasPlayable && select.value === '');
   select.disabled = !!shouldDisable;
   select.addEventListener('change', async () => {
     const targetChannel = select.value;
-    const previous = select.dataset.previousChannel || resolvedId;
-    if (!targetChannel || select.disabled) {
-      if (previous) {
-        select.value = previous;
-        updateChannelDotColor(dot, previous);
-      }
+    const previous = select.dataset.previousChannel ?? '';
+    if (select.disabled) {
+      select.value = previous;
+      updateChannelDotColor(dot, previous || null);
       return;
     }
     try {
       await setNodeChannel(node.id, targetChannel, select, dot);
     } catch (_) {
-      if (previous) {
-        select.value = previous;
-        updateChannelDotColor(dot, previous);
-      }
+      select.value = previous;
+      updateChannelDotColor(dot, previous || null);
     }
   });
   wrapper.appendChild(select);
@@ -2163,8 +2173,12 @@ function commitRenderNodes(nodes) {
     volInput.addEventListener('input', () => {
       setRangeProgress(volInput, volInput.value, volInput.max || 100);
       updateVolumeMeta();
+      queueNodeVolumeUpdate(n.id, volInput.value);
     });
-    volInput.addEventListener('change', () => setNodeVolume(n.id, volInput.value));
+    volInput.addEventListener('change', () => {
+      flushPendingNodeVolumeUpdate(n.id);
+      setNodeVolume(n.id, volInput.value);
+    });
     volRow.appendChild(volInput);
     nodeVolumeSliderRefs.set(n.id, volInput);
     if (volumeMeta) {
@@ -2192,6 +2206,11 @@ function commitRenderNodes(nodes) {
   const nodeIds = new Set(nodes.map(n => n.id));
   Object.keys(camillaPendingNodes).forEach(id => {
     if (!nodeIds.has(id)) delete camillaPendingNodes[id];
+  });
+  nodeVolumeUpdateTimers.forEach((timer, nodeId) => {
+    if (nodeIds.has(nodeId)) return;
+    clearTimeout(timer);
+    nodeVolumeUpdateTimers.delete(nodeId);
   });
   refreshNodeSettingsModal();
 }

@@ -740,7 +740,7 @@ class WebNodeOffer(BaseModel):
 
 
 class NodeChannelPayload(BaseModel):
-    channel_id: str = Field(min_length=1, max_length=120)
+    channel_id: Optional[str] = Field(default=None, max_length=120)
 
 
 class SpotifyConfig(BaseModel):
@@ -1213,20 +1213,24 @@ def _radio_runtime_payload(channel_id: str) -> dict:
     return status
 
 
-def _select_initial_channel_id(preferred: Optional[str] = None) -> str:
+def _select_initial_channel_id(preferred: Optional[str] = None, *, fallback: bool = True) -> Optional[str]:
     candidate = (preferred or "").strip().lower()
     if candidate in channels_by_id:
         return candidate
-    return _primary_channel_id()
+    if fallback:
+        return _primary_channel_id()
+    return None
 
 
-def resolve_node_channel_id(node: dict) -> str:
+def resolve_node_channel_id(node: dict, *, assign_default: bool = False) -> Optional[str]:
     channel_id = (node.get("channel_id") or "").strip().lower()
     if channel_id in channels_by_id:
         return channel_id
-    fallback = _primary_channel_id()
-    node["channel_id"] = fallback
-    return fallback
+    if assign_default:
+        fallback = _primary_channel_id()
+        node["channel_id"] = fallback
+        return fallback
+    return None
 
 
 def public_node(node: dict) -> dict:
@@ -1927,7 +1931,7 @@ def _register_node_internal(
         "playback_device": previous.get("playback_device"),
         "outputs": previous.get("outputs", {}),
         "fingerprint": fingerprint or previous.get("fingerprint"),
-        "channel_id": _select_initial_channel_id(previous.get("channel_id")),
+        "channel_id": _select_initial_channel_id(previous.get("channel_id"), fallback=node_type != "browser"),
         "snapclient_id": previous.get("snapclient_id"),
         "online": True,
         "offline_since": None,
@@ -2268,7 +2272,9 @@ def load_nodes() -> None:
                 item["online"] = True
             else:
                 item["online"] = bool(item.get("online", False))
-            item["channel_id"] = _select_initial_channel_id(item.get("channel_id"))
+            item["channel_id"] = _select_initial_channel_id(
+                item.get("channel_id"), fallback=item.get("type") != "browser"
+            )
             snapclient_id = (item.get("snapclient_id") or "").strip() or None
             item["snapclient_id"] = snapclient_id
             nodes[item["id"]] = item
@@ -2768,10 +2774,18 @@ async def _ensure_snapclient_stream(node: dict, channel: dict) -> str:
     return str(client.get("id"))
 
 
-async def _set_node_channel(node: dict, channel_id: str) -> None:
-    resolved = resolve_channel_id(channel_id)
+async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
+    normalized = (channel_id or "").strip().lower()
+    if normalized and normalized not in channels_by_id:
+        raise HTTPException(status_code=404, detail="Unknown channel")
+    resolved = normalized or None
     current = resolve_node_channel_id(node)
     if resolved == current:
+        return
+    if not resolved:
+        if node.get("type") == "browser" and webrtc_relay:
+            await webrtc_relay.update_session_channel(node["id"], None, None)
+        node["channel_id"] = None
         return
     channel = channels_by_id[resolved]
     stream_id = channel.get("snap_stream")
@@ -3285,9 +3299,9 @@ async def web_node_session(payload: WebNodeOffer) -> dict:
     name = payload.name.strip() or "Web node"
     node = create_browser_node(name)
     channel_id = resolve_node_channel_id(node)
-    channel = channels_by_id.get(channel_id)
+    channel = channels_by_id.get(channel_id) if channel_id else None
     stream_id = channel.get("snap_stream") if channel else None
-    if not channel or not stream_id:
+    if channel_id and (not channel or not stream_id):
         await teardown_browser_node(node["id"])
         raise HTTPException(status_code=500, detail="Channel is missing snap_stream mapping")
     try:

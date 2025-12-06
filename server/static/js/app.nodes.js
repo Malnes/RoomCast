@@ -160,7 +160,9 @@ async function setVolume(clientId, percent) {
   }
 }
 
-async function setNodeVolume(nodeId, percent) {
+async function setNodeVolume(nodeId, percent, options = {}) {
+  const opts = options && typeof options === 'object' ? options : {};
+  const silent = opts.silent === true;
   try {
     const res = await fetch(`/api/nodes/${nodeId}/volume`, {
       method: 'POST',
@@ -168,7 +170,9 @@ async function setNodeVolume(nodeId, percent) {
       body: JSON.stringify({ percent: Number(percent) }),
     });
     await ensureOk(res);
-    showSuccess('Node volume updated');
+    if (!silent) {
+      showSuccess('Node volume updated');
+    }
   } catch (err) {
     showError(`Failed to set node volume: ${err.message}`);
   }
@@ -194,30 +198,30 @@ async function setNodeMaxVolume(nodeId, percent, sliderEl) {
 }
 
 async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
-  if (!channelId) return;
-  const previous = selectEl?.dataset?.previousChannel || null;
-  if (previous && previous === channelId) return;
+  const normalized = typeof channelId === 'string' ? channelId.trim() : '';
+  const previous = selectEl?.dataset?.previousChannel ?? '';
+  if (previous === normalized) return;
   if (selectEl) selectEl.disabled = true;
   try {
     const res = await fetch(`/api/nodes/${nodeId}/channel`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ channel_id: channelId }),
+      body: JSON.stringify({ channel_id: normalized || null }),
     });
     await ensureOk(res);
     showSuccess('Channel updated');
     if (selectEl) {
-      selectEl.dataset.previousChannel = channelId;
+      selectEl.dataset.previousChannel = normalized;
     }
-    updateChannelDotColor(dotEl, channelId);
+    updateChannelDotColor(dotEl, normalized || null);
     await fetchNodes({ force: true });
   } catch (err) {
     showError(`Failed to update channel: ${err.message}`);
-    if (selectEl && previous) {
+    if (selectEl) {
       selectEl.value = previous;
       selectEl.dataset.previousChannel = previous;
     }
-    if (dotEl) updateChannelDotColor(dotEl, previous);
+    if (dotEl) updateChannelDotColor(dotEl, previous || null);
     throw err;
   } finally {
     if (selectEl) selectEl.disabled = false;

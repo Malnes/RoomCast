@@ -1310,12 +1310,9 @@ function resolveRangeAccent(el) {
 }
 
 function resolveNodeChannelId(node) {
-  if (node?.channel_id && channelsCache.some(ch => ch.id === node.channel_id)) {
-    return node.channel_id;
-  }
-  const playable = getPlayerChannels();
-  if (playable.length) return playable[0].id;
-  return channelsCache[0]?.id || null;
+  const channelId = (node?.channel_id || '').trim().toLowerCase();
+  if (!channelId) return null;
+  return channelsCache.some(ch => ch.id === channelId) ? channelId : null;
 }
 
 function updateChannelDotColor(target, channelId) {

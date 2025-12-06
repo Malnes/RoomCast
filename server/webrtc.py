@@ -418,7 +418,13 @@ class SnapclientPump:
 class WebAudioTrack(MediaStreamTrack):
     kind = "audio"
 
-    def __init__(self, relay: "WebAudioRelay", sample_rate: int, channel_id: str, pan: float = 0.0) -> None:
+    def __init__(
+        self,
+        relay: "WebAudioRelay",
+        sample_rate: int,
+        channel_id: Optional[str],
+        pan: float = 0.0,
+    ) -> None:
         super().__init__()
         self._relay = relay
         self._queue: Optional[asyncio.Queue[AudioChunk]] = None
@@ -426,8 +432,13 @@ class WebAudioTrack(MediaStreamTrack):
         self._pan = float(pan)
         self._sample_rate = max(8000, min(192000, int(sample_rate)))
         self._channel_id = channel_id
+        self._silence_frame_bytes = _frame_bytes(self._sample_rate)
+        self._silence_samples = _frame_samples(self._sample_rate)
+        self._silence_chunk = bytes(self._silence_frame_bytes)
 
     async def _ensure_queue(self) -> asyncio.Queue[AudioChunk]:
+        if not self._channel_id:
+            raise RuntimeError("No channel assigned")
         if not self._queue:
             self._queue = await self._relay._subscribe_channel(self._channel_id)
         return self._queue
@@ -435,7 +446,7 @@ class WebAudioTrack(MediaStreamTrack):
     def set_pan(self, pan: float) -> None:
         self._pan = max(-1.0, min(1.0, pan))
 
-    async def set_channel(self, channel_id: str) -> None:
+    async def set_channel(self, channel_id: Optional[str]) -> None:
         if channel_id == self._channel_id:
             return
         await self._release_queue()
@@ -452,21 +463,31 @@ class WebAudioTrack(MediaStreamTrack):
 
     async def recv(self) -> av.AudioFrame:
         while True:
-            queue = await self._ensure_queue()
+            if not self._channel_id:
+                await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
+                return self._build_frame(self._silence_chunk)
+            try:
+                queue = await self._ensure_queue()
+            except RuntimeError:
+                await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
+                continue
             chunk = await queue.get()
             if chunk is None:
                 # Channel switched; resubscribe to the new source.
                 self._queue = None
                 continue
             chunk = self._apply_pan(chunk)
-            samples = len(chunk) // SAMPLE_WIDTH
-            frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
-            frame.planes[0].update(chunk)
-            frame.sample_rate = self._sample_rate
-            frame.time_base = Fraction(1, self._sample_rate)
-            frame.pts = self._samples_sent
-            self._samples_sent += samples
-            return frame
+            return self._build_frame(chunk)
+
+    def _build_frame(self, chunk: bytes) -> av.AudioFrame:
+        samples = len(chunk) // SAMPLE_WIDTH
+        frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
+        frame.planes[0].update(chunk)
+        frame.sample_rate = self._sample_rate
+        frame.time_base = Fraction(1, self._sample_rate)
+        frame.pts = self._samples_sent
+        self._samples_sent += samples
+        return frame
 
     def _apply_pan(self, chunk: bytes) -> bytes:
         if abs(self._pan) < 1e-3:
@@ -520,7 +541,7 @@ class WebNodeSession:
     pc: RTCPeerConnection
     track: WebAudioTrack
     sample_rate: int
-    channel_id: str
+    channel_id: Optional[str]
 
     async def accept(self, sdp: str, sdp_type: str) -> RTCSessionDescription:
         offer = RTCSessionDescription(sdp=sdp, type=sdp_type)
@@ -681,8 +702,15 @@ class WebAudioRelay:
         for _, source in channels:
             await source.pump.stop()
 
-    async def create_session(self, node_id: str, channel_id: str, stream_id: str, pan: float = 0.0) -> WebNodeSession:
-        await self._ensure_channel_source(channel_id, stream_id)
+    async def create_session(
+        self,
+        node_id: str,
+        channel_id: Optional[str],
+        stream_id: Optional[str],
+        pan: float = 0.0,
+    ) -> WebNodeSession:
+        if channel_id and stream_id:
+            await self._ensure_channel_source(channel_id, stream_id)
         async with self._lock:
             existing = self._sessions.get(node_id)
             if existing:
@@ -721,8 +749,14 @@ class WebAudioRelay:
     async def drop_session(self, node_id: str) -> None:
         await self._handle_session_closed(node_id)
 
-    async def update_session_channel(self, node_id: str, channel_id: str, stream_id: str) -> None:
-        await self._ensure_channel_source(channel_id, stream_id)
+    async def update_session_channel(
+        self,
+        node_id: str,
+        channel_id: Optional[str],
+        stream_id: Optional[str],
+    ) -> None:
+        if channel_id and stream_id:
+            await self._ensure_channel_source(channel_id, stream_id)
         async with self._lock:
             session = self._sessions.get(node_id)
         if not session:
