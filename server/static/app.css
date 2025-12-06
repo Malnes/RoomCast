@@ -135,6 +135,8 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 .node-wifi-meter.is-unknown span { opacity: 0.5; }
 .node-wifi-meter.is-offline span { background: rgba(248,113,113,0.3); opacity: 0.5; }
 .node-wifi-meter.is-offline::after { content: ''; position: absolute; left: 50%; top: -2px; bottom: -2px; width: 2px; background: rgba(248,113,113,0.85); transform: translateX(-50%) rotate(-45deg); border-radius: 999px; }
+.node-type-icon { --node-type-color: #e2e8f0; display: inline-flex; align-items: center; justify-content: center; color: var(--node-type-color); }
+.node-type-icon svg { width: 18px; height: 18px; display: block; }
 .node-icon-btn { width: 48px; height: 48px; border: none; background: transparent; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; color: #e2e8f0; cursor: pointer; transition: color 0.15s ease, transform 0.1s ease; font-size: 22px; }
 .node-icon-btn svg { width: 28px; height: 28px; display: block; }
 .node-icon-btn:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.6); outline-offset: 2px; }

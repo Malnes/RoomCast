@@ -1643,6 +1643,19 @@ const EQ_ICON_SVG = `
     <line x1="17" y1="17" x2="17" y2="21"></line>
     <circle cx="17" cy="15" r="1.8" fill="currentColor" stroke="none"></circle>
   </svg>`;
+const ICON_BROWSER_NODE = `
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" role="img">
+    <circle cx="12" cy="12" r="9"></circle>
+    <path d="M3 12h18"></path>
+    <path d="M12 3a24 24 0 010 18"></path>
+    <path d="M12 3a24 24 0 000 18"></path>
+  </svg>`;
+const ICON_CONTROLLER_NODE = `
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" role="img">
+    <path d="M3 11l9-7 9 7"></path>
+    <path d="M5 10v9h14v-9"></path>
+    <rect x="10" y="13" width="4" height="6" rx="1"></rect>
+  </svg>`;
 const ICON_VOLUME_ON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15 9a3 3 0 010 6"/></svg>`;
 const ICON_VOLUME_OFF = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M19 9l-6 6"/><path d="M13 9l6 6"/></svg>`;
 const ICON_SHUFFLE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h4v4"/><path d="M4 20l16-16"/><path d="M4 4l5 5"/><path d="M15 15l5 5v-4"/></svg>`;
@@ -1953,6 +1966,49 @@ function renderNodeWifiIndicator(node) {
   return indicator;
 }
 
+function createNodeTypeIcon(options) {
+  if (!options?.icon) return null;
+  const iconEl = document.createElement('span');
+  const classes = ['node-type-icon'];
+  if (options.className) {
+    classes.push(options.className);
+  }
+  iconEl.className = classes.join(' ');
+  iconEl.innerHTML = options.icon;
+  if (options.label) {
+    iconEl.setAttribute('role', 'img');
+    iconEl.setAttribute('aria-label', options.label);
+    iconEl.title = options.label;
+  }
+  const colorValue = options.color || null;
+  if (colorValue) {
+    iconEl.style.setProperty('--node-type-color', colorValue);
+  }
+  return iconEl;
+}
+
+function renderNodeIdentityBadge(node) {
+  if (!node) return null;
+  if (node.is_controller) {
+    return createNodeTypeIcon({
+      icon: ICON_CONTROLLER_NODE,
+      label: 'Server node',
+      color: '#fde68a',
+      className: 'node-type-controller',
+    });
+  }
+  if (node.type === 'browser') {
+    const accent = getNodeChannelAccent(node) || DEFAULT_CHANNEL_COLOR;
+    return createNodeTypeIcon({
+      icon: ICON_BROWSER_NODE,
+      label: 'Browser node',
+      color: accent,
+      className: 'node-type-browser',
+    });
+  }
+  return null;
+}
+
 function commitRenderNodes(nodes) {
   nodesEl.innerHTML = '';
   nodeVolumeSliderRefs.clear();
@@ -1975,6 +2031,10 @@ function commitRenderNodes(nodes) {
     const titleStrong = document.createElement('strong');
     titleStrong.textContent = n.name;
     title.appendChild(titleStrong);
+    const identityBadge = renderNodeIdentityBadge(n);
+    if (identityBadge) {
+      title.appendChild(identityBadge);
+    }
     header.appendChild(title);
 
     const gearWrap = document.createElement('div');
