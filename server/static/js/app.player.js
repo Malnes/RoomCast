@@ -49,6 +49,11 @@ function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   setTakeoverBannerVisible(false);
 }
 
+const playerSaveServerNameBtn =
+  typeof saveServerNameBtn !== 'undefined'
+    ? saveServerNameBtn
+    : document.getElementById('save-server-name');
+
 async function fetchPlayerStatus() {
   if (!isAuthenticated()) return;
   const channel = getActiveChannel();
@@ -673,7 +678,7 @@ async function saveServerName() {
     return;
   }
   try {
-    saveServerNameBtn.disabled = true;
+    if (playerSaveServerNameBtn) playerSaveServerNameBtn.disabled = true;
     const res = await fetch('/api/server/name', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -688,7 +693,7 @@ async function saveServerName() {
   } catch (err) {
     showError(`Failed to update server name: ${err.message}`);
   } finally {
-    saveServerNameBtn.disabled = false;
+    if (playerSaveServerNameBtn) playerSaveServerNameBtn.disabled = false;
   }
 }
 
@@ -926,8 +931,8 @@ if (spotifyChannelSelect) {
     fetchLibrespotStatus();
   });
 }
-if (saveServerNameBtn) {
-  saveServerNameBtn.addEventListener('click', saveServerName);
+if (playerSaveServerNameBtn) {
+  playerSaveServerNameBtn.addEventListener('click', saveServerName);
 }
 openSettingsBtn.addEventListener('click', openSettings);
 closeSettingsBtn.addEventListener('click', closeSettings);

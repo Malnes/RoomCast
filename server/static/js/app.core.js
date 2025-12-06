@@ -54,6 +54,13 @@ const playerTimeTotal = document.getElementById('player-time-total');
 const playerArt = document.getElementById('player-art');
 const playerTitle = document.getElementById('player-title');
 const playerArtist = document.getElementById('player-artist');
+const playerText = document.getElementById('player-text');
+const streamInfoOverlay = document.getElementById('stream-info-overlay');
+const streamInfoCloseBtn = document.getElementById('stream-info-close');
+const streamInfoChannelLabel = document.getElementById('stream-info-channel');
+const streamInfoLoading = document.getElementById('stream-info-loading');
+const streamInfoError = document.getElementById('stream-info-error');
+const streamInfoContent = document.getElementById('stream-info-content');
 const playerPlaylistsBtn = document.getElementById('player-playlists');
 const playerSearchBtn = document.getElementById('player-search');
 const takeoverBanner = document.getElementById('takeover-banner');
@@ -142,6 +149,15 @@ if (playerPanel) {
   playerPanel.addEventListener('pointercancel', handleCarouselPointerCancel);
   playerPanel.addEventListener('keydown', handleCarouselKeydown);
 }
+if (playerText) {
+  playerText.addEventListener('click', handleStreamInfoRequest);
+  playerText.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handleStreamInfoRequest();
+    }
+  });
+}
 window.addEventListener('resize', () => {
   syncPlayerCarouselToActive({ animate: false });
 });
@@ -164,6 +180,17 @@ if (playlistTrackFilterInput) {
     renderPlaylistTracks(state);
   });
 }
+if (streamInfoCloseBtn) {
+  streamInfoCloseBtn.addEventListener('click', closeStreamInfoOverlay);
+}
+if (streamInfoOverlay) {
+  streamInfoOverlay.addEventListener('click', event => {
+    if (event.target === streamInfoOverlay) {
+      closeStreamInfoOverlay();
+    }
+  });
+}
+document.addEventListener('keydown', handleStreamInfoKeydown, true);
 const searchOverlay = document.getElementById('search-overlay');
 const searchCloseBtn = document.getElementById('search-close');
 const searchForm = document.getElementById('spotify-search-form');
@@ -266,6 +293,7 @@ const PLAYER_SWIPE_DIRECTIONS = { FORWARD: 'forward', BACKWARD: 'backward' };
 let playerPanelSwipeState = { cleanup: null, timerId: null, unhideTimer: null };
 let pendingPlayerEntryDirection = null;
 let queueAbortController = null;
+let streamInfoAbortController = null;
 const playlistNameCollator = typeof Intl !== 'undefined' && typeof Intl.Collator === 'function'
   ? new Intl.Collator(undefined, { sensitivity: 'base' })
   : { compare: (a, b) => {
@@ -432,6 +460,15 @@ function startDataPolling() {
   fetchStatus();
 }
 
+  if (playerText) {
+    playerText.addEventListener('click', handleStreamInfoRequest);
+    playerText.addEventListener('keydown', event => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        handleStreamInfoRequest();
+      }
+    });
+  }
 function enterAppShell() {
   if (authShell) authShell.hidden = true;
   if (appShell) appShell.hidden = false;
@@ -687,6 +724,413 @@ if (confirmModalCancel) {
 }
 if (confirmModalAccept) {
   confirmModalAccept.addEventListener('click', () => closeConfirmDialog(true));
+}
+
+function handleStreamInfoRequest() {
+  if (!activeChannelId) {
+    showError('No active channel selected.');
+    return;
+  }
+  openStreamInfoOverlay(activeChannelId);
+}
+
+async function openStreamInfoOverlay(channelId) {
+  if (!streamInfoOverlay || !streamInfoLoading || !streamInfoContent) return;
+  if (streamInfoAbortController) {
+    streamInfoAbortController.abort();
+  }
+  streamInfoAbortController = new AbortController();
+  streamInfoOverlay.hidden = false;
+  streamInfoOverlay.classList.add('is-open');
+  streamInfoOverlay.setAttribute('aria-hidden', 'false');
+  streamInfoLoading.hidden = false;
+  if (streamInfoError) {
+    streamInfoError.hidden = true;
+    streamInfoError.textContent = '';
+  }
+  streamInfoContent.hidden = true;
+  streamInfoContent.innerHTML = '';
+  if (streamInfoChannelLabel) {
+    streamInfoChannelLabel.textContent = resolveChannelName(channelId);
+  }
+  try {
+    const payload = await fetchStreamDiagnostics(channelId, streamInfoAbortController.signal);
+    renderStreamInfo(payload, channelId);
+  } catch (err) {
+    if (err?.name === 'AbortError') return;
+    const message = getErrorMessage(err) || 'Failed to load stream diagnostics.';
+    if (streamInfoError) {
+      streamInfoError.textContent = message;
+      streamInfoError.hidden = false;
+    } else {
+      showError(message);
+    }
+  } finally {
+    if (streamInfoLoading) streamInfoLoading.hidden = true;
+    streamInfoAbortController = null;
+  }
+}
+
+function closeStreamInfoOverlay() {
+  if (streamInfoAbortController) {
+    streamInfoAbortController.abort();
+    streamInfoAbortController = null;
+  }
+  if (!streamInfoOverlay) return;
+  streamInfoOverlay.classList.remove('is-open');
+  streamInfoOverlay.setAttribute('aria-hidden', 'true');
+  streamInfoOverlay.hidden = true;
+}
+
+function handleStreamInfoKeydown(event) {
+  if (event.key !== 'Escape') return;
+  if (!streamInfoOverlay || streamInfoOverlay.hidden || !streamInfoOverlay.classList.contains('is-open')) return;
+  event.preventDefault();
+  closeStreamInfoOverlay();
+}
+
+async function fetchStreamDiagnostics(channelId, signal) {
+  const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : '';
+  const res = await fetch(`/api/streams/diagnostics${query}`, { signal });
+  if (!res.ok) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      if (body?.detail) detail = body.detail;
+    } catch (_) {
+      /* ignore */
+    }
+    throw new Error(detail);
+  }
+  return res.json();
+}
+
+function renderStreamInfo(payload, channelId) {
+  if (!streamInfoContent) return;
+  const channels = Array.isArray(payload?.channels) ? payload.channels : [];
+  const channel = channels.find(entry => entry?.id === channelId) || channels[0] || null;
+  streamInfoContent.innerHTML = '';
+  if (!channel) {
+    const empty = document.createElement('div');
+    empty.className = 'stream-info-empty';
+    empty.textContent = 'Channel diagnostics are unavailable right now.';
+    streamInfoContent.appendChild(empty);
+    streamInfoContent.hidden = false;
+    return;
+  }
+  if (streamInfoChannelLabel) {
+    streamInfoChannelLabel.textContent = resolveChannelName(channel.id);
+  }
+  const fragment = document.createDocumentFragment();
+  const sourceSection = buildStreamSourceSection(channel);
+  if (sourceSection) fragment.appendChild(sourceSection);
+  const snapSection = buildSnapserverSection(channel, payload?.snapserver);
+  if (snapSection) fragment.appendChild(snapSection);
+  const rtcSection = buildWebrtcSection(channel);
+  if (rtcSection) fragment.appendChild(rtcSection);
+  if (!fragment.childNodes.length) {
+    const empty = document.createElement('div');
+    empty.className = 'stream-info-empty';
+    empty.textContent = 'No diagnostics metrics available for this channel.';
+    fragment.appendChild(empty);
+  }
+  streamInfoContent.appendChild(fragment);
+  streamInfoContent.hidden = false;
+}
+
+function resolveChannelName(channelId) {
+  if (!channelId) return 'Channel';
+  const match = channelsCache.find(ch => ch.id === channelId);
+  return (match?.name || channelId).trim();
+}
+
+function buildStreamSourceSection(channel) {
+  const section = createInfoSection('Source', 'Input path and snapstream mapping');
+  const metrics = createMetricsGrid();
+  metrics.appendChild(createMetric('Origin', describeChannelOrigin(channel)));
+  if (channel?.spotify?.bitrate_kbps) {
+    metrics.appendChild(createMetric('Spotify bitrate', `${channel.spotify.bitrate_kbps} kbps`));
+  }
+  if (channel?.spotify?.normalisation !== undefined) {
+    metrics.appendChild(createMetric('Normalisation', formatBoolean(channel.spotify.normalisation)));
+  }
+  if (channel?.spotify?.status) {
+    const status = channel.spotify.status_message ? `${channel.spotify.status} · ${channel.spotify.status_message}` : channel.spotify.status;
+    metrics.appendChild(createMetric('Librespot status', status));
+  }
+  metrics.appendChild(createMetric('Snap stream', channel.snap_stream || '—'));
+  if (channel?.fifo_path) {
+    metrics.appendChild(createMetric('FIFO path', channel.fifo_path));
+  }
+  section.appendChild(metrics);
+  return section;
+}
+
+function buildSnapserverSection(channel, snapserverMeta) {
+  const stream = channel?.snapserver_stream;
+  const hasClients = Array.isArray(channel?.hardware_clients) && channel.hardware_clients.length > 0;
+  if (!stream && !hasClients && !snapserverMeta?.error) {
+    return null;
+  }
+  const section = createInfoSection('Snapserver stream', 'PCM feed served to hardware nodes');
+  const metrics = createMetricsGrid();
+  if (stream?.format) {
+    metrics.appendChild(createMetric('Sample format', formatSampleFormat(stream.format)));
+  }
+  if (stream?.codec) {
+    metrics.appendChild(createMetric('Codec', stream.codec.toUpperCase()));
+  }
+  if (stream?.uri) {
+    metrics.appendChild(createMetric('URI', stream.uri));
+  }
+  if (snapserverMeta) {
+    const defaultHost = window.location.hostname || 'snapserver';
+    const host = `${snapserverMeta.host || defaultHost}:${snapserverMeta.port || 1780}`;
+    metrics.appendChild(createMetric('Server', host));
+    if (snapserverMeta.error) {
+      metrics.appendChild(createMetric('Server state', `Error: ${snapserverMeta.error}`));
+    }
+  }
+  section.appendChild(metrics);
+  const heading = document.createElement('div');
+  heading.className = 'stream-info-list-title';
+  const hardwareTotal = channel?.listeners?.hardware_connected ?? channel?.listeners?.hardware ?? 0;
+  heading.textContent = `Hardware listeners (${hardwareTotal})`;
+  section.appendChild(heading);
+  if (hasClients) {
+    const list = document.createElement('ul');
+    list.className = 'stream-info-list';
+    channel.hardware_clients.forEach(client => {
+      list.appendChild(buildHardwareClientItem(client));
+    });
+    section.appendChild(list);
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'stream-info-empty';
+    empty.textContent = 'No Snapcast clients are currently attached to this stream.';
+    section.appendChild(empty);
+  }
+  return section;
+}
+
+function buildWebrtcSection(channel) {
+  const relay = channel?.webrtc;
+  if (!relay) return null;
+  const section = createInfoSection('WebRTC relay', 'Browser node encoder diagnostics');
+  const metrics = createMetricsGrid();
+  if (relay.sample_rate) {
+    metrics.appendChild(createMetric('Relay sample rate', formatSampleRate(relay.sample_rate)));
+  }
+  if (relay.frame_duration_ms) {
+    metrics.appendChild(createMetric('Frame size', `${relay.frame_duration_ms} ms`));
+  }
+  if (relay.pump) {
+    metrics.appendChild(createMetric('Pump bitrate', formatBitrate(relay.pump.avg_bitrate_bps)));
+    metrics.appendChild(createMetric('Pump restarts', relay.pump.restarts ?? 0));
+    metrics.appendChild(createMetric('Last restart', formatRelativeTime(relay.pump.last_restart)));
+    if (relay.pump.last_error) {
+      metrics.appendChild(createMetric('Last pump error', relay.pump.last_error));
+    }
+  }
+  if (relay.broadcaster) {
+    metrics.appendChild(createMetric('Broadcaster bitrate', formatBitrate(relay.broadcaster.avg_bitrate_bps)));
+    metrics.appendChild(createMetric('Queue overflows', relay.broadcaster.queue_overflows ?? 0));
+    metrics.appendChild(createMetric('Peak level', formatDbfs(relay.broadcaster.last_peak_dbfs)));
+    metrics.appendChild(createMetric('RMS level', formatDbfs(relay.broadcaster.last_rms_dbfs)));
+    if (relay.broadcaster.avg_channel_difference !== undefined) {
+      metrics.appendChild(createMetric('Avg L/R delta', formatChannelDifference(relay.broadcaster.avg_channel_difference)));
+    }
+  }
+  section.appendChild(metrics);
+  const heading = document.createElement('div');
+  heading.className = 'stream-info-list-title';
+  const sessionCount = Array.isArray(relay.sessions) ? relay.sessions.length : 0;
+  heading.textContent = `Web sessions (${sessionCount})`;
+  section.appendChild(heading);
+  if (sessionCount) {
+    const list = document.createElement('ul');
+    list.className = 'stream-info-list';
+    relay.sessions.forEach(session => list.appendChild(buildWebSessionItem(session, relay)));
+    section.appendChild(list);
+  } else {
+    const empty = document.createElement('div');
+    empty.className = 'stream-info-empty';
+    empty.textContent = 'No browser listeners are currently connected.';
+    section.appendChild(empty);
+  }
+  return section;
+}
+
+function createInfoSection(title, subtitle) {
+  const section = document.createElement('section');
+  section.className = 'stream-info-section';
+  if (title) {
+    const heading = document.createElement('div');
+    heading.className = 'section-title';
+    heading.textContent = title;
+    section.appendChild(heading);
+  }
+  if (subtitle) {
+    const sub = document.createElement('div');
+    sub.className = 'muted';
+    sub.textContent = subtitle;
+    section.appendChild(sub);
+  }
+  return section;
+}
+
+function createMetricsGrid() {
+  const grid = document.createElement('div');
+  grid.className = 'stream-info-metrics';
+  return grid;
+}
+
+function createMetric(label, value) {
+  const metric = document.createElement('div');
+  metric.className = 'stream-info-metric';
+  const labelEl = document.createElement('div');
+  labelEl.className = 'stream-info-metric-label';
+  labelEl.textContent = label;
+  const valueEl = document.createElement('div');
+  valueEl.className = 'stream-info-metric-value';
+  valueEl.textContent = value ?? '—';
+  metric.appendChild(labelEl);
+  metric.appendChild(valueEl);
+  return metric;
+}
+
+function buildHardwareClientItem(client) {
+  const item = document.createElement('li');
+  item.className = 'stream-info-list-item';
+  const name = client?.node_name || client?.configured_name || client?.host?.name || client?.id || 'Unnamed client';
+  const title = document.createElement('div');
+  title.className = 'stream-info-metric-value';
+  title.textContent = name;
+  item.appendChild(title);
+  const statusBits = [];
+  statusBits.push(client?.connected ? 'Connected' : 'Offline');
+  if (client?.version) statusBits.push(`v${client.version}`);
+  if (typeof client?.latency_ms === 'number') statusBits.push(`${client.latency_ms} ms latency`);
+  const status = document.createElement('div');
+  status.className = 'stream-info-list-sub';
+  status.textContent = statusBits.join(' · ');
+  item.appendChild(status);
+  const detailBits = [];
+  if (typeof client?.volume_percent === 'number') {
+    const volume = client.muted ? `${client.volume_percent}% (muted)` : `${client.volume_percent}%`;
+    detailBits.push(`Volume ${volume}`);
+  }
+  if (client?.node_name && client?.node_id) {
+    detailBits.push(`Node ${client.node_name}`);
+  }
+  if (detailBits.length) {
+    const detail = document.createElement('div');
+    detail.className = 'stream-info-list-sub';
+    detail.textContent = detailBits.join(' · ');
+    item.appendChild(detail);
+  }
+  return item;
+}
+
+function buildWebSessionItem(session, relay) {
+  const item = document.createElement('li');
+  item.className = 'stream-info-list-item';
+  const title = document.createElement('div');
+  title.className = 'stream-info-metric-value';
+  title.textContent = session?.node_name || session?.node_id || 'Browser node';
+  item.appendChild(title);
+  const stateBits = [];
+  if (session?.connection_state) stateBits.push(`Peer ${session.connection_state}`);
+  if (session?.ice_state) stateBits.push(`ICE ${session.ice_state}`);
+  if (session?.signaling_state) stateBits.push(`SDP ${session.signaling_state}`);
+  const state = document.createElement('div');
+  state.className = 'stream-info-list-sub';
+  state.textContent = stateBits.join(' · ') || 'State unknown';
+  item.appendChild(state);
+  const queueFrames = Number(session?.pending_frames) || 0;
+  const frameDuration = relay?.frame_duration_ms || 20;
+  const bufferMs = queueFrames * frameDuration;
+  const detailBits = [];
+  detailBits.push(`Queue ${queueFrames} frames${bufferMs ? ` (${bufferMs} ms)` : ''}`);
+  detailBits.push(`Pan ${formatPan(session?.pan)}`);
+  const detail = document.createElement('div');
+  detail.className = 'stream-info-list-sub';
+  detail.textContent = detailBits.join(' · ');
+  item.appendChild(detail);
+  return item;
+}
+
+function describeChannelOrigin(channel) {
+  const source = (channel?.source || 'spotify').toLowerCase();
+  if (source === 'radio') {
+    const station = channel?.radio_state?.station_name || channel?.radio_state?.stream_url;
+    return station ? `Radio · ${station}` : 'Radio';
+  }
+  if (channel?.spotify?.device_name) {
+    return `Spotify · ${channel.spotify.device_name}`;
+  }
+  return 'Spotify';
+}
+
+function formatSampleFormat(format) {
+  if (!format) return '—';
+  const rate = formatSampleRate(format.sample_rate);
+  const depth = format?.bit_depth ? `${format.bit_depth}-bit` : '—';
+  const channels = format?.channels ? format.channels.toString().toUpperCase() : 'stereo';
+  return `${rate} / ${depth} / ${channels}`;
+}
+
+function formatSampleRate(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return value ? String(value) : '—';
+  if (numeric >= 1000) {
+    const khz = numeric / 1000;
+    return `${khz % 1 === 0 ? khz.toFixed(0) : khz.toFixed(1)} kHz`;
+  }
+  return `${numeric} Hz`;
+}
+
+function formatBitrate(bps) {
+  const numeric = Number(bps);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '—';
+  const kbps = numeric / 1000;
+  return `${kbps >= 100 ? kbps.toFixed(0) : kbps.toFixed(1)} kbps`;
+}
+
+function formatDbfs(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  return `${numeric.toFixed(1)} dBFS`;
+}
+
+function formatChannelDifference(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '—';
+  if (numeric < 1) return '<1';
+  if (numeric >= 1000) return `${numeric.toFixed(0)}`;
+  return numeric.toFixed(1);
+}
+
+function formatRelativeTime(timestamp) {
+  const numeric = Number(timestamp);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '—';
+  const diff = Math.max(0, Math.round(Date.now() / 1000 - numeric));
+  if (diff < 60) return `${diff}s ago`;
+  if (diff < 3600) return `${Math.round(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.round(diff / 3600)}h ago`;
+  return `${Math.round(diff / 86400)}d ago`;
+}
+
+function formatBoolean(value) {
+  if (value === undefined || value === null) return '—';
+  return value ? 'On' : 'Off';
+}
+
+function formatPan(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return '0';
+  if (Math.abs(numeric) < 0.01) return 'Center';
+  return numeric.toFixed(2);
 }
 
 function hidePersistentAlert() {

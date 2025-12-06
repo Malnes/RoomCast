@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode, urlparse, parse_qs
 from typing import Dict, Optional, AsyncIterator, List, Callable, Any, Tuple, Literal
 
 import httpx
@@ -861,6 +861,109 @@ class SnapcastClient:
 snapcast = SnapcastClient(SNAPSERVER_HOST, SNAPSERVER_PORT)
 app = FastAPI(title="RoomCast Controller", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _public_snap_stream(entry: Optional[dict]) -> Optional[dict]:
+    if not isinstance(entry, dict):
+        return None
+    uri = entry.get("uri")
+    if not uri:
+        status = entry.get("status") or {}
+        uri = status.get("uri") or entry.get("location")
+    parsed = urlparse(uri) if uri else None
+    params = parse_qs(parsed.query) if parsed else {}
+    sampleformat = (params.get("sampleformat") or [None])[0]
+    format_info = None
+    if sampleformat:
+        parts = sampleformat.split(":")
+        format_info = {
+            "raw": sampleformat,
+            "sample_rate": _safe_int(parts[0]) if parts else None,
+            "bit_depth": parts[1] if len(parts) > 1 else None,
+            "channels": parts[2] if len(parts) > 2 else None,
+        }
+    codec = (params.get("codec") or [None])[0]
+    payload = {
+        "id": entry.get("id") or entry.get("name"),
+        "name": entry.get("name"),
+        "uri": uri,
+        "codec": codec,
+        "format": format_info,
+        "status": entry.get("status"),
+        "properties": entry.get("properties"),
+    }
+    return payload
+
+
+def _summarize_snapserver_status(status: Optional[dict]) -> tuple[dict[str, dict], dict[str, list[dict]]]:
+    if not isinstance(status, dict):
+        return {}, {}
+    server = status.get("server") or {}
+    streams: dict[str, dict] = {}
+    for entry in server.get("streams", []) or []:
+        if not isinstance(entry, dict):
+            continue
+        sid = entry.get("id") or entry.get("name")
+        if not sid:
+            continue
+        streams[sid] = _public_snap_stream(entry)
+    stream_clients: dict[str, list[dict]] = {}
+    for group in server.get("groups", []) or []:
+        if not isinstance(group, dict):
+            continue
+        stream_id = group.get("stream_id")
+        if not stream_id:
+            continue
+        stream_clients.setdefault(stream_id, [])
+        for client in group.get("clients", []) or []:
+            if not isinstance(client, dict):
+                continue
+            enriched = dict(client)
+            enriched["_group_id"] = group.get("id")
+            enriched["_group_name"] = group.get("name")
+            stream_clients[stream_id].append(enriched)
+    return streams, stream_clients
+
+
+def _public_snap_client(client: dict, snapclient_nodes: dict[str, dict]) -> dict:
+    cfg = client.get("config") or {}
+    volume = cfg.get("volume") or {}
+    host = client.get("host") or {}
+    snap_info = client.get("snapclient") or {}
+    client_id = client.get("id")
+    linked_node = snapclient_nodes.get(client_id)
+    volume_percent = volume.get("percent")
+    try:
+        volume_percent = _normalize_percent(volume_percent, default=75)
+    except Exception:
+        volume_percent = None
+    payload = {
+        "id": client_id,
+        "connected": bool(client.get("connected")),
+        "latency_ms": cfg.get("latency"),
+        "volume_percent": volume_percent,
+        "muted": bool(volume.get("muted")) if isinstance(volume.get("muted"), bool) else None,
+        "host": {
+            "name": host.get("name"),
+            "ip": host.get("ip"),
+            "os": host.get("os"),
+        },
+        "version": snap_info.get("version"),
+        "protocol": snap_info.get("protocolVersion"),
+        "group_id": client.get("_group_id"),
+        "group_name": client.get("_group_name"),
+        "configured_name": cfg.get("name"),
+        "node_id": linked_node.get("id") if linked_node else None,
+        "node_name": linked_node.get("name") if linked_node else None,
+    }
+    return payload
 
 
 async def _collect_channel_listener_counts() -> tuple[dict[str, int], bool]:
@@ -3083,6 +3186,96 @@ async def _channel_idle_loop() -> None:
 @app.get("/api/nodes")
 async def list_nodes() -> dict:
     return {"nodes": public_nodes()}
+
+
+@app.get("/api/streams/diagnostics")
+async def stream_diagnostics(channel_id: Optional[str] = Query(None)) -> dict:
+    if channel_id:
+        target_ids = [resolve_channel_id(channel_id)]
+    else:
+        target_ids = [cid for cid in channel_order if cid in channels_by_id]
+    snap_status = None
+    snap_error = None
+    try:
+        snap_status = await snapcast.status()
+    except Exception as exc:  # pragma: no cover - network dependency
+        snap_error = str(exc)
+        log.warning("Stream diagnostics: failed to read snapserver status: %s", exc)
+    streams_by_id, clients_by_stream = _summarize_snapserver_status(snap_status)
+    webrtc_diag = None
+    if webrtc_relay:
+        try:
+            webrtc_diag = await webrtc_relay.diagnostics()
+        except Exception as exc:  # pragma: no cover - defensive
+            log.warning("Stream diagnostics: failed to read WebRTC stats: %s", exc)
+            webrtc_diag = None
+    channel_payloads = []
+    node_lookup = {node_id: node for node_id, node in nodes.items()}
+    snapclient_nodes = {
+        node.get("snapclient_id"): node for node in nodes.values() if node.get("snapclient_id")
+    }
+    for cid in target_ids:
+        channel = channels_by_id.get(cid)
+        if not channel:
+            continue
+        stream_id = channel.get("snap_stream")
+        snap_stream = streams_by_id.get(stream_id)
+        hardware_clients = [
+            _public_snap_client(client, snapclient_nodes)
+            for client in clients_by_stream.get(stream_id, [])
+        ]
+        connected_clients = sum(1 for client in hardware_clients if client.get("connected"))
+        channel_webrtc = (webrtc_diag or {}).get("channels", {}).get(cid) if webrtc_diag else None
+        if channel_webrtc and channel_webrtc.get("sessions"):
+            for session in channel_webrtc["sessions"]:
+                node = node_lookup.get(session.get("node_id"))
+                if node:
+                    session["node_name"] = node.get("name")
+                    session["node_type"] = node.get("type")
+        spotify_summary = None
+        if channel.get("source") == "spotify":
+            cfg = read_spotify_config(channel["id"])
+            status = read_librespot_status(channel["id"])
+            spotify_summary = {
+                "bitrate_kbps": cfg.get("bitrate"),
+                "device_name": cfg.get("device_name"),
+                "normalisation": cfg.get("normalisation"),
+                "username": cfg.get("username"),
+                "status": status.get("state"),
+                "status_message": status.get("message"),
+            }
+        channel_payloads.append(
+            {
+                "id": channel["id"],
+                "name": channel.get("name"),
+                "color": channel.get("color"),
+                "source": channel.get("source", "spotify"),
+                "snap_stream": stream_id,
+                "fifo_path": channel.get("fifo_path"),
+                "spotify": spotify_summary,
+                "radio_state": channel.get("radio_state") if channel.get("source") == "radio" else None,
+                "snapserver_stream": snap_stream,
+                "hardware_clients": hardware_clients,
+                "listeners": {
+                    "hardware": len(hardware_clients),
+                    "hardware_connected": connected_clients,
+                    "webrtc": channel_webrtc.get("listeners") if channel_webrtc else 0,
+                },
+                "webrtc": channel_webrtc,
+            }
+        )
+    response = {
+        "timestamp": time.time(),
+        "channels": channel_payloads,
+        "snapserver": {
+            "host": SNAPSERVER_HOST,
+            "port": SNAPSERVER_PORT,
+            "error": snap_error,
+        },
+    }
+    if webrtc_diag:
+        response["webrtc"] = {"sample_rate": webrtc_diag.get("sample_rate")}
+    return response
 
 
 @app.post("/api/web-nodes/session")

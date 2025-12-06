@@ -1527,6 +1527,13 @@ async function registerControllerNode(btn) {
   }
 }
 
+const radioCollapsiblePanels = (typeof window !== 'undefined' && window.__roomcastCollapsiblePanels)
+  ? window.__roomcastCollapsiblePanels
+  : Array.from(document.querySelectorAll('[data-collapsible]'));
+if (typeof window !== 'undefined' && !window.__roomcastCollapsiblePanels) {
+  window.__roomcastCollapsiblePanels = radioCollapsiblePanels;
+}
+
 function setCollapsiblePanelState(panel, open) {
   if (!panel) return;
   const trigger = panel.querySelector('.collapsible-header');
@@ -1538,7 +1545,7 @@ function setCollapsiblePanelState(panel, open) {
 }
 
 function initCollapsiblePanels() {
-  collapsiblePanels.forEach(panel => {
+  radioCollapsiblePanels.forEach(panel => {
     const trigger = panel.querySelector('.collapsible-header');
     if (!trigger) return;
     trigger.addEventListener('click', () => {
@@ -1550,7 +1557,7 @@ function initCollapsiblePanels() {
 }
 
 function collapseAllPanels() {
-  collapsiblePanels.forEach(panel => setCollapsiblePanelState(panel, false));
+  radioCollapsiblePanels.forEach(panel => setCollapsiblePanelState(panel, false));
 }
 
 function applyCoverArtBackground() {

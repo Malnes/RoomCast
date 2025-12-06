@@ -95,7 +95,7 @@
       <div class="player-top">
         <div class="player-meta">
           <img id="player-art" src="" alt="" style="display:none;" role="button" tabindex="-1" aria-label="Show play queue">
-          <div class="player-text">
+          <div class="player-text" id="player-text" role="button" tabindex="0" aria-label="Show stream diagnostics">
             <div id="player-title" class="player-title">Player unavailable</div>
             <div id="player-artist" class="player-artist">—</div>
           </div>
@@ -213,6 +213,26 @@
         <div id="queue-empty" class="queue-empty muted" hidden>No upcoming tracks.</div>
         <div id="queue-current" class="queue-current" hidden></div>
         <div id="queue-list" class="queue-list" hidden></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="stream-info-overlay" class="stream-info-overlay" aria-hidden="true" hidden>
+    <div class="stream-info-modal" role="dialog" aria-modal="true" aria-labelledby="stream-info-title">
+      <div class="stream-info-header">
+        <div>
+          <div class="section-title" id="stream-info-title">Stream diagnostics</div>
+          <div class="muted" id="stream-info-channel">Active channel</div>
+        </div>
+        <button id="stream-info-close" class="icon-btn small-btn" type="button" aria-label="Close stream diagnostics">✕</button>
+      </div>
+      <div class="stream-info-body">
+        <div id="stream-info-loading" class="stream-info-loading" role="status" aria-live="polite">
+          <span class="spinner"></span>
+          <span>Loading stream metrics…</span>
+        </div>
+        <div id="stream-info-error" class="stream-info-error" role="alert" hidden></div>
+        <div id="stream-info-content" class="stream-info-content" hidden></div>
       </div>
     </div>
   </div>

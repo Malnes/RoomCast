@@ -3,7 +3,7 @@ import logging
 import math
 import time
 from array import array
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from fractions import Fraction
 from typing import Awaitable, Callable, Dict, Optional
 
@@ -21,6 +21,77 @@ CHANNELS = 2
 SAMPLE_FORMAT = "16"
 FRAME_DURATION_MS = 20
 SAMPLE_WIDTH = CHANNELS * BYTES_PER_SAMPLE
+
+
+def _to_dbfs(value: Optional[float]) -> Optional[float]:
+    if value is None or value <= 0:
+        return None
+    try:
+        return round(20.0 * math.log10(value / 32767.0), 2)
+    except (ValueError, ZeroDivisionError):
+        return None
+
+
+@dataclass
+class BroadcastStats:
+    started_at: float = field(default_factory=time.time)
+    total_chunks: int = 0
+    total_bytes: int = 0
+    queue_overflows: int = 0
+    last_chunk_at: Optional[float] = None
+    last_peak: Optional[float] = None
+    last_rms: Optional[float] = None
+    subscribers: int = 0
+    last_queue_depth: int = 0
+    max_queue_depth: int = 0
+    last_channel_diff: Optional[float] = None
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        elapsed = max(now - self.started_at, 1e-3)
+        avg_bitrate = (self.total_bytes * 8.0) / elapsed if self.total_bytes else 0.0
+        return {
+            "started_at": self.started_at,
+            "uptime_sec": elapsed,
+            "total_chunks": self.total_chunks,
+            "total_bytes": self.total_bytes,
+            "avg_bitrate_bps": avg_bitrate,
+            "queue_overflows": self.queue_overflows,
+            "last_chunk_at": self.last_chunk_at,
+            "last_peak_dbfs": _to_dbfs(self.last_peak),
+            "last_rms_dbfs": _to_dbfs(self.last_rms),
+            "subscribers": self.subscribers,
+            "last_queue_depth": self.last_queue_depth,
+            "max_queue_depth": self.max_queue_depth,
+            "avg_channel_difference": self.last_channel_diff,
+        }
+
+
+@dataclass
+class PumpStats:
+    started_at: float = field(default_factory=time.time)
+    total_chunks: int = 0
+    total_bytes: int = 0
+    restarts: int = 0
+    last_restart: Optional[float] = None
+    last_chunk_at: Optional[float] = None
+    last_error: Optional[str] = None
+
+    def snapshot(self) -> dict:
+        now = time.time()
+        elapsed = max(now - self.started_at, 1e-3)
+        avg_bitrate = (self.total_bytes * 8.0) / elapsed if self.total_bytes else 0.0
+        return {
+            "started_at": self.started_at,
+            "uptime_sec": elapsed,
+            "total_chunks": self.total_chunks,
+            "total_bytes": self.total_bytes,
+            "avg_bitrate_bps": avg_bitrate,
+            "restarts": self.restarts,
+            "last_restart": self.last_restart,
+            "last_chunk_at": self.last_chunk_at,
+            "last_error": self.last_error,
+        }
 
 def _frame_samples(sample_rate: int) -> int:
     return sample_rate * FRAME_DURATION_MS // 1000
@@ -43,31 +114,56 @@ class AudioBroadcaster:
     def __init__(self) -> None:
         self._subscribers: set[asyncio.Queue[AudioChunk]] = set()
         self._lock = asyncio.Lock()
+        self._stats = BroadcastStats()
+        self._last_channel_log = 0.0
 
     async def subscribe(self) -> asyncio.Queue[AudioChunk]:
         queue: asyncio.Queue[AudioChunk] = asyncio.Queue(maxsize=50)
         async with self._lock:
             self._subscribers.add(queue)
+            self._stats.subscribers = len(self._subscribers)
         return queue
 
     async def unsubscribe(self, queue: asyncio.Queue[AudioChunk]) -> None:
         async with self._lock:
             self._subscribers.discard(queue)
+            self._stats.subscribers = len(self._subscribers)
 
     async def publish(self, chunk: bytes) -> None:
         if not chunk:
             return
+        self._stats.total_chunks += 1
+        self._stats.total_bytes += len(chunk)
+        self._stats.last_chunk_at = time.time()
+        peak, rms, channel_diff = self._measure_levels(chunk)
+        if peak:
+            self._stats.last_peak = peak
+        if rms:
+            self._stats.last_rms = rms
+        if channel_diff is not None:
+            self._stats.last_channel_diff = channel_diff
+            now = time.time()
+            if now - self._last_channel_log >= 5:
+                self._last_channel_log = now
+                log.info(
+                    "WebRTC broadcaster channel difference avg=%.2f",
+                    channel_diff,
+                )
         dead: list[asyncio.Queue[AudioChunk]] = []
+        latest_depth = 0
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(chunk)
+                latest_depth = max(latest_depth, queue.qsize())
             except asyncio.QueueFull:
+                self._stats.queue_overflows += 1
                 try:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
                     pass
                 try:
                     queue.put_nowait(chunk)
+                    latest_depth = max(latest_depth, queue.qsize())
                 except asyncio.QueueFull:
                     # Subscriber is likely stuck; drop it.
                     dead.append(queue)
@@ -75,6 +171,49 @@ class AudioBroadcaster:
             async with self._lock:
                 for queue in dead:
                     self._subscribers.discard(queue)
+                self._stats.subscribers = len(self._subscribers)
+        if latest_depth:
+            self._stats.last_queue_depth = latest_depth
+            self._stats.max_queue_depth = max(self._stats.max_queue_depth, latest_depth)
+
+    def diagnostics(self) -> dict:
+        return self._stats.snapshot()
+
+    @staticmethod
+    def _measure_levels(chunk: bytes) -> tuple[Optional[int], Optional[float], Optional[float]]:
+        if len(chunk) < BYTES_PER_SAMPLE:
+            return None, None, None
+        try:
+            samples = memoryview(chunk).cast("h")
+        except TypeError:
+            data = array("h")
+            data.frombytes(chunk)
+            samples = data
+        peak = 0
+        total = 0
+        count = 0
+        channel_diff_total = 0
+        channel_diff_count = 0
+        for sample in samples:
+            value = int(sample)
+            total += value * value
+            abs_val = abs(value)
+            if abs_val > peak:
+                peak = abs_val
+            count += 1
+        if CHANNELS > 1 and len(samples) >= CHANNELS:
+            for idx in range(0, len(samples) - 1, CHANNELS):
+                left = int(samples[idx])
+                right = int(samples[idx + 1])
+                channel_diff_total += abs(left - right)
+                channel_diff_count += 1
+        if count == 0:
+            return None, None, None
+        rms = math.sqrt(total / count)
+        channel_diff = (
+            channel_diff_total / channel_diff_count if channel_diff_count else None
+        )
+        return peak, rms, channel_diff
 
 
 class SnapclientPump:
@@ -107,6 +246,7 @@ class SnapclientPump:
         self._frame_bytes = _frame_bytes(self.sample_rate)
         self._assign_task: Optional[asyncio.Task[None]] = None
         self._got_audio = False
+        self._stats = PumpStats()
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -136,6 +276,7 @@ class SnapclientPump:
                 await self._spawn()
                 await self._read_stdout()
             except Exception as exc:  # pragma: no cover - safety net
+                self._stats.last_error = repr(exc)
                 log.exception("Snapclient pump crashed: %s", exc)
             finally:
                 await self._cleanup_proc()
@@ -143,13 +284,6 @@ class SnapclientPump:
                     await asyncio.sleep(2)
 
     async def _spawn(self) -> None:
-        channel_arg = "*"
-        if self.stream_id and ":" in self.stream_id:
-            _, _, chan_info = self.stream_id.partition(":")
-            channel_hint = chan_info.split(".")[-1]
-            if channel_hint.isdigit():
-                channel_arg = channel_hint
-
         args = [
             "snapclient",
             "-h",
@@ -159,7 +293,7 @@ class SnapclientPump:
             "--player",
             "file:filename=stdout",
             "--sampleformat",
-            f"{self.sample_rate}:{SAMPLE_FORMAT}:{channel_arg}",
+            f"{self.sample_rate}:{SAMPLE_FORMAT}:*",
             "--latency",
             str(self.latency_ms),
             "--logsink",
@@ -170,6 +304,8 @@ class SnapclientPump:
         if self.client_id:
             args.extend(["--hostID", self.client_id])
         log.info("Starting snapclient pipe: %s", " ".join(args))
+        self._stats.restarts += 1
+        self._stats.last_restart = time.time()
         self._proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
@@ -229,6 +365,9 @@ class SnapclientPump:
         while len(self._buffer) >= self._frame_bytes:
             payload = bytes(self._buffer[:self._frame_bytes])
             del self._buffer[:self._frame_bytes]
+            self._stats.total_chunks += 1
+            self._stats.total_bytes += len(payload)
+            self._stats.last_chunk_at = time.time()
             await self.broadcaster.publish(payload)
             if not self._got_audio:
                 self._got_audio = True
@@ -261,6 +400,20 @@ class SnapclientPump:
             self._proc.kill()
             await self._proc.wait()
 
+    def diagnostics(self) -> dict:
+        stats = self._stats.snapshot()
+        stats.update(
+            {
+                "client_id": self.client_id,
+                "stream_id": self.stream_id,
+                "latency_ms": self.latency_ms,
+                "sample_rate": self.sample_rate,
+                "frame_bytes": self._frame_bytes,
+                "got_audio": self._got_audio,
+            }
+        )
+        return stats
+
 
 class WebAudioTrack(MediaStreamTrack):
     kind = "audio"
@@ -287,6 +440,15 @@ class WebAudioTrack(MediaStreamTrack):
             return
         await self._release_queue()
         self._channel_id = channel_id
+
+    @property
+    def pan(self) -> float:
+        return self._pan
+
+    def pending_frames(self) -> int:
+        if not self._queue:
+            return 0
+        return self._queue.qsize()
 
     async def recv(self) -> av.AudioFrame:
         while True:
@@ -664,3 +826,44 @@ class WebAudioRelay:
     async def channel_listener_counts(self) -> dict[str, int]:
         async with self._lock:
             return {cid: source.ref_count for cid, source in self._channel_sources.items()}
+
+    async def diagnostics(self) -> dict:
+        async with self._lock:
+            sessions = {node_id: session for node_id, session in self._sessions.items()}
+            sources = {cid: source for cid, source in self._channel_sources.items()}
+        payload: dict[str, dict] = {}
+        for cid, source in sources.items():
+            payload[cid] = {
+                "stream_id": source.stream_id,
+                "listeners": source.ref_count,
+                "pump": source.pump.diagnostics(),
+                "broadcaster": source.broadcaster.diagnostics(),
+                "frame_duration_ms": FRAME_DURATION_MS,
+                "channels": CHANNELS,
+                "sample_rate": self._sample_rate,
+                "sessions": [],
+            }
+        for node_id, session in sessions.items():
+            entry = payload.setdefault(
+                session.channel_id,
+                {
+                    "stream_id": session.channel_id,
+                    "listeners": 0,
+                    "pump": None,
+                    "broadcaster": None,
+                    "sessions": [],
+                },
+            )
+            entry.setdefault("sessions", []).append(
+                {
+                    "node_id": node_id,
+                    "channel_id": session.channel_id,
+                    "pan": session.track.pan,
+                    "sample_rate": session.sample_rate,
+                    "pending_frames": session.track.pending_frames(),
+                    "connection_state": getattr(session.pc, "connectionState", None),
+                    "ice_state": getattr(session.pc, "iceConnectionState", None),
+                    "signaling_state": getattr(session.pc, "signalingState", None),
+                }
+            )
+        return {"sample_rate": self._sample_rate, "channels": payload}

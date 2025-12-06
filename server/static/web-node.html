@@ -97,7 +97,11 @@
           }
         };
 
-        const offer = await pc.createOffer({ offerToReceiveAudio: true });
+        const rawOffer = await pc.createOffer({ offerToReceiveAudio: true });
+        const offer = {
+          type: rawOffer.type,
+          sdp: enhanceOpusSdp(rawOffer.sdp || '', 44100),
+        };
         await pc.setLocalDescription(offer);
         await waitForIce(pc);
 
@@ -200,6 +204,53 @@
       nodeVol.value = 75;
       registerBlock.style.display = 'block';
       disconnectBtn.style.display = 'none';
+    }
+
+    function enhanceOpusSdp(sdp, sampleRate = 44100) {
+      if (!sdp) return sdp;
+      const lines = sdp.split(/\r?\n/);
+      const opusIndex = lines.findIndex(line => line.startsWith('a=rtpmap:') && line.toLowerCase().includes('opus/48000'));
+      if (opusIndex === -1) {
+        return sdp;
+      }
+      const rtpmapParts = lines[opusIndex].split(/\s+/);
+      const payloadType = (rtpmapParts[0]?.split(':')[1]) || null;
+      if (!payloadType) {
+        return sdp;
+      }
+      if (!/opus\/48000\/2/i.test(lines[opusIndex])) {
+        lines[opusIndex] = lines[opusIndex].replace(/opus\/48000(?!\/2)/i, 'opus/48000/2');
+      }
+      const desiredParams = {
+        stereo: '1',
+        'sprop-stereo': '1',
+        maxaveragebitrate: '256000',
+        maxplaybackrate: String(sampleRate),
+        ptime: '20',
+        minptime: '10',
+        useinbandfec: '1',
+      };
+      const fmtpPrefix = `a=fmtp:${payloadType}`;
+      const fmtpIndex = lines.findIndex(line => line.startsWith(fmtpPrefix));
+      if (fmtpIndex === -1) {
+        const serialized = Object.entries(desiredParams).map(([key, value]) => `${key}=${value}`).join(';');
+        lines.splice(opusIndex + 1, 0, `${fmtpPrefix} ${serialized}`);
+      } else {
+        const existing = lines[fmtpIndex].slice(fmtpPrefix.length).trim().replace(/^\s+/, '');
+        const currentParams = {};
+        if (existing) {
+          existing.split(';').forEach(part => {
+            const segment = part.trim();
+            if (!segment) return;
+            const [key, value = '1'] = segment.split('=');
+            currentParams[key] = value;
+          });
+        }
+        Object.assign(currentParams, desiredParams);
+        const serialized = Object.entries(currentParams).map(([key, value]) => `${key}=${value}`).join(';');
+        lines[fmtpIndex] = `${fmtpPrefix} ${serialized}`;
+      }
+      return lines.join('\r\n');
     }
 
     registerBtn.addEventListener('click', startWebNode);
