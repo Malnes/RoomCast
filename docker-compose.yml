@@ -35,7 +35,10 @@ services:
       - config:/config
 
   snapserver:
-    image: saiyato/snapserver:latest
+    build:
+      context: ./snapserver
+      args:
+        SNAPCAST_VERSION: "0.31.0"
     network_mode: host
     command:
       - --stream.source

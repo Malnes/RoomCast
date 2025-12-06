@@ -113,6 +113,10 @@ RADIO_BROWSER_CACHE_TTL = int(os.getenv("RADIO_BROWSER_CACHE_TTL", "300"))
 RADIO_BROWSER_USER_AGENT = os.getenv("RADIO_BROWSER_USER_AGENT", "RoomCast/Radio").strip() or "RoomCast/Radio"
 RADIO_WORKER_TOKEN = os.getenv("RADIO_WORKER_TOKEN", "").strip()
 RADIO_WORKER_PATH_PREFIX = "/api/radio/worker"
+CHANNEL_IDLE_TIMEOUT = float(os.getenv("CHANNEL_IDLE_TIMEOUT", "600"))
+CHANNEL_IDLE_TIMEOUT = max(30.0, CHANNEL_IDLE_TIMEOUT)
+CHANNEL_IDLE_POLL_INTERVAL = float(os.getenv("CHANNEL_IDLE_POLL_INTERVAL", "15"))
+CHANNEL_IDLE_POLL_INTERVAL = max(1.0, min(CHANNEL_IDLE_POLL_INTERVAL, CHANNEL_IDLE_TIMEOUT))
 
 
 def _is_private_snap_host(value: str) -> bool:
@@ -1749,6 +1753,23 @@ def _match_snapclient_for_node(node: dict, clients: list[dict]) -> Optional[dict
     return fallback
 
 
+async def _snapcast_group_id_for_client(client_id: Optional[str]) -> Optional[str]:
+    if not client_id:
+        return None
+    try:
+        clients = await snapcast.list_clients()
+    except Exception as exc:  # pragma: no cover - network dependency
+        log.warning("WebRTC stream assignment: failed to list snapclients: %s", exc)
+        return None
+    for client in clients:
+        if (client.get("id") or "").strip() == client_id:
+            group_id = (client.get("_group_id") or "").strip()
+            if group_id:
+                return group_id
+            return None
+    return None
+
+
 def _register_node_internal(
     reg: NodeRegistration,
     *,
@@ -2209,6 +2230,11 @@ async def _startup_events() -> None:
     if spotify_refresh_task is None:
         spotify_refresh_task = asyncio.create_task(_spotify_refresh_loop())
     if channel_idle_task is None:
+        log.info(
+            "Channel idle monitor enabled (timeout=%.0fs, poll=%.1fs)",
+            CHANNEL_IDLE_TIMEOUT,
+            CHANNEL_IDLE_POLL_INTERVAL,
+        )
         channel_idle_task = asyncio.create_task(_channel_idle_loop())
 
 
@@ -2582,8 +2608,22 @@ async def _assign_webrtc_stream(client_id: str, stream_id: str) -> None:
         return
     try:
         await snapcast.set_client_stream(client_id, stream_id)
+        return
     except Exception as exc:  # pragma: no cover - network dependency
-        log.warning("Failed to assign web relay client %s to %s: %s", client_id, stream_id, exc)
+        if not _is_rpc_method_not_found_error(exc):
+            log.warning("Failed to assign web relay client %s to %s: %s", client_id, stream_id, exc)
+            raise
+        group_id = await _snapcast_group_id_for_client(client_id)
+        if not group_id:
+            raise RuntimeError(
+                f"Snapclient {client_id} is not registered with snapserver yet; cannot switch to {stream_id}"
+            )
+        try:
+            await snapcast.set_group_stream(group_id, stream_id)
+        except Exception as group_exc:  # pragma: no cover - network dependency
+            raise RuntimeError(
+                f"Failed to move snapclient group {group_id} (client {client_id}) to {stream_id}: {group_exc}"
+            )
 
 
 async def _ensure_snapclient_stream(node: dict, channel: dict) -> str:

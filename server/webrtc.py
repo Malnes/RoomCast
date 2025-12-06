@@ -14,6 +14,8 @@ from aiortc.mediastreams import MediaStreamTrack
 
 log = logging.getLogger("roomcast.webrtc")
 
+AudioChunk = Optional[bytes]
+
 BYTES_PER_SAMPLE = 2
 CHANNELS = 2
 SAMPLE_FORMAT = "16"
@@ -39,23 +41,23 @@ class AudioBroadcaster:
     """Fan-out PCM publisher so each WebRTC track gets the same PCM packets."""
 
     def __init__(self) -> None:
-        self._subscribers: set[asyncio.Queue[bytes]] = set()
+        self._subscribers: set[asyncio.Queue[AudioChunk]] = set()
         self._lock = asyncio.Lock()
 
-    async def subscribe(self) -> asyncio.Queue[bytes]:
-        queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=50)
+    async def subscribe(self) -> asyncio.Queue[AudioChunk]:
+        queue: asyncio.Queue[AudioChunk] = asyncio.Queue(maxsize=50)
         async with self._lock:
             self._subscribers.add(queue)
         return queue
 
-    async def unsubscribe(self, queue: asyncio.Queue[bytes]) -> None:
+    async def unsubscribe(self, queue: asyncio.Queue[AudioChunk]) -> None:
         async with self._lock:
             self._subscribers.discard(queue)
 
     async def publish(self, chunk: bytes) -> None:
         if not chunk:
             return
-        dead: list[asyncio.Queue[bytes]] = []
+        dead: list[asyncio.Queue[AudioChunk]] = []
         for queue in list(self._subscribers):
             try:
                 queue.put_nowait(chunk)
@@ -104,6 +106,7 @@ class SnapclientPump:
         self._buffer = bytearray()
         self._frame_bytes = _frame_bytes(self.sample_rate)
         self._assign_task: Optional[asyncio.Task[None]] = None
+        self._got_audio = False
 
     async def start(self) -> None:
         if self._task and not self._task.done():
@@ -174,6 +177,7 @@ class SnapclientPump:
         )
         asyncio.create_task(self._log_stderr(self._proc.stderr))
         self._buffer.clear()
+        self._got_audio = False
         self._schedule_stream_assignment()
 
     async def update_stream(self, stream_id: str) -> None:
@@ -182,6 +186,7 @@ class SnapclientPump:
             return
         self.stream_id = stream_id
         self._schedule_stream_assignment()
+        await self._restart_proc()
 
     def _schedule_stream_assignment(self) -> None:
         if not self._assign_stream_cb or not self.client_id or not self.stream_id:
@@ -225,6 +230,9 @@ class SnapclientPump:
             payload = bytes(self._buffer[:self._frame_bytes])
             del self._buffer[:self._frame_bytes]
             await self.broadcaster.publish(payload)
+            if not self._got_audio:
+                self._got_audio = True
+                log.info("snapclient[%s]: first PCM chunk published", self.client_id or "unknown")
 
     async def _cleanup_proc(self) -> None:
         if self._proc:
@@ -240,7 +248,18 @@ class SnapclientPump:
             line = await stream.readline()
             if not line:
                 break
-            log.warning("snapclient: %s", line.decode(errors="ignore").strip())
+            prefix = f"snapclient[{self.client_id}]" if self.client_id else "snapclient"
+            log.warning("%s: %s", prefix, line.decode(errors="ignore").strip())
+
+    async def _restart_proc(self) -> None:
+        if not self._proc or self._proc.returncode is not None:
+            return
+        self._proc.terminate()
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            self._proc.kill()
+            await self._proc.wait()
 
 
 class WebAudioTrack(MediaStreamTrack):
@@ -249,13 +268,13 @@ class WebAudioTrack(MediaStreamTrack):
     def __init__(self, relay: "WebAudioRelay", sample_rate: int, channel_id: str, pan: float = 0.0) -> None:
         super().__init__()
         self._relay = relay
-        self._queue: Optional[asyncio.Queue[bytes]] = None
+        self._queue: Optional[asyncio.Queue[AudioChunk]] = None
         self._samples_sent = 0
         self._pan = float(pan)
         self._sample_rate = max(8000, min(192000, int(sample_rate)))
         self._channel_id = channel_id
 
-    async def _ensure_queue(self) -> asyncio.Queue[bytes]:
+    async def _ensure_queue(self) -> asyncio.Queue[AudioChunk]:
         if not self._queue:
             self._queue = await self._relay._subscribe_channel(self._channel_id)
         return self._queue
@@ -266,23 +285,26 @@ class WebAudioTrack(MediaStreamTrack):
     async def set_channel(self, channel_id: str) -> None:
         if channel_id == self._channel_id:
             return
-        if self._queue:
-            await self._relay._unsubscribe_channel(self._channel_id, self._queue)
-            self._queue = None
+        await self._release_queue()
         self._channel_id = channel_id
 
     async def recv(self) -> av.AudioFrame:
-        queue = await self._ensure_queue()
-        chunk = await queue.get()
-        chunk = self._apply_pan(chunk)
-        samples = len(chunk) // SAMPLE_WIDTH
-        frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
-        frame.planes[0].update(chunk)
-        frame.sample_rate = self._sample_rate
-        frame.time_base = Fraction(1, self._sample_rate)
-        frame.pts = self._samples_sent
-        self._samples_sent += samples
-        return frame
+        while True:
+            queue = await self._ensure_queue()
+            chunk = await queue.get()
+            if chunk is None:
+                # Channel switched; resubscribe to the new source.
+                self._queue = None
+                continue
+            chunk = self._apply_pan(chunk)
+            samples = len(chunk) // SAMPLE_WIDTH
+            frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
+            frame.planes[0].update(chunk)
+            frame.sample_rate = self._sample_rate
+            frame.time_base = Fraction(1, self._sample_rate)
+            frame.pts = self._samples_sent
+            self._samples_sent += samples
+            return frame
 
     def _apply_pan(self, chunk: bytes) -> bytes:
         if abs(self._pan) < 1e-3:
@@ -302,12 +324,32 @@ class WebAudioTrack(MediaStreamTrack):
         return data.tobytes()
 
     async def shutdown(self) -> None:
-        if self._queue:
-            await self._relay._unsubscribe_channel(self._channel_id, self._queue)
-            self._queue = None
+        await self._release_queue()
 
     def stop(self) -> None:
         super().stop()
+
+    async def _release_queue(self) -> None:
+        if not self._queue:
+            return
+        queue = self._queue
+        await self._relay._unsubscribe_channel(self._channel_id, queue)
+        self._queue = None
+        await self._drain_and_signal(queue)
+
+    @staticmethod
+    async def _drain_and_signal(queue: asyncio.Queue[AudioChunk]) -> None:
+        while True:
+            try:
+                queue.put_nowait(None)
+                return
+            except asyncio.QueueFull:
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0)
+                else:
+                    continue
 
 
 @dataclass
@@ -580,7 +622,7 @@ class WebAudioRelay:
         async with self._lock:
             return self._channel_sources[channel_id]
 
-    async def _subscribe_channel(self, channel_id: str) -> asyncio.Queue[bytes]:
+    async def _subscribe_channel(self, channel_id: str) -> asyncio.Queue[AudioChunk]:
         async with self._lock:
             source = self._channel_sources.get(channel_id)
             if not source:
@@ -591,7 +633,7 @@ class WebAudioRelay:
             stop_task.cancel()
         return await source.broadcaster.subscribe()
 
-    async def _unsubscribe_channel(self, channel_id: str, queue: asyncio.Queue[bytes]) -> None:
+    async def _unsubscribe_channel(self, channel_id: str, queue: asyncio.Queue[AudioChunk]) -> None:
         async with self._lock:
             source = self._channel_sources.get(channel_id)
             if not source:
