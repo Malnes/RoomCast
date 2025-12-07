@@ -3183,6 +3183,19 @@ def _channel_should_monitor(channel: dict) -> bool:
     return True
 
 
+def _channel_has_active_hardware_listeners(channel_id: str) -> bool:
+    if not channel_id:
+        return False
+    for node in nodes.values():
+        if node.get("type") == "browser":
+            continue
+        if node.get("channel_id") != channel_id:
+            continue
+        if node.get("online"):
+            return True
+    return False
+
+
 async def _stop_channel_due_to_idle(channel: dict) -> bool:
     cid = channel.get("id") or ""
     if not cid:
@@ -3246,6 +3259,8 @@ async def _evaluate_channel_idle() -> None:
             continue
         tracked.add(cid)
         listeners = counts.get(cid, 0)
+        if listeners <= 0 and _channel_has_active_hardware_listeners(cid):
+            listeners = 1
         state = channel_idle_state.setdefault(cid, {"idle_since": None, "stopped": False})
         if listeners > 0:
             state["idle_since"] = None
