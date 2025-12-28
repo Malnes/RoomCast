@@ -7,6 +7,8 @@ import secrets
 import shlex
 import shutil
 import subprocess
+import time
+import hashlib
 from pathlib import Path
 from typing import Callable, List, Optional
 
@@ -51,6 +53,10 @@ AGENT_CONFIG_PATH = Path(os.getenv("AGENT_CONFIG_PATH", "/var/lib/roomcast/agent
 NODE_UID_PATH = Path(os.getenv("NODE_UID_PATH", "/var/lib/roomcast/node-uid"))
 SNAPCLIENT_BIN = os.getenv("SNAPCLIENT_BIN", "snapclient")
 SNAPCLIENT_DEFAULT_PORT = int(os.getenv("SNAPCLIENT_PORT", "1704"))
+RECOVERY_CODE_SECONDS = int(os.getenv("RECOVERY_CODE_SECONDS", "600"))
+RECOVERY_LED_ENABLED = os.getenv("RECOVERY_LED_ENABLED", "1").lower() not in {"0", "false", "no"}
+RECOVERY_LED_PATH = os.getenv("RECOVERY_LED_PATH", "").strip() or None
+RECOVERY_CODE_PATH = Path(os.getenv("RECOVERY_CODE_PATH", "/var/lib/roomcast/recovery-code.json"))
 UPDATE_COMMAND = os.getenv("ROOMCAST_UPDATE_COMMAND", "sudo /usr/local/bin/roomcast-updater")
 UPDATE_COMMAND_ARGS = shlex.split(UPDATE_COMMAND) if UPDATE_COMMAND else []
 RESTART_COMMAND = os.getenv("ROOMCAST_RESTART_COMMAND", "sudo /sbin/reboot")
@@ -69,6 +75,9 @@ agent_secret: str | None = None
 agent_config: dict = {}
 snapclient_process: Optional[asyncio.subprocess.Process] = None
 snapclient_lock = asyncio.Lock()
+
+recovery_state: dict = {}
+recovery_task: asyncio.Task | None = None
 
 
 def _read_text_safely(path: Path) -> str:
@@ -144,6 +153,147 @@ def _persist_agent_secret(value: str) -> None:
 
 
 agent_secret = _load_agent_secret()
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _load_recovery_state() -> dict:
+    try:
+        raw = RECOVERY_CODE_PATH.read_text()
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except Exception:
+        return {}
+
+
+def _persist_recovery_state(data: dict) -> None:
+    try:
+        RECOVERY_CODE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        RECOVERY_CODE_PATH.write_text(json.dumps(data))
+        try:
+            os.chmod(RECOVERY_CODE_PATH, 0o600)
+        except OSError:
+            pass
+    except Exception as exc:  # pragma: no cover
+        log.warning("Failed to persist recovery state: %s", exc)
+
+
+def _recovery_active(now: float | None = None) -> bool:
+    state = recovery_state or {}
+    expires_at = state.get("expires_at")
+    if expires_at is None:
+        return False
+    try:
+        return float(expires_at) > (now if now is not None else time.time())
+    except (TypeError, ValueError):
+        return False
+
+
+def _verify_recovery_code(code: str) -> bool:
+    if not code:
+        return False
+    if not _recovery_active():
+        return False
+    expected = (recovery_state or {}).get("code_sha256")
+    if not isinstance(expected, str) or not expected:
+        return False
+    normalized = re.sub(r"\s+", "", str(code))
+    return _sha256_hex(normalized) == expected
+
+
+def _pick_led_path() -> Optional[Path]:
+    if RECOVERY_LED_PATH:
+        p = Path(RECOVERY_LED_PATH)
+        if (p / "brightness").exists():
+            return p
+        return None
+    leds_root = Path("/sys/class/leds")
+    if not leds_root.exists():
+        return None
+    try:
+        entries = [p for p in leds_root.iterdir() if p.is_dir() and (p / "brightness").exists()]
+    except Exception:
+        return None
+    if not entries:
+        return None
+    preferred = ["led0", "act", "ACT", "status", "Status", "usr", "user"]
+    for name in preferred:
+        for p in entries:
+            if p.name == name or name.lower() in p.name.lower():
+                return p
+    return entries[0]
+
+
+def _led_write(path: Path, filename: str, value: str) -> None:
+    try:
+        (path / filename).write_text(value)
+    except Exception as exc:  # pragma: no cover - permissions/hardware
+        raise RuntimeError(str(exc)) from exc
+
+
+async def _flash_recovery_code(code: str, *, seconds: int) -> None:
+    led_path = _pick_led_path()
+    if not led_path:
+        log.info("Recovery LED not available; skipping LED flash")
+        return
+    trigger_file = led_path / "trigger"
+    previous_trigger = None
+    if trigger_file.exists():
+        try:
+            previous_trigger = trigger_file.read_text()
+        except Exception:
+            previous_trigger = None
+        try:
+            _led_write(led_path, "trigger", "none")
+        except Exception as exc:  # pragma: no cover
+            log.info("Unable to disable LED trigger at %s: %s", led_path, exc)
+    start = time.time()
+    code_digits = [c for c in re.sub(r"\s+", "", code) if c.isdigit()]
+    if len(code_digits) != 6:
+        log.warning("Invalid recovery code format for LED flash")
+        return
+
+    on_s = 0.12
+    off_s = 0.10
+    digit_gap_s = 0.35
+    cycle_gap_s = 1.2
+
+    try:
+        while time.time() - start < max(1, seconds):
+            for ch in code_digits:
+                count = int(ch)
+                if count == 0:
+                    count = 10
+                for _ in range(count):
+                    try:
+                        _led_write(led_path, "brightness", "1")
+                    except Exception as exc:  # pragma: no cover
+                        log.info("Unable to write LED brightness at %s: %s", led_path, exc)
+                        return
+                    await asyncio.sleep(on_s)
+                    try:
+                        _led_write(led_path, "brightness", "0")
+                    except Exception:
+                        return
+                    await asyncio.sleep(off_s)
+                await asyncio.sleep(digit_gap_s)
+            await asyncio.sleep(cycle_gap_s)
+    finally:
+        try:
+            _led_write(led_path, "brightness", "0")
+        except Exception:
+            pass
+        if previous_trigger is not None and trigger_file.exists():
+            try:
+                # Restore whatever trigger string was present.
+                # If kernel rejects it, ignore.
+                _led_write(led_path, "trigger", previous_trigger)
+            except Exception:
+                pass
 def _load_node_uid() -> str:
     try:
         raw = NODE_UID_PATH.read_text().strip()
@@ -574,6 +724,7 @@ class EqPayload(BaseModel):
 
 class PairPayload(BaseModel):
     force: bool = False
+    recovery_code: str | None = None
 
 
 class SnapclientConfigPayload(BaseModel):
@@ -906,11 +1057,24 @@ async def pair_status() -> dict:
 
 
 @app.post("/pair")
-async def pair(payload: PairPayload | None = None) -> dict:
+async def pair(request: Request, payload: PairPayload | None = None) -> dict:
     global agent_secret
     force = bool(payload.force) if payload else False
     if agent_secret and not force:
         raise HTTPException(status_code=409, detail="Already paired")
+
+    if agent_secret and force:
+        # Allow rotation only if caller proves knowledge of the existing secret,
+        # or if the user physically confirms takeover via a short-lived recovery code.
+        provided_secret = request.headers.get("x-agent-secret") if request else None
+        if provided_secret != agent_secret:
+            provided_code = payload.recovery_code if payload else None
+            if not (isinstance(provided_code, str) and _verify_recovery_code(provided_code)):
+                raise HTTPException(
+                    status_code=423,
+                    detail="Node is paired to another controller. Provide the 6-digit recovery code to take over.",
+                )
+
     agent_secret = secrets.token_urlsafe(32)
     _persist_agent_secret(agent_secret)
     return {"secret": agent_secret}
@@ -1029,12 +1193,59 @@ async def trigger_restart(request: Request) -> dict:
 
 @app.on_event("startup")
 async def on_startup() -> None:
+    global recovery_state, recovery_task
+    recovery_state = _load_recovery_state()
+    now = time.time()
+    if _recovery_active(now) and isinstance(recovery_state.get("code"), str):
+        remaining = int(max(1, float(recovery_state["expires_at"]) - now))
+        if RECOVERY_LED_ENABLED and recovery_task is None:
+            recovery_task = asyncio.create_task(_flash_recovery_code(str(recovery_state["code"]), seconds=remaining))
+    else:
+        # Start a short-lived takeover window if we're already paired but the configured snapserver
+        # is unreachable at boot. This helps reclaim nodes when the old controller is gone.
+        host = (agent_config.get("snapserver_host") or "").strip()
+        port = int(agent_config.get("snapserver_port") or SNAPCLIENT_DEFAULT_PORT)
+        if agent_secret and host:
+            reachable = False
+            try:
+                reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=1.5)
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+                reachable = True
+            except Exception:
+                reachable = False
+
+            if not reachable:
+                code = f"{secrets.randbelow(1_000_000):06d}"
+                recovery_state = {
+                    "code": code,
+                    "code_sha256": _sha256_hex(code),
+                    "created_at": now,
+                    "expires_at": now + max(30, RECOVERY_CODE_SECONDS),
+                    "reason": "snapserver_unreachable_at_boot",
+                }
+                _persist_recovery_state(recovery_state)
+                log.warning(
+                    "Snapserver %s:%s unreachable at boot; takeover recovery code active for %ss",
+                    host,
+                    port,
+                    RECOVERY_CODE_SECONDS,
+                )
+                if RECOVERY_LED_ENABLED and recovery_task is None:
+                    recovery_task = asyncio.create_task(_flash_recovery_code(code, seconds=RECOVERY_CODE_SECONDS))
+
     await _ensure_camilla_config_current()
     await _reconcile_snapclient()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
+    global recovery_task
+    if recovery_task and not recovery_task.done():
+        recovery_task.cancel()
     await _stop_snapclient()
 
 

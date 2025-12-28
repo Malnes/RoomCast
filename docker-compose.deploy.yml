@@ -9,29 +9,53 @@ services:
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
       SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:8000/api/spotify/callback}
+      RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
     depends_on:
       - snapserver
-      - librespot
+      - librespot_ch1
     volumes:
       - config:/config
 
+  server_node_agent:
+    image: ${ROOMCAST_CONTROLLER_IMAGE:-ghcr.io/malnes/roomcast-controller:latest}
+    profiles: ["node"]
+    network_mode: host
+    working_dir: /opt/node-agent
+    command: ["uvicorn", "agent:app", "--host", "0.0.0.0", "--port", "9700"]
+    environment:
+      CAMILLA_ENABLED: ${CAMILLA_ENABLED:-0}
+      MIXER_CONTROL: ${MIXER_CONTROL:-Master}
+      PLAYBACK_DEVICE: ${PLAYBACK_DEVICE:-plughw:0,0}
+      AGENT_SECRET_PATH: /var/lib/roomcast/agent-secret
+      AGENT_CONFIG_PATH: /var/lib/roomcast/agent-config.json
+      NODE_UID_PATH: /var/lib/roomcast/node-uid
+      SNAPCLIENT_BIN: ${SNAPCLIENT_BIN:-snapclient}
+    devices:
+      - /dev/snd:/dev/snd
+    group_add:
+      - audio
+    volumes:
+      - node_state:/var/lib/roomcast
+
   snapserver:
-    image: saiyato/snapserver:latest
+    image: ${ROOMCAST_SNAPSERVER_IMAGE:-ghcr.io/malnes/roomcast-snapserver:latest}
     network_mode: host
     command:
       - --stream.source
-      - pipe:///tmp/snapfifo?name=Spotify
-      - --stream.sampleformat
-      - 44100:16:2
-      - --stream.codec
-      - pcm
+      - pipe:///tmp/snapfifo-ch1?name=Spotify_CH1&sampleformat=44100:16:2&codec=pcm
+      - --stream.source
+      - pipe:///tmp/snapfifo-ch2?name=Spotify_CH2&sampleformat=44100:16:2&codec=pcm
+      - --stream.source
+      - pipe:///tmp/snapfifo-radio1?name=Radio_CH1&sampleformat=48000:16:2&codec=pcm
+      - --stream.source
+      - pipe:///tmp/snapfifo-radio2?name=Radio_CH2&sampleformat=48000:16:2&codec=pcm
       - --http-cors
       - '*'
     volumes:
       - snapfifo:/tmp
-      - ./snapserver.json:/root/.config/snapserver/server.json
+      - snapserver_config:/root/.config/snapserver
 
-  librespot:
+  librespot_ch1:
     image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
     network_mode: host
     depends_on:
@@ -40,8 +64,42 @@ services:
       - snapfifo:/tmp
       - config:/config
     environment:
+      CONFIG_PATH: /config/spotify.json
+      SPOTIFY_TOKEN_PATH: /config/spotify-token.json
+      STATUS_PATH: /config/librespot-status.json
+      FIFO_PATH: /tmp/snapfifo-ch1
       LIBRESPOT_FALLBACK_NAME: ${LIBRESPOT_NAME:-RoomCast}
+
+  librespot_ch2:
+    image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
+    network_mode: host
+    depends_on:
+      - snapserver
+    volumes:
+      - snapfifo:/tmp
+      - config:/config
+    environment:
+      CONFIG_PATH: /config/spotify-ch2.json
+      SPOTIFY_TOKEN_PATH: /config/spotify-token-ch2.json
+      STATUS_PATH: /config/librespot-status-ch2.json
+      FIFO_PATH: /tmp/snapfifo-ch2
+      LIBRESPOT_FALLBACK_NAME: ${LIBRESPOT_NAME_CH2:-RoomCast CH2}
+
+  radio_worker:
+    image: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
+    network_mode: host
+    depends_on:
+      - controller
+      - snapserver
+    environment:
+      CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://127.0.0.1:8000}
+      RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
+      RADIO_ASSIGNMENT_INTERVAL: ${RADIO_ASSIGNMENT_INTERVAL:-10}
+    volumes:
+      - snapfifo:/tmp
 
 volumes:
   snapfifo:
   config:
+  snapserver_config:
+  node_state:

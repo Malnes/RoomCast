@@ -48,8 +48,27 @@ The script installs `snapclient`, pulls this repo into `/opt/roomcast`, sets up 
 Pairing workflow
 ----------------
 - When you register the node from the RoomCast dashboard (via **Discover nodes** or manual entry), the controller automatically calls the agent's `/pair` endpoint to mint a per-controller secret stored in `/var/lib/roomcast/agent-secret`.  
-- Moving a node between controllers? Either click **Pair node** on the server UI or run `curl -X POST http://<node-ip>:9700/pair -H 'Content-Type: application/json' -d '{"force": true}'` before registering it with the new controller.  
+- Moving a node between controllers?
+   - If you still have the old controller, click **Pair node** on the server UI. The controller proves knowledge of the existing node secret and rotates it safely.
+   - If the old controller is gone and the node is already paired, use the **recovery code** flow below.
 - You can rotate the key at any time; the controller will push the new secret to the agent and update its own record automatically.
+
+Recovery code (takeover without reinstall)
+----------------------------------------
+
+If a node is already paired to a controller that is no longer reachable, the agent can open a short takeover window on boot:
+
+- Condition: node is paired **and** it has a configured snapserver host, but that snapserver is unreachable at boot.
+- Behavior: for ~10 minutes (configurable), the node will blink a 6-digit recovery code on its status LED (best-effort; hardware/permissions vary).
+
+On the new RoomCast server:
+- Discover/register the node as usual.
+- Click **Pair node**. If takeover is required, the UI will prompt for the 6-digit code.
+
+Notes:
+- Digit encoding: each digit blinks that many times; `0` is encoded as 10 blinks.
+- LED control relies on `/sys/class/leds` and may require permissions depending on distro/kernel.
+- You can override LED selection with `RECOVERY_LED_PATH=/sys/class/leds/<name>` or disable it with `RECOVERY_LED_ENABLED=0`.
 
 ### Updating nodes
 - Each agent exposes its version via `/health`, and the controller UI displays that version next to the node entry.  

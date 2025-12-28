@@ -15,7 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        component: [controller, librespot]
+        component: [controller, librespot, snapserver, radio-worker]
         include:
           - component: controller
             context: .
@@ -25,6 +25,14 @@ jobs:
             context: ./librespot
             dockerfile: ./librespot/Dockerfile
             image: roomcast-librespot
+          - component: snapserver
+            context: ./snapserver
+            dockerfile: ./snapserver/Dockerfile
+            image: roomcast-snapserver
+          - component: radio-worker
+            context: ./radio-worker
+            dockerfile: ./radio-worker/Dockerfile
+            image: roomcast-radio-worker
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4

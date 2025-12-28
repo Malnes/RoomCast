@@ -1,0 +1,15 @@
+[Unit]
+Description=RoomCast Node First-Boot Installer
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/roomcast/firstboot.done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/roomcast-firstboot.sh
+TimeoutStartSec=0
+StandardOutput=append:/var/log/roomcast-firstboot.log
+StandardError=append:/var/log/roomcast-firstboot.log
+
+[Install]
+WantedBy=multi-user.target

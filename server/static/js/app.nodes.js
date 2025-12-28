@@ -268,12 +268,30 @@ async function toggleMute(nodeId, btn) {
 async function pairNode(nodeId, btn) {
   if (btn) btn.disabled = true;
   try {
-    const res = await fetch(`/api/nodes/${nodeId}/pair`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ force: true }),
-    });
-    await ensureOk(res);
+    const attemptPair = async (recoveryCode) => {
+      const payload = { force: true };
+      if (recoveryCode) payload.recovery_code = recoveryCode;
+      const res = await fetch(`/api/nodes/${nodeId}/pair`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      await ensureOk(res);
+    };
+
+    try {
+      await attemptPair(null);
+    } catch (err) {
+      const msg = (err && err.message ? String(err.message) : '').toLowerCase();
+      if (msg.includes('recovery')) {
+        const code = prompt('Enter the 6-digit node recovery code (blinking LED)', '');
+        if (!code) throw err;
+        await attemptPair(code.trim());
+      } else {
+        throw err;
+      }
+    }
+
     showSuccess('Node paired');
     await fetchNodes();
   } catch (err) {

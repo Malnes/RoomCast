@@ -26,6 +26,47 @@ Follow these steps on a fresh Raspberry Pi OS **Lite** (or any Debian-based) ins
 
 That’s it. No manual package installs, unit edits, or extra steps per Pi. Re-run the installer later to pull updates.
 
+## Recovering a node when the old controller is gone
+
+If a node is still paired to a controller that no longer exists, you do **not** need to reinstall from scratch.
+
+- On boot, if the node is paired and its configured snapserver host is unreachable, it will blink a 6-digit recovery code for ~10 minutes.
+- In the new RoomCast UI, click **Pair node** and enter the recovery code when prompted.
+
+If you don't have a controllable LED on that board (or permissions prevent access), you can still recover by temporarily re-enabling SSH and using the pairing endpoint manually.
+
+## First-boot install (no SSH)
+
+If you want to provision nodes without SSHing into each Pi, you can inject a one-time systemd unit into the SD card **before** first boot.
+On first boot, the Pi will download and run the installer, then disable itself.
+
+Prereq: you still need to preconfigure Wi‑Fi/Ethernet and (optionally) SSH credentials using Raspberry Pi Imager.
+
+### On a Linux workstation
+
+1) Flash Raspberry Pi OS Lite as usual.
+2) Insert the SD card and mount the root partition (usually partition 2):
+
+```bash
+sudo mount /dev/sdX2 /mnt/pi-root
+```
+
+3) From a clone of this repo, run:
+
+```bash
+cd node-agent/firstboot
+sudo ./prepare-sd-linux.sh --root /mnt/pi-root --ref main --user pi
+sudo umount /mnt/pi-root
+```
+
+4) Boot the Pi.
+
+Progress/diagnostics on the Pi:
+- Logs: `/var/log/roomcast-firstboot.log`
+- Marker file after success: `/var/lib/roomcast/firstboot.done`
+
+After the first boot finishes, register the node in the RoomCast dashboard as usual.
+
    ## Audio mixer control notes
 
    Most Pi images expose a `Master` simple mixer control, but some HDMI or USB DACs only provide controls like `PCM`, `Digital`, or `Speaker`. The agent now auto-detects the first available control when `Master` is missing so mute/volume actions keep working out of the box. If you want to force a specific control, set the `MIXER_CONTROL` environment variable in the `roomcast-agent` systemd unit (for example run `sudo systemctl edit roomcast-agent`, add `Environment=MIXER_CONTROL=PCM`, then `sudo systemctl restart roomcast-agent`).

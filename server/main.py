@@ -2051,13 +2051,20 @@ async def _fetch_agent_fingerprint(url: str) -> Optional[str]:
     return None
 
 
-async def request_agent_secret(node: dict, force: bool = False) -> str:
+async def request_agent_secret(node: dict, force: bool = False, *, recovery_code: str | None = None) -> str:
     if node.get("type") != "agent":
         raise HTTPException(status_code=400, detail="Pairing only applies to hardware nodes")
     url = f"{node['url'].rstrip('/')}/pair"
-    payload = {"force": bool(force)}
+    payload: dict = {"force": bool(force)}
+    if isinstance(recovery_code, str) and recovery_code.strip():
+        payload["recovery_code"] = recovery_code.strip()
+    headers = {}
+    # If we already have a secret (same controller), prove it so the agent allows rotation.
+    secret = node.get("agent_secret")
+    if isinstance(secret, str) and secret:
+        headers["X-Agent-Secret"] = secret
     async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.post(url, json=payload)
+        resp = await client.post(url, json=payload, headers=headers)
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text or "Failed to pair node")
     try:
@@ -2726,6 +2733,18 @@ async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool
             node["agent_secret"] = secret
             await configure_agent_audio(node)
             await _sync_node_max_volume(node)
+        except HTTPException as exc:
+            # If the node is already paired to another controller, keep it registered so the
+            # user can complete takeover pairing by entering the recovery code.
+            if exc.status_code in {423, 403} and "recovery" in str(exc.detail).lower():
+                node["agent_secret"] = None
+                node["audio_configured"] = False
+                save_nodes()
+                await broadcast_nodes()
+                return public_node(node)
+            nodes.pop(node["id"], None)
+            save_nodes()
+            raise
         except Exception:
             nodes.pop(node["id"], None)
             save_nodes()
@@ -2978,7 +2997,8 @@ async def pair_node(node_id: str, payload: dict | None = Body(default=None)) -> 
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes do not support pairing")
     force = True if payload is None else bool(payload.get("force", False))
-    secret = await request_agent_secret(node, force=force)
+    recovery_code = None if payload is None else payload.get("recovery_code")
+    secret = await request_agent_secret(node, force=force, recovery_code=recovery_code)
     node["agent_secret"] = secret
     await configure_agent_audio(node)
     save_nodes()
