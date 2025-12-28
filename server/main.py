@@ -13,6 +13,7 @@ import uuid
 from pathlib import Path
 from urllib.parse import urlencode, urlparse, parse_qs
 from typing import Dict, Optional, AsyncIterator, List, Callable, Any, Tuple, Literal
+from xml.etree import ElementTree
 
 import httpx
 import asyncssh
@@ -173,6 +174,29 @@ def _resolve_snapserver_agent_host() -> str:
 
 
 SNAPSERVER_AGENT_HOST = _resolve_snapserver_agent_host()
+
+
+def _resolve_public_controller_host() -> str:
+    override = os.getenv("ROOMCAST_PUBLIC_HOST", "").strip()
+    if override:
+        return override
+    detected = _detect_primary_ipv4_host()
+    if detected:
+        return detected
+    return "127.0.0.1"
+
+
+ROOMCAST_PUBLIC_HOST = _resolve_public_controller_host()
+ROOMCAST_PUBLIC_PORT = int(os.getenv("ROOMCAST_PUBLIC_PORT", "8000"))
+
+SONOS_HTTP_USER_AGENT = os.getenv("SONOS_HTTP_USER_AGENT", "RoomCast/Sonos").strip() or "RoomCast/Sonos"
+SONOS_DISCOVERY_TIMEOUT = float(os.getenv("SONOS_DISCOVERY_TIMEOUT", "2.0"))
+SONOS_CONTROL_TIMEOUT = float(os.getenv("SONOS_CONTROL_TIMEOUT", "4.0"))
+SONOS_STREAM_BITRATE_KBPS = int(os.getenv("SONOS_STREAM_BITRATE_KBPS", "192"))
+
+SONOS_DEVICE_TYPE = "urn:schemas-upnp-org:device:ZonePlayer:1"
+SONOS_SSDP_ADDR = ("239.255.255.250", 1900)
+
 
 channels_by_id: Dict[str, dict] = {}
 channel_order: list[str] = []
@@ -1035,6 +1059,10 @@ PUBLIC_API_PATHS = {
     "/api/spotify/callback",
 }
 
+PUBLIC_API_PREFIXES = (
+    "/api/sonos/stream/",
+)
+
 
 @app.middleware("http")
 async def session_middleware(request: Request, call_next):
@@ -1042,7 +1070,8 @@ async def session_middleware(request: Request, call_next):
     token = request.cookies.get(SESSION_COOKIE_NAME)
     request.state.user = _resolve_session_user(token)
     is_worker_endpoint = path.startswith(RADIO_WORKER_PATH_PREFIX)
-    requires_auth = path.startswith("/api/") and (not is_worker_endpoint) and path not in PUBLIC_API_PATHS
+    is_public_path = path in PUBLIC_API_PATHS or path.startswith(PUBLIC_API_PREFIXES)
+    requires_auth = path.startswith("/api/") and (not is_worker_endpoint) and (not is_public_path)
     if requires_auth:
         initialized = _is_initialized()
         if not initialized and path != "/api/auth/initialize":
@@ -1244,7 +1273,7 @@ def resolve_node_channel_id(node: dict, *, assign_default: bool = False) -> Opti
 def public_node(node: dict) -> dict:
     data = {k: v for k, v in node.items() if k not in SENSITIVE_NODE_FIELDS}
     data["paired"] = bool(node.get("agent_secret"))
-    if node.get("type") == "browser":
+    if node.get("type") in {"browser", "sonos"}:
         data["configured"] = True
     else:
         data["configured"] = bool(node.get("audio_configured"))
@@ -1256,7 +1285,7 @@ def public_node(node: dict) -> dict:
     data["online"] = node.get("online", node.get("type") == "browser")
     data["last_seen"] = node.get("last_seen")
     data["offline_since"] = node.get("offline_since")
-    if node.get("type") == "browser":
+    if node.get("type") in {"browser", "sonos"}:
         data["update_available"] = False
     elif AGENT_LATEST_VERSION:
         data["update_available"] = (node.get("agent_version") or "") != AGENT_LATEST_VERSION
@@ -1840,9 +1869,262 @@ def _normalize_node_url(raw: str) -> str:
         return value
     if value.startswith("browser:"):
         return value.rstrip("/")
+    if value.startswith("sonos://"):
+        return value.rstrip("/")
     if "://" not in value:
         value = f"http://{value}"
     return value.rstrip("/")
+
+
+def _sonos_ip_from_url(url: Optional[str]) -> Optional[str]:
+    if not url:
+        return None
+    if url.startswith("sonos://"):
+        return url[len("sonos://"):].strip("/") or None
+    return None
+
+
+def _sonos_stream_url(channel_id: str) -> str:
+    return f"http://{ROOMCAST_PUBLIC_HOST}:{ROOMCAST_PUBLIC_PORT}/api/sonos/stream/{channel_id}"
+
+
+def _sonos_extract_rincon(udn: str | None) -> Optional[str]:
+    if not udn:
+        return None
+    raw = udn.strip()
+    if raw.lower().startswith("uuid:"):
+        raw = raw[5:]
+    return raw if raw.startswith("RINCON_") else None
+
+
+async def _sonos_fetch_description(ip: str) -> Optional[dict]:
+    url = f"http://{ip}:1400/xml/device_description.xml"
+    headers = {"User-Agent": SONOS_HTTP_USER_AGENT}
+    try:
+        async with httpx.AsyncClient(timeout=SONOS_CONTROL_TIMEOUT) as client:
+            resp = await client.get(url, headers=headers)
+        if resp.status_code != 200:
+            return None
+        root = ElementTree.fromstring(resp.text)
+    except Exception:
+        return None
+
+    def _find_text(path: str) -> Optional[str]:
+        el = root.find(path)
+        if el is None or el.text is None:
+            return None
+        value = el.text.strip()
+        return value or None
+
+    # UPnP device description uses namespaces sometimes; handle both.
+    friendly = _find_text(".//friendlyName") or _find_text(".//{*}friendlyName")
+    udn = _find_text(".//UDN") or _find_text(".//{*}UDN")
+    dtype = _find_text(".//deviceType") or _find_text(".//{*}deviceType")
+    if dtype and dtype.strip() != SONOS_DEVICE_TYPE:
+        return None
+    rincon = _sonos_extract_rincon(udn)
+    return {
+        "friendly_name": friendly,
+        "udn": udn,
+        "rincon": rincon,
+        "device_type": dtype,
+        "description_url": url,
+    }
+
+
+async def _sonos_soap_action(
+    ip: str,
+    *,
+    service: str,
+    action: str,
+    control_path: str,
+    arguments: dict[str, str],
+) -> None:
+    target = f"http://{ip}:1400{control_path}"
+    ns = f"urn:schemas-upnp-org:service:{service}:1"
+    body_parts = [f"<{k}>{v}</{k}>" for k, v in arguments.items()]
+    envelope = (
+        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
+        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
+        "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
+        "<s:Body>"
+        f"<u:{action} xmlns:u=\"{ns}\">"
+        + "".join(body_parts)
+        + f"</u:{action}>"
+        "</s:Body>"
+        "</s:Envelope>"
+    )
+    headers = {
+        "Content-Type": "text/xml; charset=\"utf-8\"",
+        "SOAPACTION": f'\"{ns}#{action}\"',
+        "User-Agent": SONOS_HTTP_USER_AGENT,
+    }
+    async with httpx.AsyncClient(timeout=SONOS_CONTROL_TIMEOUT) as client:
+        resp = await client.post(target, content=envelope.encode("utf-8"), headers=headers)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail=f"Sonos SOAP {service}.{action} failed: {resp.text}")
+
+
+async def _sonos_set_volume(ip: str, percent: int) -> None:
+    await _sonos_soap_action(
+        ip,
+        service="RenderingControl",
+        action="SetVolume",
+        control_path="/MediaRenderer/RenderingControl/Control",
+        arguments={
+            "InstanceID": "0",
+            "Channel": "Master",
+            "DesiredVolume": str(max(0, min(100, int(percent)))),
+        },
+    )
+
+
+async def _sonos_set_mute(ip: str, muted: bool) -> None:
+    await _sonos_soap_action(
+        ip,
+        service="RenderingControl",
+        action="SetMute",
+        control_path="/MediaRenderer/RenderingControl/Control",
+        arguments={
+            "InstanceID": "0",
+            "Channel": "Master",
+            "DesiredMute": "1" if muted else "0",
+        },
+    )
+
+
+async def _sonos_become_standalone(ip: str) -> None:
+    await _sonos_soap_action(
+        ip,
+        service="AVTransport",
+        action="BecomeCoordinatorOfStandaloneGroup",
+        control_path="/MediaRenderer/AVTransport/Control",
+        arguments={"InstanceID": "0"},
+    )
+
+
+async def _sonos_join(ip: str, coordinator_rincon: str) -> None:
+    uri = f"x-rincon:{coordinator_rincon}"
+    await _sonos_soap_action(
+        ip,
+        service="AVTransport",
+        action="SetAVTransportURI",
+        control_path="/MediaRenderer/AVTransport/Control",
+        arguments={
+            "InstanceID": "0",
+            "CurrentURI": uri,
+            "CurrentURIMetaData": "",
+        },
+    )
+
+
+async def _sonos_set_uri_and_play(ip: str, uri: str) -> None:
+    await _sonos_soap_action(
+        ip,
+        service="AVTransport",
+        action="SetAVTransportURI",
+        control_path="/MediaRenderer/AVTransport/Control",
+        arguments={
+            "InstanceID": "0",
+            "CurrentURI": uri,
+            "CurrentURIMetaData": "",
+        },
+    )
+    await _sonos_soap_action(
+        ip,
+        service="AVTransport",
+        action="Play",
+        control_path="/MediaRenderer/AVTransport/Control",
+        arguments={
+            "InstanceID": "0",
+            "Speed": "1",
+        },
+    )
+
+
+async def _sonos_stop(ip: str) -> None:
+    await _sonos_soap_action(
+        ip,
+        service="AVTransport",
+        action="Stop",
+        control_path="/MediaRenderer/AVTransport/Control",
+        arguments={"InstanceID": "0"},
+    )
+
+
+async def _sonos_ping(ip: str) -> bool:
+    headers = {"User-Agent": SONOS_HTTP_USER_AGENT}
+    try:
+        async with httpx.AsyncClient(timeout=SONOS_CONTROL_TIMEOUT) as client:
+            resp = await client.get(f"http://{ip}:1400/xml/device_description.xml", headers=headers)
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def _reconcile_sonos_groups() -> None:
+    """Ensure Sonos speakers with the same channel_id are grouped together.
+
+    - Each Sonos device is still represented as a separate RoomCast node.
+    - If multiple Sonos nodes share the same channel, they are grouped for sync.
+    - If a Sonos node changes channel, it becomes standalone immediately.
+    """
+    by_channel: dict[str, list[dict]] = {}
+    standalone: list[dict] = []
+    for node in nodes.values():
+        if node.get("type") != "sonos":
+            continue
+        if node.get("online") is False:
+            continue
+        cid = resolve_node_channel_id(node)
+        if not cid:
+            standalone.append(node)
+            continue
+        by_channel.setdefault(cid, []).append(node)
+
+    # Standalone nodes: ensure they're standalone; stop if unassigned.
+    for node in standalone:
+        ip = _sonos_ip_from_url(node.get("url"))
+        if not ip:
+            continue
+        try:
+            await _sonos_become_standalone(ip)
+            await _sonos_stop(ip)
+        except Exception:
+            # Sonos may already be standalone or playing something else; do not crash reconciliation.
+            pass
+
+    for channel_id, members in by_channel.items():
+        if not members:
+            continue
+        # Choose deterministic coordinator.
+        members_sorted = sorted(members, key=lambda item: (item.get("name") or "", item.get("id") or ""))
+        coordinator = members_sorted[0]
+        coordinator_ip = _sonos_ip_from_url(coordinator.get("url"))
+        coordinator_rincon = coordinator.get("sonos_rincon")
+        if not coordinator_ip or not coordinator_rincon:
+            continue
+        # Ensure coordinator is standalone and playing the correct RoomCast channel stream.
+        try:
+            await _sonos_become_standalone(coordinator_ip)
+        except Exception:
+            pass
+        try:
+            await _sonos_set_uri_and_play(coordinator_ip, _sonos_stream_url(channel_id))
+        except Exception as exc:
+            log.warning("Sonos coordinator %s failed to start stream: %s", coordinator.get("id"), exc)
+            continue
+
+        # Join remaining members to coordinator.
+        for member in members_sorted[1:]:
+            member_ip = _sonos_ip_from_url(member.get("url"))
+            if not member_ip:
+                continue
+            try:
+                await _sonos_join(member_ip, coordinator_rincon)
+            except Exception as exc:
+                log.warning("Sonos member %s failed to join group: %s", member.get("id"), exc)
+
 
 
 def _node_host_from_url(url: Optional[str]) -> Optional[str]:
@@ -1992,7 +2274,12 @@ def _register_node_internal(
             return existing
     node_id = reg.id or str(uuid.uuid4())
     previous = nodes.get(node_id, {})
-    node_type = "browser" if normalized.startswith("browser:") else "agent"
+    if normalized.startswith("browser:"):
+        node_type = "browser"
+    elif normalized.startswith("sonos://"):
+        node_type = "sonos"
+    else:
+        node_type = "agent"
     nodes[node_id] = {
         "id": node_id,
         "name": reg.name,
@@ -2001,7 +2288,7 @@ def _register_node_internal(
         "type": node_type,
         "eq": default_eq_state(),
         "agent_secret": previous.get("agent_secret"),
-        "audio_configured": True if node_type == "browser" else previous.get("audio_configured", False),
+        "audio_configured": True if node_type in {"browser", "sonos"} else previous.get("audio_configured", False),
         "agent_version": previous.get("agent_version"),
         "volume_percent": _normalize_percent(previous.get("volume_percent", 75), default=75),
         "max_volume_percent": _normalize_percent(previous.get("max_volume_percent", 100), default=100),
@@ -2015,6 +2302,8 @@ def _register_node_internal(
         "online": True,
         "offline_since": None,
         "is_controller": bool(previous.get("is_controller")),
+        "sonos_udn": previous.get("sonos_udn"),
+        "sonos_rincon": previous.get("sonos_rincon"),
     }
     save_nodes()
     return nodes[node_id]
@@ -2034,7 +2323,7 @@ def _controller_node() -> Optional[dict]:
 
 async def _fetch_agent_fingerprint(url: str) -> Optional[str]:
     normalized = _normalize_node_url(url)
-    if not normalized or normalized.startswith("browser:"):
+    if not normalized or normalized.startswith("browser:") or normalized.startswith("sonos://"):
         return None
     target = f"{normalized}/health"
     try:
@@ -2331,7 +2620,7 @@ def load_nodes() -> None:
             eq.setdefault("preset", DEFAULT_EQ_PRESET)
             item["eq"] = eq
             item["url"] = _normalize_node_url(item.get("url", ""))
-            if item.get("type") == "browser":
+            if item.get("type") in {"browser", "sonos"}:
                 item["audio_configured"] = True
             else:
                 item["audio_configured"] = bool(item.get("audio_configured"))
@@ -2358,6 +2647,9 @@ def load_nodes() -> None:
                 item["online"] = True
             else:
                 item["online"] = bool(item.get("online", False))
+            if item.get("type") == "sonos":
+                item["sonos_udn"] = item.get("sonos_udn")
+                item["sonos_rincon"] = item.get("sonos_rincon")
             item["channel_id"] = _select_initial_channel_id(
                 item.get("channel_id"), fallback=item.get("type") != "browser"
             )
@@ -2722,11 +3014,37 @@ async def snapcast_volume(client_id: str, payload: VolumePayload) -> dict:
 async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool = False) -> dict:
     normalized_url = _normalize_node_url(reg.url)
     reg.url = normalized_url
-    fingerprint = reg.fingerprint or await _fetch_agent_fingerprint(normalized_url)
+    fingerprint = reg.fingerprint
+    if normalized_url.startswith("sonos://"):
+        ip = _sonos_ip_from_url(normalized_url)
+        if not ip:
+            raise HTTPException(status_code=400, detail="Invalid Sonos URL")
+        desc = await _sonos_fetch_description(ip)
+        if not desc:
+            raise HTTPException(status_code=502, detail="Failed to read Sonos device description")
+        fingerprint = fingerprint or desc.get("udn")
+    else:
+        fingerprint = fingerprint or await _fetch_agent_fingerprint(normalized_url)
     node = _register_node_internal(reg, fingerprint=fingerprint, normalized_url=normalized_url)
     if mark_controller:
         node["is_controller"] = True
         save_nodes()
+    if node.get("type") == "sonos":
+        ip = _sonos_ip_from_url(node.get("url"))
+        if not ip:
+            raise HTTPException(status_code=400, detail="Invalid Sonos node URL")
+        desc = await _sonos_fetch_description(ip)
+        if desc:
+            if desc.get("friendly_name"):
+                node["name"] = desc["friendly_name"]
+            node["sonos_udn"] = desc.get("udn")
+            node["sonos_rincon"] = desc.get("rincon")
+            node["fingerprint"] = node.get("fingerprint") or desc.get("udn")
+        node["audio_configured"] = True
+        node["agent_secret"] = None
+        save_nodes()
+        await broadcast_nodes()
+        return public_node(node)
     if node.get("type") == "agent":
         try:
             secret = await request_agent_secret(node, force=True)
@@ -2889,6 +3207,26 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
     stream_id = channel.get("snap_stream")
     if not stream_id:
         raise HTTPException(status_code=400, detail="Channel is missing snap_stream mapping")
+    if node.get("type") == "sonos":
+        ip = _sonos_ip_from_url(node.get("url"))
+        if not ip:
+            raise HTTPException(status_code=400, detail="Invalid Sonos node")
+        # If leaving a channel, become standalone immediately.
+        try:
+            await _sonos_become_standalone(ip)
+        except Exception:
+            pass
+        if not resolved:
+            try:
+                await _sonos_stop(ip)
+            except Exception:
+                pass
+            node["channel_id"] = None
+            return
+        node["channel_id"] = resolved
+        # Reconcile grouping based on updated desired assignments.
+        await _reconcile_sonos_groups()
+        return
     if node.get("type") == "agent":
         client_id = await _ensure_snapclient_stream(node, channel)
         node["snapclient_id"] = client_id
@@ -2909,6 +3247,13 @@ async def set_node_volume(node_id: str, payload: VolumePayload) -> dict:
             raise HTTPException(status_code=503, detail="Browser node not connected")
         await _send_browser_volume(node, requested)
         result = {"sent": True}
+    elif node.get("type") == "sonos":
+        ip = _sonos_ip_from_url(node.get("url"))
+        if not ip:
+            raise HTTPException(status_code=400, detail="Invalid Sonos node")
+        effective = _apply_volume_limit(node, requested)
+        await _sonos_set_volume(ip, effective)
+        result = {"sonos": True, "effective": effective}
     else:
         result = await _call_agent(node, "/volume", {"percent": requested})
     node["volume_percent"] = requested
@@ -2929,6 +3274,14 @@ async def set_node_max_volume(node_id: str, payload: VolumePayload) -> dict:
     save_nodes()
     if node.get("type") == "browser":
         await _send_browser_volume(node, node.get("volume_percent", 75))
+    if node.get("type") == "sonos":
+        ip = _sonos_ip_from_url(node.get("url"))
+        if ip:
+            try:
+                effective = _apply_volume_limit(node, int(node.get("volume_percent", 75)))
+                await _sonos_set_volume(ip, effective)
+            except Exception:
+                pass
     await broadcast_nodes()
     return {"ok": True, "max_volume_percent": percent}
 
@@ -2947,6 +3300,12 @@ async def set_node_mute(node_id: str, payload: dict = Body(...)) -> dict:
             raise HTTPException(status_code=503, detail="Browser node not connected")
         await ws.send_json({"type": "mute", "muted": bool(muted)})
         result = {"sent": True}
+    elif node.get("type") == "sonos":
+        ip = _sonos_ip_from_url(node.get("url"))
+        if not ip:
+            raise HTTPException(status_code=400, detail="Invalid Sonos node")
+        await _sonos_set_mute(ip, bool(muted))
+        result = {"sonos": True}
     else:
         result = await _call_agent(node, "/mute", {"muted": bool(muted)})
     node["muted"] = bool(muted)
@@ -2974,6 +3333,8 @@ async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="EQ is not supported for Sonos nodes")
     eq_data = payload.model_dump()
     node["eq"] = eq_data
     save_nodes()
@@ -2996,6 +3357,8 @@ async def pair_node(node_id: str, payload: dict | None = Body(default=None)) -> 
         raise HTTPException(status_code=404, detail="Unknown node")
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes do not support pairing")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="Sonos nodes do not support pairing")
     force = True if payload is None else bool(payload.get("force", False))
     recovery_code = None if payload is None else payload.get("recovery_code")
     secret = await request_agent_secret(node, force=force, recovery_code=recovery_code)
@@ -3038,6 +3401,8 @@ async def configure_node(node_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Unknown node")
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes do not require configuration")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="Sonos nodes do not require configuration")
     result = await configure_agent_audio(node)
     await _sync_node_max_volume(node)
     await broadcast_nodes()
@@ -3051,6 +3416,8 @@ async def set_node_output(node_id: str, payload: OutputSelectionPayload) -> dict
         raise HTTPException(status_code=404, detail="Unknown node")
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes do not support hardware outputs")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="Sonos nodes do not support hardware outputs")
     result = await _call_agent(node, "/outputs", payload.model_dump())
     outputs = result.get("outputs") if isinstance(result, dict) else None
     if isinstance(outputs, dict):
@@ -3072,6 +3439,8 @@ async def check_node_updates(node_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Unknown node")
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes do not support updates")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="Sonos nodes do not support updates")
     reachable, changed = await refresh_agent_metadata(node)
     if not reachable:
         raise HTTPException(status_code=504, detail="Node agent is not responding")
@@ -3094,6 +3463,8 @@ async def update_agent_node(node_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Unknown node")
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes cannot be updated from the controller")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="Sonos nodes cannot be updated from the controller")
     result = await _call_agent(node, "/update", {})
     node["updating"] = True
     node["audio_configured"] = False
@@ -3111,6 +3482,8 @@ async def restart_agent_node(node_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Unknown node")
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes cannot be restarted from the controller")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="Sonos nodes cannot be restarted from the controller")
     result = await _call_agent(node, "/restart", {})
     schedule_restart_watch(node_id)
     await broadcast_nodes()
@@ -3126,6 +3499,8 @@ async def create_terminal_session(node_id: str) -> dict:
         raise HTTPException(status_code=404, detail="Unknown node")
     if node.get("type") == "browser":
         raise HTTPException(status_code=400, detail="Browser nodes do not support terminal access")
+    if node.get("type") == "sonos":
+        raise HTTPException(status_code=400, detail="Sonos nodes do not support terminal access")
     if node.get("online") is False:
         raise HTTPException(status_code=409, detail="Node is offline")
     target = _resolve_terminal_target(node)
@@ -3172,14 +3547,215 @@ async def unregister_node(node_id: str) -> dict:
 async def _refresh_all_agent_nodes() -> None:
     dirty = False
     for node in list(nodes.values()):
-        if node.get("type") != "agent":
-            continue
-        _, changed = await refresh_agent_metadata(node, persist=False)
-        if changed:
+        if node.get("type") == "agent":
+            _, changed = await refresh_agent_metadata(node, persist=False)
+            if changed:
+                dirty = True
+        elif node.get("type") == "sonos":
+            ip = _sonos_ip_from_url(node.get("url"))
+            if not ip:
+                continue
+            now = time.time()
+            reachable = await _sonos_ping(ip)
+            prev_online = node.get("online") is not False
+            node["online"] = bool(reachable)
+            if reachable:
+                node["last_seen"] = now
+                node["offline_since"] = None
+            else:
+                if prev_online:
+                    node["offline_since"] = now
             dirty = True
     if dirty:
         save_nodes()
         await broadcast_nodes()
+
+
+@app.get("/api/sonos/stream/{channel_id}")
+async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingResponse:
+    resolved = resolve_channel_id(channel_id)
+    channel = channels_by_id.get(resolved)
+    if not channel or not channel.get("snap_stream"):
+        raise HTTPException(status_code=404, detail="Unknown channel")
+    stream_id = channel.get("snap_stream")
+    if not stream_id:
+        raise HTTPException(status_code=400, detail="Channel is missing snap_stream")
+
+    client_id = f"roomcast-sonos-{uuid.uuid4()}"
+    latency_ms = max(100, min(1200, int(WEBRTC_LATENCY_MS)))
+    sample_rate = int(WEBRTC_SAMPLE_RATE)
+
+    async def _iter_bytes() -> AsyncIterator[bytes]:
+        snap_proc: Optional[asyncio.subprocess.Process] = None
+        ff_proc: Optional[asyncio.subprocess.Process] = None
+        assign_task: Optional[asyncio.Task[None]] = None
+        try:
+            snap_args = [
+                "snapclient",
+                "-h",
+                SNAPSERVER_AGENT_HOST,
+                "-p",
+                str(SNAPCLIENT_PORT),
+                "--player",
+                "file:filename=stdout",
+                "--sampleformat",
+                f"{sample_rate}:16:*",
+                "--latency",
+                str(latency_ms),
+                "--logsink",
+                "stderr",
+                "--logfilter",
+                "*:warn",
+                "--hostID",
+                client_id,
+            ]
+            snap_proc = await asyncio.create_subprocess_exec(
+                *snap_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+
+            async def _assign() -> None:
+                deadline = time.time() + 15
+                delay = 0.5
+                while time.time() < deadline:
+                    if snap_proc and snap_proc.returncode is not None:
+                        return
+                    try:
+                        await snapcast.set_client_stream(client_id, stream_id)
+                        return
+                    except Exception:
+                        await asyncio.sleep(delay)
+                        delay = min(2.0, delay * 1.4)
+
+            assign_task = asyncio.create_task(_assign())
+
+            ff_args = [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "s16le",
+                "-ar",
+                str(sample_rate),
+                "-ac",
+                "2",
+                "-i",
+                "pipe:0",
+                "-vn",
+                "-b:a",
+                f"{max(64, SONOS_STREAM_BITRATE_KBPS)}k",
+                "-f",
+                "mp3",
+                "pipe:1",
+            ]
+            assert snap_proc.stdout is not None
+            ff_proc = await asyncio.create_subprocess_exec(
+                *ff_args,
+                stdin=snap_proc.stdout,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            assert ff_proc.stdout is not None
+            while True:
+                if await request.is_disconnected():
+                    return
+                chunk = await ff_proc.stdout.read(32 * 1024)
+                if not chunk:
+                    return
+                yield chunk
+        finally:
+            if assign_task and not assign_task.done():
+                assign_task.cancel()
+            if ff_proc and ff_proc.returncode is None:
+                ff_proc.terminate()
+                try:
+                    await asyncio.wait_for(ff_proc.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    ff_proc.kill()
+            if snap_proc and snap_proc.returncode is None:
+                snap_proc.terminate()
+                try:
+                    await asyncio.wait_for(snap_proc.wait(), timeout=3)
+                except asyncio.TimeoutError:
+                    snap_proc.kill()
+
+    headers = {
+        "Cache-Control": "no-store",
+        "Content-Type": "audio/mpeg",
+    }
+    return StreamingResponse(_iter_bytes(), media_type="audio/mpeg", headers=headers)
+
+
+async def _sonos_ssdp_discover() -> list[dict]:
+    """Discover Sonos devices using SSDP M-SEARCH."""
+    message = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SONOS_SSDP_ADDR[0]}:{SONOS_SSDP_ADDR[1]}\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 1\r\n"
+        f"ST: {SONOS_DEVICE_TYPE}\r\n"
+        "\r\n"
+    ).encode("utf-8")
+    loop = asyncio.get_running_loop()
+    found: dict[str, dict] = {}
+
+    class _Proto(asyncio.DatagramProtocol):
+        def connection_made(self, transport):
+            self.transport = transport
+            try:
+                self.transport.sendto(message, SONOS_SSDP_ADDR)
+            except Exception:
+                pass
+
+        def datagram_received(self, data, addr):
+            try:
+                text = data.decode("utf-8", errors="ignore")
+            except Exception:
+                return
+            lines = [line.strip() for line in text.split("\r\n") if line.strip()]
+            headers = {}
+            for line in lines[1:]:
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+            location = headers.get("location")
+            if not location:
+                return
+            host = addr[0]
+            found[host] = {"ip": host, "location": location}
+
+    transport = None
+    try:
+        transport, _ = await loop.create_datagram_endpoint(
+            lambda: _Proto(),
+            local_addr=("0.0.0.0", 0),
+        )
+        await asyncio.sleep(max(0.2, SONOS_DISCOVERY_TIMEOUT))
+    finally:
+        if transport:
+            transport.close()
+
+    results: list[dict] = []
+    for item in found.values():
+        ip = item.get("ip")
+        if not ip:
+            continue
+        desc = await _sonos_fetch_description(ip)
+        if not desc:
+            continue
+        results.append(
+            {
+                "kind": "sonos",
+                "host": desc.get("friendly_name") or ip,
+                "url": f"sonos://{ip}",
+                "fingerprint": desc.get("udn"),
+                "version": "Sonos",
+            }
+        )
+    return results
 
 
 async def _node_health_loop() -> None:
@@ -3860,10 +4436,36 @@ async def discover_nodes() -> StreamingResponse:
             "host_count": len(hosts),
             "limited": limited,
         }) + "\n"
+        sonos_task: Optional[asyncio.Task[list[dict]]] = None
+        sonos_emitted = False
         try:
+            # Run Sonos SSDP discovery concurrently with agent probing.
+            sonos_task = asyncio.create_task(_sonos_ssdp_discover())
             async for result in _stream_host_probes(hosts):
                 found += 1
                 yield json.dumps({"type": "discovered", "data": result}) + "\n"
+                if sonos_task and not sonos_emitted and sonos_task.done():
+                    sonos_emitted = True
+                    try:
+                        sonos_items = sonos_task.result() or []
+                    except Exception:
+                        sonos_items = []
+                    for item in sonos_items:
+                        found += 1
+                        yield json.dumps({"type": "discovered", "data": item}) + "\n"
+            sonos_items: list[dict] = []
+            if sonos_task:
+                try:
+                    sonos_items = await asyncio.wait_for(
+                        sonos_task,
+                        timeout=max(0.5, SONOS_DISCOVERY_TIMEOUT + 1.0),
+                    )
+                except Exception:
+                    sonos_items = []
+            if not sonos_emitted:
+                for item in sonos_items or []:
+                    found += 1
+                    yield json.dumps({"type": "discovered", "data": item}) + "\n"
         except asyncio.CancelledError:
             yield json.dumps({"type": "cancelled", "found": found}) + "\n"
             raise
@@ -3872,6 +4474,9 @@ async def discover_nodes() -> StreamingResponse:
             yield json.dumps({"type": "error", "message": "Discovery failed"}) + "\n"
         else:
             yield json.dumps({"type": "complete", "found": found}) + "\n"
+        finally:
+            if sonos_task and not sonos_task.done():
+                sonos_task.cancel()
 
     return StreamingResponse(_event_stream(), media_type="application/x-ndjson")
 

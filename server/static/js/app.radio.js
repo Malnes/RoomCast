@@ -2085,39 +2085,44 @@ function commitRenderNodes(nodes) {
     const statusRow = document.createElement('div');
     statusRow.className = 'node-status';
     const isBrowser = n.type === 'browser';
-    const paired = !!n.paired;
-    const configured = isBrowser ? true : !!n.configured;
+    const isSonos = n.type === 'sonos';
+    const paired = isSonos ? true : !!n.paired;
+    const configured = (isBrowser || isSonos) ? true : !!n.configured;
     const online = isBrowser ? true : n.online !== false;
     const restarting = !!n.restarting;
     const updateAvailable = hasAgentUpdate(n);
     const updating = !!n.updating;
-    const disableAgentControls = !isBrowser && (!paired || !configured || restarting || !online);
-    const eqBtn = document.createElement('button');
-    eqBtn.className = 'node-icon-btn';
-    eqBtn.innerHTML = EQ_ICON_SVG;
-    eqBtn.setAttribute('aria-label', 'Equalizer');
-    eqBtn.title = 'Equalizer';
-    eqBtn.disabled = n.type !== 'browser' && (!paired || !configured || restarting || !online);
-    eqBtn.addEventListener('click', (event) => {
-      event.stopPropagation();
-      openEqModal(n.id, n.name);
-    });
-    gearWrap.insertBefore(eqBtn, gearBtn);
-    const channelSelector = createNodeChannelSelector(n, { disabled: disableAgentControls });
+    const disableNodeControls = isBrowser ? false : (!online || restarting || (!isSonos && (!paired || !configured)));
+
+    let eqBtn = null;
+    if (isBrowser || n.type === 'agent') {
+      eqBtn = document.createElement('button');
+      eqBtn.className = 'node-icon-btn';
+      eqBtn.innerHTML = EQ_ICON_SVG;
+      eqBtn.setAttribute('aria-label', 'Equalizer');
+      eqBtn.title = 'Equalizer';
+      eqBtn.disabled = n.type !== 'browser' && (!paired || !configured || restarting || !online);
+      eqBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        openEqModal(n.id, n.name);
+      });
+      gearWrap.insertBefore(eqBtn, gearBtn);
+    }
+    const channelSelector = createNodeChannelSelector(n, { disabled: disableNodeControls });
     if (channelSelector) {
-      gearWrap.insertBefore(channelSelector, eqBtn);
+      gearWrap.insertBefore(channelSelector, eqBtn || gearBtn);
     }
     if (!isBrowser) {
       const wifiIndicator = renderNodeWifiIndicator(n);
       title.appendChild(wifiIndicator);
     }
-    if (!isBrowser && !paired) {
+    if (!isBrowser && !isSonos && !paired) {
       const pairPill = document.createElement('span');
       pairPill.className = 'status-pill warn';
       pairPill.textContent = 'Pairing required';
       statusRow.appendChild(pairPill);
     }
-    if (!isBrowser) {
+    if (!isBrowser && !isSonos) {
       if (!configured) {
         const cfgPill = document.createElement('span');
         cfgPill.className = 'status-pill warn';
@@ -2125,7 +2130,7 @@ function commitRenderNodes(nodes) {
         statusRow.appendChild(cfgPill);
       }
     }
-    if (!isBrowser && (updateAvailable || updating)) {
+    if (!isBrowser && !isSonos && (updateAvailable || updating)) {
       const versionMeta = document.createElement('div');
       versionMeta.className = 'label';
       let text = n.agent_version ? `Agent ${n.agent_version}` : 'Agent version unknown';
@@ -2162,7 +2167,7 @@ function commitRenderNodes(nodes) {
     volRow.style.gap = '8px';
     const muteBtn = document.createElement('button');
     muteBtn.className = 'node-mute-btn';
-    muteBtn.disabled = disableAgentControls;
+    muteBtn.disabled = disableNodeControls;
     muteBtn.addEventListener('click', () => toggleMute(n.id, muteBtn));
     applyMuteButtonState(muteBtn, n.muted === true);
     volRow.appendChild(muteBtn);
@@ -2173,7 +2178,7 @@ function commitRenderNodes(nodes) {
     const parsedVolume = Number(n.volume_percent);
     const maxVolumePercent = normalizePercent(n.max_volume_percent, 100);
     volInput.value = Number.isFinite(parsedVolume) ? parsedVolume : 75;
-    volInput.disabled = disableAgentControls;
+    volInput.disabled = disableNodeControls;
     volInput.style.width = '100%';
     const nodeVolumeColor = getNodeChannelAccent(n);
     applyRangeAccent(volInput, nodeVolumeColor);
@@ -2285,11 +2290,12 @@ function appendDiscovered(items) {
   const list = Array.isArray(items) ? items : [items];
   list.forEach(item => {
     if (!item || !item.url) return;
+    const isSonos = typeof item.url === 'string' && item.url.startsWith('sonos://');
     const row = document.createElement('div');
     row.className = 'panel discover-row';
     row.style.marginBottom = '8px';
     const title = document.createElement('div');
-    const versionLabel = item.version ? `Agent ${item.version}` : 'Version unknown';
+    const versionLabel = isSonos ? 'Sonos speaker' : (item.version ? `Agent ${item.version}` : 'Version unknown');
     title.innerHTML = `<strong>${item.host}</strong> <span class="muted">${item.url}</span><div class="label">${versionLabel}</div>`;
     const nameInput = document.createElement('input');
     const existing = findNodeByFingerprint(item.fingerprint);
@@ -2297,7 +2303,7 @@ function appendDiscovered(items) {
       nameInput.value = existing.name || existing.id || `Node ${item.host}`;
       nameInput.disabled = true;
     } else {
-      nameInput.value = `Node ${item.host}`;
+      nameInput.value = isSonos ? (item.host || 'Sonos speaker') : `Node ${item.host}`;
     }
     nameInput.style.marginTop = '6px';
     const btn = document.createElement('button');

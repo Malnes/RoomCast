@@ -531,8 +531,9 @@ function renderNodeSettingsContent() {
   nodeSettingsContent.innerHTML = '';
 
   const isBrowser = node.type === 'browser';
-  const paired = !!node.paired;
-  const configured = isBrowser ? true : !!node.configured;
+  const isSonos = node.type === 'sonos';
+  const paired = isSonos ? true : !!node.paired;
+  const configured = (isBrowser || isSonos) ? true : !!node.configured;
   const online = isBrowser ? true : node.online !== false;
   const restarting = !!node.restarting;
   const updating = !!node.updating;
@@ -540,7 +541,7 @@ function renderNodeSettingsContent() {
   const outputs = node.outputs || {};
   const outputOptions = Array.isArray(outputs.options) ? outputs.options : [];
   const selectedOutput = outputs.selected || node.playback_device || '';
-  const disableOutputs = !isBrowser && (!paired || !configured || restarting || !online || updating);
+  const disableOutputs = !isBrowser && !isSonos && (!paired || !configured || restarting || !online || updating);
 
   const detailsPanel = document.createElement('div');
   detailsPanel.className = 'panel';
@@ -548,11 +549,11 @@ function renderNodeSettingsContent() {
   detailsTitle.className = 'section-title';
   detailsTitle.textContent = 'Details';
   detailsPanel.appendChild(detailsTitle);
-  detailsPanel.appendChild(createMetaRow('Node type', isBrowser ? 'Browser node' : 'Hardware node'));
+  detailsPanel.appendChild(createMetaRow('Node type', isBrowser ? 'Browser node' : (isSonos ? 'Sonos speaker' : 'Hardware node')));
   if (node.url) {
     detailsPanel.appendChild(createMetaRow('Endpoint', node.url));
   }
-  if (node.agent_version) {
+  if (!isSonos && node.agent_version) {
     let versionText = `Agent ${node.agent_version}`;
     if (updating) versionText += ' (updating…)';
     else if (updateAvailable && node.latest_agent_version) versionText += ` → ${node.latest_agent_version}`;
@@ -563,7 +564,7 @@ function renderNodeSettingsContent() {
   }
   nodeSettingsContent.appendChild(detailsPanel);
 
-  if (!isBrowser) {
+  if (!isBrowser && !isSonos) {
     const audioPanel = document.createElement('div');
     audioPanel.className = 'panel';
     const audioTitle = document.createElement('div');
@@ -626,7 +627,7 @@ function renderNodeSettingsContent() {
   maxSlider.max = 100;
   maxSlider.value = currentMaxVolume;
   setRangeProgress(maxSlider, maxSlider.value, maxSlider.max || 100);
-  const disableMaxVolume = !isBrowser && (!paired || !online || restarting || updating);
+  const disableMaxVolume = !isBrowser && (!online || restarting || updating || (!isSonos && !paired));
   maxSlider.disabled = disableMaxVolume;
   maxSlider.addEventListener('input', () => {
     setRangeProgress(maxSlider, maxSlider.value, maxSlider.max || 100);
@@ -656,7 +657,7 @@ function renderNodeSettingsContent() {
   actionStack.className = 'modal-actions';
 
   actionStack.appendChild(createNodeSettingsAction('Rename node', () => renameNode(node.id, node.name)));
-  if (!isBrowser) {
+  if (!isBrowser && !isSonos) {
     const pairBtn = createNodeSettingsAction(paired ? 'Rotate key' : 'Pair node', (btn) => pairNode(node.id, btn), { disabled: restarting });
     if (!paired) {
       pairBtn.style.background = 'linear-gradient(135deg, #f97316, #ea580c)';
