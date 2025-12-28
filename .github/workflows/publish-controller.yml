@@ -18,7 +18,7 @@ jobs:
         component: [controller, librespot]
         include:
           - component: controller
-            context: ./server
+            context: .
             dockerfile: ./server/Dockerfile
             image: roomcast-controller
           - component: librespot
