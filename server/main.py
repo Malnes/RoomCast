@@ -88,6 +88,8 @@ SESSION_COOKIE_SAMESITE = _raw_samesite if _raw_samesite in {"lax", "strict", "n
 SESSION_MAX_AGE = int(os.getenv("AUTH_SESSION_MAX_AGE", str(7 * 24 * 3600)))
 CHANNELS_PATH = Path(os.getenv("CHANNELS_PATH", "/config/channels.json"))
 CHANNELS_PATH.parent.mkdir(parents=True, exist_ok=True)
+SOURCES_PATH = Path(os.getenv("SOURCES_PATH", "/config/sources.json"))
+SOURCES_PATH.parent.mkdir(parents=True, exist_ok=True)
 PRIMARY_CHANNEL_ID = os.getenv("PRIMARY_CHANNEL_ID", "ch1").strip() or "ch1"
 CHANNEL_ID_PREFIX = os.getenv("CHANNEL_ID_PREFIX", "ch").strip() or "ch"
 PLAYER_SNAPSHOT_PATH = Path(os.getenv("PLAYER_SNAPSHOT_PATH", "/config/player-snapshots.json"))
@@ -200,6 +202,7 @@ SONOS_SSDP_ADDR = ("239.255.255.250", 1900)
 
 channels_by_id: Dict[str, dict] = {}
 channel_order: list[str] = []
+sources_by_id: Dict[str, dict] = {}
 player_snapshots: Dict[str, dict] = {}
 player_snapshot_lock = threading.Lock()
 
@@ -370,6 +373,15 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
     source = (entry.get("source") or "spotify").strip().lower()
     if source not in {"spotify", "radio"}:
         source = "spotify"
+    source_ref_raw = (entry.get("source_ref") or "").strip().lower()
+    source_ref: Optional[str] = None
+    if source == "spotify":
+        source_ref = _normalize_spotify_source_id(source_ref_raw)
+        if not source_ref:
+            # Backwards-compatible mapping: ch2 defaults to Spotify B, everything else to A.
+            source_ref = "spotify:b" if channel_id == f"{CHANNEL_ID_PREFIX}2" else "spotify:a"
+    elif source == "radio":
+        source_ref = "radio"
     radio_state = None
     if source == "radio":
         radio_state = _normalize_radio_state(entry.get("radio_state"))
@@ -385,6 +397,7 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
         "color": color,
         "enabled": enabled,
         "source": source,
+        "source_ref": source_ref,
         "radio_state": radio_state,
     }
 
@@ -445,6 +458,7 @@ def _default_channel_entries() -> list[dict]:
             "color": "#22c55e",
             "enabled": True,
             "source": "spotify",
+            "source_ref": "spotify:a",
         },
         {
             "id": f"{CHANNEL_ID_PREFIX}2",
@@ -458,6 +472,7 @@ def _default_channel_entries() -> list[dict]:
             "color": "#0ea5e9",
             "enabled": True,
             "source": "spotify",
+            "source_ref": "spotify:b",
         },
     ]
     defaults.extend(_radio_channel_templates())
@@ -584,6 +599,132 @@ def _ensure_channel_paths(entry: dict) -> None:
     Path(entry["status_path"]).parent.mkdir(parents=True, exist_ok=True)
 
 
+def _write_sources_file(entries: list[dict]) -> None:
+    SOURCES_PATH.write_text(json.dumps(entries, indent=2))
+
+
+def _is_spotify_source_id(value: Optional[str]) -> bool:
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower().startswith("spotify:")
+
+
+def _normalize_spotify_source_id(value: Optional[str]) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    raw = value.strip().lower()
+    if not raw:
+        return None
+    if not raw.startswith("spotify:"):
+        return None
+    return raw
+
+
+def _default_source_entries() -> list[dict]:
+    # Source instances are the stable units of authentication (e.g. Spotify login A/B).
+    # They can be routed to any logical channel by updating channel.source_ref.
+    return [
+        {
+            "id": "spotify:a",
+            "kind": "spotify",
+            "name": "Spotify A",
+            "snap_stream": "Spotify_CH1",
+            "config_path": str(CONFIG_PATH),
+            "token_path": str(SPOTIFY_TOKEN_PATH),
+            "status_path": str(LIBRESPOT_STATUS_PATH),
+        },
+        {
+            "id": "spotify:b",
+            "kind": "spotify",
+            "name": "Spotify B",
+            "snap_stream": "Spotify_CH2",
+            "config_path": "/config/spotify-ch2.json",
+            "token_path": "/config/spotify-token-ch2.json",
+            "status_path": "/config/librespot-status-ch2.json",
+        },
+    ]
+
+
+def load_sources() -> None:
+    global sources_by_id
+    entries: list[Any] = []
+    if SOURCES_PATH.exists():
+        try:
+            entries = json.loads(SOURCES_PATH.read_text()) or []
+        except json.JSONDecodeError:
+            log.warning("sources.json is invalid; regenerating defaults")
+            entries = []
+    if not entries:
+        entries = _default_source_entries()
+        _write_sources_file(entries)
+    normalized: Dict[str, dict] = {}
+    for raw in entries:
+        if not isinstance(raw, dict):
+            continue
+        kind = (raw.get("kind") or "").strip().lower()
+        if kind != "spotify":
+            continue
+        source_id = _normalize_spotify_source_id(raw.get("id"))
+        if not source_id:
+            continue
+        name = (raw.get("name") or source_id).strip() or source_id
+        snap_stream = (raw.get("snap_stream") or "").strip()
+        if not snap_stream:
+            continue
+        config_path = str(raw.get("config_path") or "").strip()
+        token_path = str(raw.get("token_path") or "").strip()
+        status_path = str(raw.get("status_path") or "").strip()
+        if not (config_path and token_path and status_path):
+            continue
+        Path(config_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(token_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(status_path).parent.mkdir(parents=True, exist_ok=True)
+        normalized[source_id] = {
+            "id": source_id,
+            "kind": "spotify",
+            "name": name,
+            "snap_stream": snap_stream,
+            "config_path": config_path,
+            "token_path": token_path,
+            "status_path": status_path,
+        }
+    # Ensure required defaults exist even if file is partially configured.
+    defaults = {item["id"]: item for item in _default_source_entries()}
+    dirty = False
+    for sid, entry in defaults.items():
+        if sid not in normalized:
+            normalized[sid] = dict(entry)
+            dirty = True
+    sources_by_id = normalized
+    if dirty:
+        _write_sources_file(list(sources_by_id.values()))
+
+
+def save_sources() -> None:
+    _write_sources_file(list(sources_by_id.values()))
+
+
+def get_spotify_source(source_id: Optional[str]) -> dict:
+    sid = _normalize_spotify_source_id(source_id)
+    if not sid or sid not in sources_by_id:
+        raise HTTPException(status_code=404, detail="Spotify source not found")
+    return sources_by_id[sid]
+
+
+def resolve_channel_spotify_source_id(channel_id: Optional[str]) -> Optional[str]:
+    channel = get_channel(channel_id)
+    ref = (channel.get("source_ref") or "").strip().lower()
+    sid = _normalize_spotify_source_id(ref)
+    if sid:
+        return sid if sid in sources_by_id else None
+    if (channel.get("source") or "spotify").strip().lower() != "spotify":
+        return None
+    # Backwards-compatible mapping for existing installs.
+    if channel.get("id") == f"{CHANNEL_ID_PREFIX}2":
+        return "spotify:b"
+    return "spotify:a"
+
+
 def load_channels() -> None:
     global channels_by_id, channel_order
     entries: list[Any] = []
@@ -653,12 +794,14 @@ def channels_public() -> list[dict]:
             "color": entry.get("color"),
             "enabled": entry.get("enabled", True),
             "source": entry.get("source", "spotify"),
+            "source_ref": entry.get("source_ref"),
             "radio_state": entry.get("radio_state"),
         })
     return items
 
 
 load_channels()
+load_sources()
 
 
 def channel_detail(channel_id: str) -> dict:
@@ -675,6 +818,7 @@ def channel_detail(channel_id: str) -> dict:
         "status_path": entry["status_path"],
         "enabled": entry.get("enabled", True),
         "source": entry.get("source", "spotify"),
+        "source_ref": entry.get("source_ref"),
         "radio_state": entry.get("radio_state"),
         "spotify": read_spotify_config(entry["id"]),
         "librespot_status": read_librespot_status(entry["id"]),
@@ -689,6 +833,8 @@ def all_channel_details() -> list[dict]:
 def update_channel_metadata(channel_id: str, updates: dict) -> dict:
     channel = get_channel(channel_id)
     is_radio_channel = channel.get("source") == "radio"
+    routing_changed = False
+    previous_snap_stream = (channel.get("snap_stream") or "").strip()
     if "name" in updates:
         name = (updates.get("name") or "").strip()
         if not name:
@@ -701,8 +847,20 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
         if not snap_stream:
             raise HTTPException(status_code=400, detail="Snapstream name cannot be empty")
         channel["snap_stream"] = snap_stream
+        routing_changed = routing_changed or (snap_stream != previous_snap_stream)
     if "enabled" in updates:
         channel["enabled"] = bool(updates.get("enabled"))
+    if "source_ref" in updates:
+        if (channel.get("source") or "spotify").strip().lower() != "spotify":
+            raise HTTPException(status_code=400, detail="source_ref can only be set for Spotify channels")
+        requested = _normalize_spotify_source_id((updates.get("source_ref") or "").strip().lower())
+        if not requested:
+            raise HTTPException(status_code=400, detail="Invalid source_ref")
+        source = get_spotify_source(requested)
+        channel["source_ref"] = requested
+        # Route this logical channel to the selected Spotify source stream.
+        channel["snap_stream"] = source["snap_stream"]
+        routing_changed = routing_changed or (channel["snap_stream"] != previous_snap_stream)
     if "order" in updates:
         try:
             channel["order"] = max(1, int(updates["order"]))
@@ -711,7 +869,46 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
     save_channels()
     if is_radio_channel:
         _mark_radio_assignments_dirty()
-    return channel
+    result = dict(channel)
+    result["_routing_changed"] = routing_changed
+    return result
+
+
+async def _apply_channel_routing(channel_id: str) -> None:
+    """Re-apply routing for all nodes currently assigned to this channel.
+
+    This is the critical piece for hot-swapping: if a channel's snap_stream changes
+    (e.g. via source_ref), existing destinations must be updated immediately.
+    """
+    cid = resolve_channel_id(channel_id)
+    channel = channels_by_id.get(cid)
+    if not channel:
+        return
+    stream_id = (channel.get("snap_stream") or "").strip()
+
+    # Update Snapcast-backed nodes and WebRTC nodes.
+    for node in list(nodes.values()):
+        if resolve_node_channel_id(node) != cid:
+            continue
+        if node.get("type") == "agent":
+            try:
+                client_id = await _ensure_snapclient_stream(node, channel)
+                node["snapclient_id"] = client_id
+            except Exception as exc:
+                log.warning("Channel routing: failed to move snapclient node %s: %s", node.get("id"), exc)
+        elif node.get("type") == "browser" and webrtc_relay:
+            try:
+                await webrtc_relay.update_session_channel(node["id"], cid, stream_id or None)
+            except Exception as exc:
+                log.warning("Channel routing: failed to update WebRTC node %s: %s", node.get("id"), exc)
+
+    # Sonos uses HTTP pull; force coordinator refresh by reconciling.
+    try:
+        await _reconcile_sonos_groups()
+    except Exception as exc:
+        log.warning("Channel routing: Sonos reconcile failed: %s", exc)
+
+    save_nodes()
 
 
 class NodeRegistration(BaseModel):
@@ -817,6 +1014,7 @@ class ChannelUpdatePayload(BaseModel):
     order: Optional[int] = Field(default=None, ge=1, le=50)
     snap_stream: Optional[str] = Field(default=None, min_length=1, max_length=160)
     enabled: Optional[bool] = None
+    source_ref: Optional[str] = Field(default=None, min_length=1, max_length=60)
 
 
 class RadioStationSelectionPayload(BaseModel):
@@ -1607,8 +1805,16 @@ async def _sync_node_max_volume(node: dict, *, percent: Optional[int] = None) ->
     await _call_agent(node, "/config/max-volume", payload)
 
 
-def _ensure_spotify_token(channel_id: Optional[str] = None) -> dict:
-    token = load_token(channel_id)
+def _resolve_spotify_source_id(identifier: Optional[str]) -> Optional[str]:
+    # Accept either a spotify source id (spotify:a) or a channel id.
+    sid = _normalize_spotify_source_id(identifier)
+    if sid:
+        return sid if sid in sources_by_id else None
+    return resolve_channel_spotify_source_id(identifier)
+
+
+def _ensure_spotify_token(identifier: Optional[str] = None) -> dict:
+    token = load_token(identifier)
     if not token or not token.get("access_token"):
         raise HTTPException(status_code=401, detail="Spotify not authorized")
     return token
@@ -2675,11 +2881,10 @@ async def _spotify_refresh_loop() -> None:
     while True:
         try:
             await asyncio.sleep(max(SPOTIFY_REFRESH_CHECK_INTERVAL, 5))
-            for channel_id in list(channel_order):
-                channel_entry = channels_by_id.get(channel_id)
-                if not channel_entry:
+            for source_id, source in list(sources_by_id.items()):
+                if not source or source.get("kind") != "spotify":
                     continue
-                token = load_token(channel_id)
+                token = load_token(source_id)
                 if not token or "refresh_token" not in token:
                     continue
                 seconds_left = _token_seconds_until_expiry(token)
@@ -2688,9 +2893,9 @@ async def _spotify_refresh_loop() -> None:
                 if seconds_left > SPOTIFY_REFRESH_LEEWAY:
                     continue
                 try:
-                    await spotify_refresh(token, channel_id)
+                    await spotify_refresh(token, source_id)
                 except HTTPException as exc:
-                    log.warning("Background Spotify refresh failed for %s: %s", channel_id, exc.detail)
+                    log.warning("Background Spotify refresh failed for %s: %s", source_id, exc.detail)
                     await asyncio.sleep(SPOTIFY_REFRESH_FAILURE_BACKOFF)
         except asyncio.CancelledError:
             break
@@ -2754,18 +2959,44 @@ async def _shutdown_events() -> None:
     await stop_local_agent()
 
 
-def current_spotify_creds(channel_id: Optional[str] = None) -> Tuple[str, str, str]:
-    cfg = read_spotify_config(channel_id, include_secret=True)
+def current_spotify_creds(identifier: Optional[str] = None) -> Tuple[str, str, str]:
+    cfg = read_spotify_config(identifier, include_secret=True)
     cid = (cfg.get("client_id") or os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
     secret = cfg.get("client_secret") or os.getenv("SPOTIFY_CLIENT_SECRET") or ""
     redirect = cfg.get("redirect_uri") or os.getenv("SPOTIFY_REDIRECT_URI") or SPOTIFY_REDIRECT_URI
     return cid, secret, redirect
 
 
-def read_spotify_config(channel_id: Optional[str] = None, include_secret: bool = False) -> dict:
-    channel = get_channel(channel_id)
-    cfg_path = Path(channel["config_path"])
-    token = load_token(channel["id"])
+def read_spotify_config(identifier: Optional[str] = None, include_secret: bool = False) -> dict:
+    resolved_channel_id = None
+    spotify_source_id = _resolve_spotify_source_id(identifier)
+    if spotify_source_id is None:
+        # Keep a stable shape for UI code even when channel is not Spotify.
+        resolved_channel_id = resolve_channel_id(identifier)
+        cfg = {
+            "channel_id": resolved_channel_id,
+            "source_id": None,
+            "username": "",
+            "device_name": "RoomCast",
+            "bitrate": 320,
+            "initial_volume": 75,
+            "normalisation": True,
+            "has_password": False,
+            "client_id": (os.getenv("SPOTIFY_CLIENT_ID") or SPOTIFY_CLIENT_ID or "").strip(),
+            "has_client_secret": bool(os.getenv("SPOTIFY_CLIENT_SECRET") or SPOTIFY_CLIENT_SECRET),
+            "redirect_uri": os.getenv("SPOTIFY_REDIRECT_URI") or SPOTIFY_REDIRECT_URI,
+            "has_oauth_token": False,
+        }
+        if include_secret:
+            cfg["client_secret"] = (os.getenv("SPOTIFY_CLIENT_SECRET") or SPOTIFY_CLIENT_SECRET or "")
+        return cfg
+
+    # If identifier was a channel id, expose it for UI convenience.
+    if not _normalize_spotify_source_id(identifier):
+        resolved_channel_id = resolve_channel_id(identifier)
+    source = get_spotify_source(spotify_source_id)
+    cfg_path = Path(source["config_path"])
+    token = load_token(spotify_source_id)
     has_token = bool(token and token.get("access_token"))
     config_exists = cfg_path.exists()
     try:
@@ -2786,7 +3017,8 @@ def read_spotify_config(channel_id: Optional[str] = None, include_secret: bool =
                        or SPOTIFY_REDIRECT_URI)
 
     cfg = {
-        "channel_id": channel["id"],
+        "channel_id": resolved_channel_id,
+        "source_id": spotify_source_id,
         "username": data.get("username", ""),
         "device_name": data.get("device_name", "RoomCast"),
         "bitrate": data.get("bitrate", 320),
@@ -2805,9 +3037,12 @@ def read_spotify_config(channel_id: Optional[str] = None, include_secret: bool =
     return cfg
 
 
-def read_librespot_status(channel_id: Optional[str] = None) -> dict:
-    channel = get_channel(channel_id)
-    status_path = Path(channel["status_path"])
+def read_librespot_status(identifier: Optional[str] = None) -> dict:
+    spotify_source_id = _resolve_spotify_source_id(identifier)
+    if spotify_source_id is None:
+        return {"state": "unknown", "message": "Not a Spotify channel"}
+    source = get_spotify_source(spotify_source_id)
+    status_path = Path(source["status_path"])
     if not status_path.exists():
         return {"state": "unknown", "message": "No status yet"}
     try:
@@ -2816,9 +3051,12 @@ def read_librespot_status(channel_id: Optional[str] = None) -> dict:
         return {"state": "unknown", "message": "Invalid status file"}
 
 
-def load_token(channel_id: Optional[str] = None) -> Optional[dict]:
-    channel = get_channel(channel_id)
-    token_path = Path(channel["token_path"])
+def load_token(identifier: Optional[str] = None) -> Optional[dict]:
+    spotify_source_id = _resolve_spotify_source_id(identifier)
+    if spotify_source_id is None:
+        return None
+    source = get_spotify_source(spotify_source_id)
+    token_path = Path(source["token_path"])
     if not token_path.exists():
         return None
     try:
@@ -2827,11 +3065,14 @@ def load_token(channel_id: Optional[str] = None) -> Optional[dict]:
         return None
 
 
-def save_token(data: dict, channel_id: Optional[str] = None) -> None:
+def save_token(data: dict, identifier: Optional[str] = None) -> None:
     if not data:
         return
-    channel = get_channel(channel_id)
-    token_path = Path(channel["token_path"])
+    spotify_source_id = _resolve_spotify_source_id(identifier)
+    if spotify_source_id is None:
+        raise HTTPException(status_code=400, detail="Spotify source not configured")
+    source = get_spotify_source(spotify_source_id)
+    token_path = Path(source["token_path"])
     expires_at: Optional[float] = None
     expires_in = data.get("expires_in")
     if expires_in is not None:
@@ -2863,10 +3104,10 @@ def _token_seconds_until_expiry(token: Optional[dict]) -> Optional[float]:
     return None
 
 
-async def spotify_refresh(token: dict, channel_id: Optional[str] = None) -> dict:
+async def spotify_refresh(token: dict, identifier: Optional[str] = None) -> dict:
     if not token or "refresh_token" not in token:
         raise HTTPException(status_code=401, detail="Spotify not authorized")
-    cid, secret, _ = current_spotify_creds(channel_id)
+    cid, secret, _ = current_spotify_creds(identifier)
     payload = {
         "grant_type": "refresh_token",
         "refresh_token": token["refresh_token"],
@@ -2880,18 +3121,18 @@ async def spotify_refresh(token: dict, channel_id: Optional[str] = None) -> dict
     data = resp.json()
     token["access_token"] = data["access_token"]
     token["expires_in"] = data.get("expires_in")
-    save_token(token, channel_id)
+    save_token(token, identifier)
     return token
 
 
-async def spotify_request(method: str, path: str, token: dict, channel_id: Optional[str] = None, **kwargs) -> httpx.Response:
+async def spotify_request(method: str, path: str, token: dict, identifier: Optional[str] = None, **kwargs) -> httpx.Response:
     headers = kwargs.pop("headers", {})
     headers["Authorization"] = f"Bearer {token['access_token']}"
     url = f"https://api.spotify.com/v1{path}"
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.request(method, url, headers=headers, **kwargs)
     if resp.status_code == 401:
-        token = await spotify_refresh(token, channel_id)
+        token = await spotify_refresh(token, identifier)
         headers["Authorization"] = f"Bearer {token['access_token']}"
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.request(method, url, headers=headers, **kwargs)
@@ -4486,25 +4727,59 @@ async def list_channels_api() -> dict:
     return {"channels": all_channel_details()}
 
 
+@app.get("/api/sources")
+async def list_sources_api() -> dict:
+    sources = []
+    for sid, source in sorted(sources_by_id.items()):
+        if not isinstance(source, dict):
+            continue
+        kind = source.get("kind")
+        if kind != "spotify":
+            continue
+        token = load_token(sid)
+        sources.append({
+            "id": sid,
+            "kind": kind,
+            "name": source.get("name") or sid,
+            "snap_stream": source.get("snap_stream"),
+            "has_oauth_token": bool(token and token.get("access_token")),
+        })
+    return {"sources": sources}
+
+
 @app.patch("/api/channels/{channel_id}")
 async def update_channel_api(channel_id: str, payload: ChannelUpdatePayload) -> dict:
     updates = payload.model_dump(exclude_unset=True)
     if updates:
-        update_channel_metadata(channel_id, updates)
+        result = update_channel_metadata(channel_id, updates)
+        if bool(result.get("_routing_changed")):
+            await _apply_channel_routing(channel_id)
+            await broadcast_nodes()
     return {"ok": True, "channel": channel_detail(resolve_channel_id(channel_id))}
 
 
 @app.get("/api/config/spotify")
-async def get_spotify_config(channel_id: Optional[str] = Query(default=None)) -> dict:
-    resolved = resolve_channel_id(channel_id)
-    return read_spotify_config(resolved)
+async def get_spotify_config(
+    channel_id: Optional[str] = Query(default=None),
+    source_id: Optional[str] = Query(default=None),
+) -> dict:
+    target = source_id if source_id else resolve_channel_id(channel_id)
+    return read_spotify_config(target)
 
 
 @app.post("/api/config/spotify")
-async def set_spotify_config(cfg: SpotifyConfig, channel_id: Optional[str] = Query(default=None)) -> dict:
-    resolved = resolve_channel_id(channel_id)
-    channel = get_channel(resolved)
-    cfg_path = Path(channel["config_path"])
+async def set_spotify_config(
+    cfg: SpotifyConfig,
+    channel_id: Optional[str] = Query(default=None),
+    source_id: Optional[str] = Query(default=None),
+) -> dict:
+    resolved_channel = resolve_channel_id(channel_id)
+    target = source_id if source_id else resolved_channel
+    spotify_source_id = _resolve_spotify_source_id(target)
+    if spotify_source_id is None:
+        raise HTTPException(status_code=400, detail="Spotify source not configured")
+    source = get_spotify_source(spotify_source_id)
+    cfg_path = Path(source["config_path"])
     payload = cfg.model_dump()
     existing = {}
     if cfg_path.exists():
@@ -4520,17 +4795,17 @@ async def set_spotify_config(cfg: SpotifyConfig, channel_id: Optional[str] = Que
     if not payload.get("redirect_uri"):
         payload["redirect_uri"] = existing.get("redirect_uri") or SPOTIFY_REDIRECT_URI
 
-    primary_channel = _primary_channel_id()
-    if resolved == primary_channel and payload.get("client_id"):
+    # Keep env vars aligned with the default Spotify A instance for backwards compatibility.
+    if spotify_source_id == "spotify:a" and payload.get("client_id"):
         os.environ["SPOTIFY_CLIENT_ID"] = payload["client_id"]
-    if resolved == primary_channel and payload.get("client_secret"):
+    if spotify_source_id == "spotify:a" and payload.get("client_secret"):
         os.environ["SPOTIFY_CLIENT_SECRET"] = payload["client_secret"]
-    if resolved == primary_channel and payload.get("redirect_uri"):
+    if spotify_source_id == "spotify:a" and payload.get("redirect_uri"):
         os.environ["SPOTIFY_REDIRECT_URI"] = payload["redirect_uri"]
 
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps(payload, indent=2))
-    return {"ok": True, "config": read_spotify_config(resolved)}
+    return {"ok": True, "config": read_spotify_config(target)}
 
 
 @app.get("/api/radio/genres")
@@ -4804,12 +5079,19 @@ async def librespot_status(channel_id: Optional[str] = Query(default=None)) -> d
 
 
 @app.get("/api/spotify/auth-url")
-async def spotify_auth_url(channel_id: Optional[str] = Query(default=None)) -> dict:
-    resolved = resolve_channel_id(channel_id)
-    cid, secret, redirect = current_spotify_creds(resolved)
+async def spotify_auth_url(
+    channel_id: Optional[str] = Query(default=None),
+    source_id: Optional[str] = Query(default=None),
+) -> dict:
+    resolved_channel = resolve_channel_id(channel_id)
+    target = source_id if source_id else resolved_channel
+    spotify_source_id = _resolve_spotify_source_id(target)
+    if spotify_source_id is None:
+        raise HTTPException(status_code=400, detail="Spotify source not configured")
+    cid, secret, redirect = current_spotify_creds(spotify_source_id)
     if not (cid and secret):
         raise HTTPException(status_code=400, detail="Spotify client_id/client_secret not set")
-    state = TOKEN_SIGNER.dumps({"t": time.time(), "channel_id": resolved})
+    state = TOKEN_SIGNER.dumps({"t": time.time(), "source_id": spotify_source_id})
     scope = "user-read-playback-state user-modify-playback-state streaming user-read-email user-read-private"
     params = {
         "client_id": cid,
@@ -4829,8 +5111,10 @@ async def spotify_callback(code: str, state: str):
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid state")
 
-    resolved = resolve_channel_id((payload or {}).get("channel_id"))
-    cid, secret, redirect = current_spotify_creds(resolved)
+    spotify_source_id = _resolve_spotify_source_id((payload or {}).get("source_id"))
+    if spotify_source_id is None:
+        raise HTTPException(status_code=400, detail="Invalid state")
+    cid, secret, redirect = current_spotify_creds(spotify_source_id)
 
     data = {
         "grant_type": "authorization_code",
@@ -4844,7 +5128,7 @@ async def spotify_callback(code: str, state: str):
     if resp.status_code >= 400:
         raise HTTPException(status_code=400, detail="Failed to exchange code")
     token = resp.json()
-    save_token(token, resolved)
+    save_token(token, spotify_source_id)
     return Response(content="Spotify linked. You can close this tab.", media_type="text/plain")
 
 
