@@ -53,13 +53,7 @@
       </div>
       <div class="header-actions">
         <div class="add-node-container" data-add-node-container>
-          <button id="add-node-button" class="icon-btn add-node-button" aria-haspopup="true" aria-expanded="false">Add node ▾</button>
-          <div id="add-node-menu" class="add-node-menu" role="menu" aria-hidden="true">
-            <button id="add-hardware-node" type="button" role="menuitem">Add hardware node</button>
-            <button id="add-controller-node" type="button" role="menuitem">Add server as node</button>
-            <button id="create-web-node" type="button" role="menuitem">Create web node</button>
-            <button id="review-web-node-requests" type="button" role="menuitem" hidden>Review web node requests</button>
-          </div>
+          <button id="add-node-button" class="icon-btn add-node-button" aria-haspopup="dialog" aria-expanded="false">Add node</button>
         </div>
         <button id="open-settings" class="icon-btn gear-btn" aria-label="Settings">⚙︎</button>
       </div>
@@ -346,6 +340,34 @@
     </div>
   </div>
 
+  <div id="add-node-overlay" class="settings-overlay" aria-hidden="true" hidden>
+    <div class="settings-card" role="dialog" aria-modal="true" aria-labelledby="add-node-title">
+      <div class="settings-header">
+        <div class="section-title" id="add-node-title" style="margin:0;">Add node</div>
+        <button id="add-node-close" class="icon-btn" type="button" aria-label="Close add node">✕</button>
+      </div>
+      <div id="add-node-options">
+        <div class="muted" style="margin-bottom:12px; font-size:13px;">Select what you want to add.</div>
+        <div style="display:grid; gap:10px;">
+          <button id="add-node-option-hardware" class="small-btn" type="button">Hardware node</button>
+          <button id="add-node-option-controller" class="small-btn" type="button">Server as node</button>
+          <button id="add-node-option-web" class="small-btn" type="button">Web node</button>
+          <button id="add-node-option-sonos" class="small-btn" type="button">Sonos speaker</button>
+        </div>
+      </div>
+
+      <div id="add-node-sonos" hidden>
+        <div style="display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap; margin-bottom:8px;">
+          <button id="add-node-back" class="small-btn ghost-btn" type="button">← Back</button>
+          <button id="add-node-sonos-scan" class="small-btn" type="button" style="min-width:120px;">Scan</button>
+        </div>
+        <div id="add-node-sonos-spinner" style="margin-bottom:8px; display:none;"><span class="spinner"></span> <span class="muted">Scanning...</span></div>
+        <div id="add-node-sonos-status" class="muted">Ready to scan.</div>
+        <div id="add-node-sonos-list"></div>
+      </div>
+    </div>
+  </div>
+
   <div id="settings-overlay" class="settings-overlay">
     <div class="settings-card">
       <div class="settings-header">
@@ -399,7 +421,7 @@
             <button class="small-btn" id="spotify-dashboard" type="button">Open Spotify developer dashboard</button>
           </div>
           <div class="spotify-channel-select">
-            <label for="spotify-channel-select">Configure channel</label>
+            <label for="spotify-channel-select">Configure source</label>
             <select id="spotify-channel-select"></select>
           </div>
           <div class="muted" id="librespot-status" style="margin-bottom:8px;">Status: unknown</div>

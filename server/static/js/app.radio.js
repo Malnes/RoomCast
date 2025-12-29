@@ -1497,16 +1497,8 @@ async function runSpotifySearch(query) {
   }
 }
 
-function setAddNodeMenuOpen(open) {
-  if (!addNodeContainer || !addNodeMenu || !addNodeToggle) return;
-  const next = !!open;
-  addNodeContainer.classList.toggle('is-open', next);
-  addNodeMenu.setAttribute('aria-hidden', next ? 'false' : 'true');
-  addNodeToggle.setAttribute('aria-expanded', next ? 'true' : 'false');
-}
-
 async function registerControllerNode(btn) {
-  const target = btn || addControllerNodeBtn;
+  const target = btn;
   const originalLabel = target ? target.textContent : '';
   if (target) {
     target.disabled = true;
@@ -1902,7 +1894,9 @@ function createNodeChannelSelector(node, options = {}) {
     select.value = '';
   }
   select.dataset.previousChannel = select.value;
-  updateChannelDotColor(dot, validResolved ? resolvedId : null);
+  const dotChannelId = validResolved ? resolvedId : null;
+  const connecting = (node?.connection_state || '').toLowerCase() === 'connecting';
+  setChannelDotConnecting(dot, dotChannelId, connecting);
   const shouldDisable = options.disabled || (!hasPlayable && select.value === '');
   select.disabled = !!shouldDisable;
   select.addEventListener('change', async () => {
@@ -1910,14 +1904,14 @@ function createNodeChannelSelector(node, options = {}) {
     const previous = select.dataset.previousChannel ?? '';
     if (select.disabled) {
       select.value = previous;
-      updateChannelDotColor(dot, previous || null);
+      setChannelDotConnecting(dot, previous || null, false);
       return;
     }
     try {
       await setNodeChannel(node.id, targetChannel, select, dot);
     } catch (_) {
       select.value = previous;
-      updateChannelDotColor(dot, previous || null);
+      setChannelDotConnecting(dot, previous || null, false);
     }
   });
   wrapper.appendChild(select);
@@ -2157,6 +2151,13 @@ function commitRenderNodes(nodes) {
       updatingPill.className = 'status-pill warn';
       updatingPill.textContent = 'Updating';
       statusRow.appendChild(updatingPill);
+    }
+    if (isSonos && typeof n.connection_error === 'string' && n.connection_error.trim()) {
+      const errPill = document.createElement('span');
+      errPill.className = 'status-pill err';
+      errPill.textContent = 'Error';
+      errPill.title = n.connection_error.trim();
+      statusRow.appendChild(errPill);
     }
     wrapper.appendChild(statusRow);
 

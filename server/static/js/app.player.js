@@ -593,12 +593,12 @@ async function playerAction(path, body, options = {}) {
 
 async function startSpotifyAuth() {
   try {
-    const channelId = getSettingsChannelId();
-    if (!channelId) {
-      showError('No channels available to link.');
+    const sourceId = getSettingsChannelId();
+    if (!sourceId) {
+      showError('No Spotify sources available to link.');
       return;
     }
-    const res = await fetch(withChannel('/api/spotify/auth-url', channelId));
+    const res = await fetch(`/api/spotify/auth-url?source_id=${encodeURIComponent(sourceId)}`);
     await ensureOk(res);
     const data = await res.json();
     if (data.url) window.open(data.url, '_blank');
@@ -648,9 +648,9 @@ async function registerNodeWithName(name, url, btn, nodeId, fingerprint) {
 }
 
 async function saveSpotify() {
-  const channelId = getSettingsChannelId();
-  if (!channelId) {
-    showError('No channels available to update.');
+  const sourceId = getSettingsChannelId();
+  if (!sourceId) {
+    showError('No Spotify source selected.');
     return;
   }
   try {
@@ -666,17 +666,15 @@ async function saveSpotify() {
       redirect_uri: spRedirect.value || 'http://localhost:8000/api/spotify/callback',
     };
     if (!payload.client_secret) delete payload.client_secret;
-    const res = await fetch(withChannel('/api/config/spotify', channelId), {
+    const res = await fetch(`/api/config/spotify?source_id=${encodeURIComponent(sourceId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     await ensureOk(res);
     spClientSecret.value = '';
-    const targetChannel = getChannelById(channelId);
-    const channelName = targetChannel?.name ? ` for ${targetChannel.name}` : '';
-    showSuccess(`Spotify config saved${channelName}. Librespot will reload and connect.`);
-    await pollLibrespotStatus(channelId);
+    showSuccess('Spotify config saved. Librespot will reload and connect.');
+    await pollLibrespotStatus(sourceId);
   } catch (err) {
     showError(`Failed to save Spotify config: ${err.message}`);
   } finally {
@@ -889,11 +887,11 @@ function resetUsersState() {
   }
 }
 
-async function pollLibrespotStatus(channelId = getSettingsChannelId()) {
-  if (!channelId) return;
+async function pollLibrespotStatus(sourceId = getSettingsChannelId()) {
+  if (!sourceId) return;
   for (let i = 0; i < 8; i++) {
     await new Promise(r => setTimeout(r, 1200));
-    await fetchLibrespotStatus(channelId);
+    await fetchLibrespotStatus(sourceId);
     const text = librespotStatus.innerText || '';
     if (!text.includes('starting') && !text.includes('waiting') && !text.includes('unknown')) break;
   }
@@ -907,7 +905,7 @@ async function openSettings() {
   } catch (_) {
     /* channel errors already surfaced via toast */
   }
-  spotifySettingsChannelId = getActiveChannelId();
+  spotifySettingsSourceId = 'spotify:a';
   populateSpotifyChannelSelect();
   syncGeneralSettingsUI();
   fetchSpotifyConfig();
@@ -916,6 +914,97 @@ async function openSettings() {
   fetchUsersList();
 }
 function closeSettings() { settingsOverlay.style.display = 'none'; }
+
+function isAddNodeOverlayOpen() {
+  return !!addNodeOverlay && !addNodeOverlay.hidden && addNodeOverlay.style.display !== 'none';
+}
+
+function showAddNodePane(pane) {
+  if (!addNodeOptionsPane || !addNodeSonosPane) return;
+  const target = pane || 'options';
+  addNodeOptionsPane.hidden = target !== 'options';
+  addNodeSonosPane.hidden = target !== 'sonos';
+}
+
+function openAddNodeOverlay() {
+  if (!addNodeOverlay) return;
+  addNodeOverlay.style.display = 'flex';
+  addNodeOverlay.hidden = false;
+  addNodeOverlay.setAttribute('aria-hidden', 'false');
+  if (addNodeToggle) addNodeToggle.setAttribute('aria-expanded', 'true');
+  showAddNodePane('options');
+}
+
+function closeAddNodeOverlay() {
+  if (!addNodeOverlay) return;
+  addNodeOverlay.style.display = 'none';
+  addNodeOverlay.hidden = true;
+  addNodeOverlay.setAttribute('aria-hidden', 'true');
+  if (addNodeToggle) addNodeToggle.setAttribute('aria-expanded', 'false');
+}
+
+async function scanSonosSpeakers() {
+  if (!addNodeSonosList || !addNodeSonosStatus) return;
+  addNodeSonosList.innerHTML = '';
+  addNodeSonosStatus.textContent = 'Scanning for Sonos speakers…';
+  if (addNodeSonosSpinner) addNodeSonosSpinner.style.display = 'block';
+  if (addNodeSonosScanBtn) addNodeSonosScanBtn.disabled = true;
+  try {
+    const res = await fetch('/api/sonos/discover');
+    await ensureOk(res);
+    const data = await res.json();
+    const devices = Array.isArray(data?.devices) ? data.devices : [];
+    if (!devices.length) {
+      addNodeSonosStatus.textContent = 'No Sonos speakers found.';
+      addNodeSonosList.innerHTML = '<div class="muted">Make sure your Sonos speakers are on the same network as this controller.</div>';
+      return;
+    }
+    addNodeSonosStatus.textContent = `Found ${devices.length} speaker${devices.length === 1 ? '' : 's'}.`;
+    devices.forEach(item => {
+      if (!item || !item.url || typeof item.url !== 'string' || !item.url.startsWith('sonos://')) return;
+      const row = document.createElement('div');
+      row.className = 'panel discover-row';
+      row.style.marginBottom = '8px';
+      const title = document.createElement('div');
+      title.innerHTML = `<strong>${item.host || 'Sonos speaker'}</strong> <span class="muted">${item.url}</span><div class="label">Sonos speaker</div>`;
+      const nameInput = document.createElement('input');
+      nameInput.style.marginTop = '6px';
+      const existing = (typeof findNodeByFingerprint === 'function') ? findNodeByFingerprint(item.fingerprint) : null;
+      if (existing) {
+        nameInput.value = existing.name || existing.id || (item.host || 'Sonos speaker');
+        nameInput.disabled = true;
+      } else {
+        nameInput.value = item.host || 'Sonos speaker';
+      }
+      const btn = document.createElement('button');
+      btn.className = 'small-btn';
+      btn.textContent = existing ? 'Relink node' : 'Register';
+      btn.style.marginTop = '6px';
+      btn.addEventListener('click', () => registerNodeWithName(
+        existing ? existing.name : nameInput.value,
+        item.url,
+        btn,
+        existing ? existing.id : undefined,
+        item.fingerprint,
+      ));
+      row.appendChild(title);
+      row.appendChild(nameInput);
+      if (existing) {
+        const hint = document.createElement('div');
+        hint.className = 'label';
+        hint.textContent = `Matches registered node “${existing.name || existing.id}”`;
+        row.appendChild(hint);
+      }
+      row.appendChild(btn);
+      addNodeSonosList.appendChild(row);
+    });
+  } catch (err) {
+    addNodeSonosStatus.textContent = `Failed to scan: ${err.message}`;
+  } finally {
+    if (addNodeSonosSpinner) addNodeSonosSpinner.style.display = 'none';
+    if (addNodeSonosScanBtn) addNodeSonosScanBtn.disabled = false;
+  }
+}
 
 function openDiscover() {
   discoverOverlay.style.display = 'flex';
@@ -944,10 +1033,69 @@ if (spInitVol) {
 }
 if (spotifyChannelSelect) {
   spotifyChannelSelect.addEventListener('change', () => {
-    spotifySettingsChannelId = spotifyChannelSelect.value || null;
+    spotifySettingsSourceId = spotifyChannelSelect.value || null;
     fetchSpotifyConfig();
     fetchLibrespotStatus();
   });
+}
+
+function handleAddNodeOverlayClick(event) {
+  if (!addNodeOverlay || event.target !== addNodeOverlay) return;
+  closeAddNodeOverlay();
+}
+
+function handleAddNodeOverlayKeydown(event) {
+  if (event.key !== 'Escape') return;
+  if (!isAddNodeOverlayOpen()) return;
+  event.preventDefault();
+  closeAddNodeOverlay();
+}
+
+if (addNodeOverlay) {
+  addNodeOverlay.addEventListener('click', handleAddNodeOverlayClick);
+}
+if (addNodeCloseBtn) {
+  addNodeCloseBtn.addEventListener('click', closeAddNodeOverlay);
+}
+document.addEventListener('keydown', handleAddNodeOverlayKeydown, true);
+
+if (addNodeToggle) {
+  addNodeToggle.addEventListener('click', evt => {
+    evt.preventDefault();
+    evt.stopPropagation();
+    openAddNodeOverlay();
+  });
+}
+
+if (addNodeBackBtn) {
+  addNodeBackBtn.addEventListener('click', () => showAddNodePane('options'));
+}
+if (addNodeOptionHardware) {
+  addNodeOptionHardware.addEventListener('click', () => {
+    closeAddNodeOverlay();
+    openDiscover();
+  });
+}
+if (addNodeOptionController) {
+  addNodeOptionController.addEventListener('click', async () => {
+    closeAddNodeOverlay();
+    await registerControllerNode(addNodeOptionController);
+  });
+}
+if (addNodeOptionWeb) {
+  addNodeOptionWeb.addEventListener('click', () => {
+    closeAddNodeOverlay();
+    window.open('/web-node', '_blank');
+  });
+}
+if (addNodeOptionSonos) {
+  addNodeOptionSonos.addEventListener('click', async () => {
+    showAddNodePane('sonos');
+    await scanSonosSpeakers();
+  });
+}
+if (addNodeSonosScanBtn) {
+  addNodeSonosScanBtn.addEventListener('click', scanSonosSpeakers);
 }
 if (playerSaveServerNameBtn) {
   playerSaveServerNameBtn.addEventListener('click', saveServerName);
@@ -1063,42 +1211,6 @@ if (addUserForm) {
     }
   });
 }
-const handleAddNodeKey = evt => {
-  if (evt.key === 'Escape') {
-    setAddNodeMenuOpen(false);
-    addNodeToggle?.focus({ preventScroll: true });
-  }
-};
-if (addNodeToggle) {
-  addNodeToggle.addEventListener('click', evt => {
-    evt.stopPropagation();
-    const next = !addNodeContainer?.classList.contains('is-open');
-    setAddNodeMenuOpen(next);
-  });
-  addNodeToggle.addEventListener('keydown', handleAddNodeKey);
-}
-if (addNodeMenu) {
-  addNodeMenu.addEventListener('click', evt => evt.stopPropagation());
-  addNodeMenu.addEventListener('keydown', handleAddNodeKey);
-}
-if (addHardwareNodeBtn) {
-  addHardwareNodeBtn.addEventListener('click', () => {
-    setAddNodeMenuOpen(false);
-    openDiscover();
-  });
-}
-if (addControllerNodeBtn) {
-  addControllerNodeBtn.addEventListener('click', async () => {
-    setAddNodeMenuOpen(false);
-    await registerControllerNode(addControllerNodeBtn);
-  });
-}
-if (createWebNodeBtn) {
-  createWebNodeBtn.addEventListener('click', () => {
-    setAddNodeMenuOpen(false);
-    window.open('/web-node', '_blank');
-  });
-}
 if (playerVolumeInline) {
   playerVolumeInline.addEventListener('click', evt => evt.stopPropagation());
 }
@@ -1124,9 +1236,6 @@ if (masterVolume) {
 document.addEventListener('click', evt => {
   if (playerVolumeInline && !playerVolumeInline.contains(evt.target)) {
     setVolumeSliderOpen(false);
-  }
-  if (addNodeContainer && !addNodeContainer.contains(evt.target)) {
-    setAddNodeMenuOpen(false);
   }
 });
 if (playlistOverlay) {

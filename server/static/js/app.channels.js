@@ -2,7 +2,7 @@ function resetChannelUiState() {
   channelsCache = [];
   activeChannelId = null;
   persistActiveChannelPreference(null);
-  spotifySettingsChannelId = null;
+  if (typeof spotifySettingsSourceId !== 'undefined') spotifySettingsSourceId = null;
   radioPlaybackState = null;
   channelPendingEdits.clear();
   channelFormRefs.clear();
@@ -52,9 +52,6 @@ async function refreshChannels(options = {}) {
         }
       }
       persistActiveChannelPreference(activeChannelId);
-      if (!channelsCache.some(ch => ch.id === spotifySettingsChannelId)) {
-        spotifySettingsChannelId = activeChannelId;
-      }
       renderPlayerCarousel();
       populateSpotifyChannelSelect();
       renderChannelsPanel();

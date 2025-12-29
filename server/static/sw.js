@@ -1,19 +1,22 @@
-const CACHE_VERSION = 'v20251203b';
+const CACHE_VERSION = 'v20251228a';
 const CACHE_NAME = `roomcast-shell-${CACHE_VERSION}`;
 const CACHE_ASSETS = [
   '/',
   '/static/app.css',
-  '/static/app.js',
   '/static/manifest.webmanifest',
   '/static/icons/icon-192.png',
   '/static/icons/icon-512.png'
 ];
-const NETWORK_FIRST_PATHS = new Set(['/', '/static/app.css', '/static/app.js']);
+const NETWORK_FIRST_PATHS = new Set(['/', '/static/app.css']);
 
 self.addEventListener('install', event => {
   event.waitUntil(
     caches.open(CACHE_NAME)
-      .then(cache => cache.addAll(CACHE_ASSETS))
+      .then(async cache => {
+        // cache.addAll() rejects the whole install if any single request fails (e.g. 404).
+        // Keep the SW install resilient by caching best-effort per asset.
+        await Promise.allSettled(CACHE_ASSETS.map(asset => cache.add(asset)));
+      })
       .then(() => self.skipWaiting())
   );
 });

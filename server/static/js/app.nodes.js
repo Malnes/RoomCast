@@ -27,16 +27,16 @@ async function fetchWebNodeRequests(options = {}) {
   }
 }
 
-async function fetchSpotifyConfig(targetChannelId = getSettingsChannelId()) {
-  if (!targetChannelId) {
+async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
+  if (!targetSourceId) {
     if (spotifyLinkStatus) {
-      spotifyLinkStatus.textContent = 'No channels available';
+      spotifyLinkStatus.textContent = 'No Spotify source selected';
       spotifyLinkStatus.className = 'status-pill warn';
     }
     return;
   }
   try {
-    const res = await fetch(withChannel('/api/config/spotify', targetChannelId));
+    const res = await fetch(`/api/config/spotify?source_id=${encodeURIComponent(targetSourceId)}`);
     await ensureOk(res);
     const cfg = await res.json();
     spName.value = cfg.device_name || 'RoomCast';
@@ -62,13 +62,13 @@ async function fetchSpotifyConfig(targetChannelId = getSettingsChannelId()) {
   }
 }
 
-async function fetchLibrespotStatus(targetChannelId = getSettingsChannelId()) {
-  if (!targetChannelId) {
-    if (librespotStatus) librespotStatus.innerText = 'Status: no channel selected';
+async function fetchLibrespotStatus(targetSourceId = getSettingsChannelId()) {
+  if (!targetSourceId) {
+    if (librespotStatus) librespotStatus.innerText = 'Status: no Spotify source selected';
     return;
   }
   try {
-    const res = await fetch(withChannel('/api/librespot/status', targetChannelId));
+    const res = await fetch(`/api/librespot/status?source_id=${encodeURIComponent(targetSourceId)}`);
     await ensureOk(res);
     const data = await res.json();
     librespotStatus.innerText = `Status: ${data.state || 'unknown'}${data.message ? ' – ' + data.message : ''}`;
@@ -215,10 +215,17 @@ async function setNodeMaxVolume(nodeId, percent, sliderEl) {
 }
 
 async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
-  const normalized = typeof channelId === 'string' ? channelId.trim() : '';
+  const normalized = typeof channelId === 'string' ? channelId.trim().toLowerCase() : '';
   const previous = selectEl?.dataset?.previousChannel ?? '';
   if (previous === normalized) return;
   if (selectEl) selectEl.disabled = true;
+  if (dotEl) {
+    if (normalized) {
+      setChannelDotConnecting(dotEl, normalized, true);
+    } else {
+      setChannelDotConnecting(dotEl, null, false);
+    }
+  }
   try {
     const res = await fetch(`/api/nodes/${nodeId}/channel`, {
       method: 'POST',
@@ -230,7 +237,13 @@ async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
     if (selectEl) {
       selectEl.dataset.previousChannel = normalized;
     }
-    updateChannelDotColor(dotEl, normalized || null);
+    if (dotEl) {
+      if (normalized) {
+        setChannelDotConnecting(dotEl, normalized, true);
+      } else {
+        setChannelDotConnecting(dotEl, null, false);
+      }
+    }
     await fetchNodes({ force: true });
   } catch (err) {
     showError(`Failed to update channel: ${err.message}`);
@@ -238,7 +251,7 @@ async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
       selectEl.value = previous;
       selectEl.dataset.previousChannel = previous;
     }
-    if (dotEl) updateChannelDotColor(dotEl, previous || null);
+    if (dotEl) setChannelDotConnecting(dotEl, previous || null, false);
     throw err;
   } finally {
     if (selectEl) selectEl.disabled = false;

@@ -6,13 +6,21 @@ const persistentAlertEl = document.getElementById('persistent-alert');
 const persistentAlertMessage = document.getElementById('persistent-alert-message');
 const persistentAlertAction = document.getElementById('persistent-alert-action');
 const persistentAlertDismiss = document.getElementById('persistent-alert-dismiss');
-const addNodeContainer = document.querySelector('[data-add-node-container]');
 const addNodeToggle = document.getElementById('add-node-button');
-const addNodeMenu = document.getElementById('add-node-menu');
-const addHardwareNodeBtn = document.getElementById('add-hardware-node');
-const addControllerNodeBtn = document.getElementById('add-controller-node');
-const createWebNodeBtn = document.getElementById('create-web-node');
 const reviewWebNodeRequestsBtn = document.getElementById('review-web-node-requests');
+const addNodeOverlay = document.getElementById('add-node-overlay');
+const addNodeCloseBtn = document.getElementById('add-node-close');
+const addNodeOptionsPane = document.getElementById('add-node-options');
+const addNodeSonosPane = document.getElementById('add-node-sonos');
+const addNodeBackBtn = document.getElementById('add-node-back');
+const addNodeOptionHardware = document.getElementById('add-node-option-hardware');
+const addNodeOptionController = document.getElementById('add-node-option-controller');
+const addNodeOptionWeb = document.getElementById('add-node-option-web');
+const addNodeOptionSonos = document.getElementById('add-node-option-sonos');
+const addNodeSonosScanBtn = document.getElementById('add-node-sonos-scan');
+const addNodeSonosSpinner = document.getElementById('add-node-sonos-spinner');
+const addNodeSonosStatus = document.getElementById('add-node-sonos-status');
+const addNodeSonosList = document.getElementById('add-node-sonos-list');
 const saveSpotifyBtn = document.getElementById('save-spotify');
 const spClientId = document.getElementById('sp-client-id');
 const spClientSecret = document.getElementById('sp-client-secret');
@@ -232,7 +240,9 @@ let discoverResultsCount = 0;
 let channelsCache = [];
 let activeChannelId = readStoredActiveChannelId();
 let channelFetchPromise = null;
-let spotifySettingsChannelId = null;
+let spotifySettingsSourceId = null;
+let spotifySourcesCache = [];
+let spotifySourcesFetchPromise = null;
 const channelPendingEdits = new Map();
 const channelFormRefs = new Map();
 let nodeSettingsModal = null;
@@ -1539,7 +1549,9 @@ function withChannel(path, channelId = getActiveChannelId()) {
 
 function getChannelById(channelId) {
   if (!channelId) return null;
-  return channelsCache.find(ch => ch.id === channelId) || null;
+  const normalized = String(channelId).trim().toLowerCase();
+  if (!normalized) return null;
+  return channelsCache.find(ch => String(ch?.id || '').trim().toLowerCase() === normalized) || null;
 }
 
 function isChannelEnabled(channel) {
@@ -1549,6 +1561,11 @@ function isChannelEnabled(channel) {
 function isRadioChannel(channel) {
   if (!channel) return false;
   return (channel.source || '').toLowerCase() === 'radio';
+}
+
+function isSpotifyChannel(channel) {
+  if (!channel) return false;
+  return (channel.source || '').toLowerCase() === 'spotify';
 }
 
 function getRadioState(channel) {
@@ -1635,7 +1652,18 @@ function resolveNodeChannelId(node) {
 function updateChannelDotColor(target, channelId) {
   if (!target) return;
   const color = getChannelAccentColor(channelId) || '#94a3b8';
+  target.style.setProperty('--node-channel-accent', color);
   target.style.background = color;
+}
+
+function setChannelDotConnecting(target, channelId, connecting) {
+  if (!target) return;
+  updateChannelDotColor(target, channelId);
+  if (connecting) {
+    target.classList.add('is-connecting');
+  } else {
+    target.classList.remove('is-connecting');
+  }
 }
 
 function getActiveChannelId() {
@@ -2027,37 +2055,66 @@ function handleCarouselKeydown(event) {
   }
 }
 
+async function refreshSpotifySources() {
+  if (spotifySourcesFetchPromise) return spotifySourcesFetchPromise;
+  spotifySourcesFetchPromise = (async () => {
+    try {
+      const res = await fetch('/api/sources');
+      await ensureOk(res);
+      const data = await res.json();
+      spotifySourcesCache = Array.isArray(data?.sources) ? data.sources : [];
+      return spotifySourcesCache;
+    } catch (_) {
+      spotifySourcesCache = [];
+      return spotifySourcesCache;
+    } finally {
+      spotifySourcesFetchPromise = null;
+    }
+  })();
+  return spotifySourcesFetchPromise;
+}
+
 function populateSpotifyChannelSelect() {
+  // Historical name; now selects Spotify source instances (A/B).
   if (!spotifyChannelSelect) return;
   spotifyChannelSelect.innerHTML = '';
-  if (!channelsCache.length) {
+
+  const sources = Array.isArray(spotifySourcesCache) ? spotifySourcesCache : [];
+  if (!sources.length) {
     const option = document.createElement('option');
     option.value = '';
-    option.textContent = 'No channels available';
+    option.textContent = 'Loading sources…';
     spotifyChannelSelect.appendChild(option);
     spotifyChannelSelect.disabled = true;
+    // Fire and forget; caller may call populate again later.
+    refreshSpotifySources().then(() => populateSpotifyChannelSelect()).catch(() => {});
     return;
   }
+
   spotifyChannelSelect.disabled = false;
-  channelsCache.forEach(channel => {
+  sources.forEach(source => {
+    if (!source?.id) return;
     const option = document.createElement('option');
-    option.value = channel.id;
-    option.textContent = channel.name || channel.id;
+    option.value = source.id;
+    option.textContent = source.name || source.id;
     spotifyChannelSelect.appendChild(option);
   });
+
   const resolved = getSettingsChannelId();
   if (resolved) spotifyChannelSelect.value = resolved;
 }
 
 function getSettingsChannelId() {
-  if (spotifySettingsChannelId && channelsCache.some(ch => ch.id === spotifySettingsChannelId)) {
-    return spotifySettingsChannelId;
+  // Historical name; returns selected Spotify source id.
+  const sources = Array.isArray(spotifySourcesCache) ? spotifySourcesCache : [];
+  if (spotifySettingsSourceId && sources.some(src => src.id === spotifySettingsSourceId)) {
+    return spotifySettingsSourceId;
   }
-  spotifySettingsChannelId = getActiveChannelId();
-  if (spotifyChannelSelect && spotifySettingsChannelId) {
-    spotifyChannelSelect.value = spotifySettingsChannelId;
+  spotifySettingsSourceId = sources[0]?.id || 'spotify:a';
+  if (spotifyChannelSelect && spotifySettingsSourceId) {
+    spotifyChannelSelect.value = spotifySettingsSourceId;
   }
-  return spotifySettingsChannelId;
+  return spotifySettingsSourceId;
 }
 
 function renderChannelsPanel() {
@@ -2075,6 +2132,8 @@ function renderChannelsPanel() {
       : channel.name || '';
     const hasPendingColor = Object.prototype.hasOwnProperty.call(pending, 'color');
     const colorValue = hasPendingColor ? pending.color : channel.color;
+    const hasPendingSourceRef = Object.prototype.hasOwnProperty.call(pending, 'source_ref');
+    const sourceRefValue = hasPendingSourceRef ? pending.source_ref : channel.source_ref;
     const enabled = isChannelEnabled(channel);
 
     const card = document.createElement('div');
@@ -2111,6 +2170,36 @@ function renderChannelsPanel() {
     colorGroup.appendChild(colorLabel);
     colorGroup.appendChild(colorInputs);
     header.appendChild(colorGroup);
+
+    const sourceGroup = document.createElement('div');
+    const sourceLabel = document.createElement('label');
+    sourceLabel.textContent = 'Source';
+    const sourceSelect = document.createElement('select');
+    sourceSelect.setAttribute('aria-label', `Select source for ${nameValue || channel.id}`);
+
+    const optionRadio = document.createElement('option');
+    optionRadio.value = 'radio';
+    optionRadio.textContent = 'Radio';
+    const optionA = document.createElement('option');
+    optionA.value = 'spotify:a';
+    optionA.textContent = 'Spotify A';
+    const optionB = document.createElement('option');
+    optionB.value = 'spotify:b';
+    optionB.textContent = 'Spotify B';
+    sourceSelect.appendChild(optionRadio);
+    sourceSelect.appendChild(optionA);
+    sourceSelect.appendChild(optionB);
+
+    const baseSource = (channel.source || '').trim().toLowerCase();
+    const baseRef = (sourceRefValue || '').trim().toLowerCase();
+    const resolvedSelection = (baseSource === 'radio' || baseRef.startsWith('radio'))
+      ? 'radio'
+      : (baseRef === 'spotify:b' ? 'spotify:b' : 'spotify:a');
+    sourceSelect.value = resolvedSelection;
+
+    sourceGroup.appendChild(sourceLabel);
+    sourceGroup.appendChild(sourceSelect);
+    header.appendChild(sourceGroup);
 
     card.appendChild(header);
 
@@ -2166,6 +2255,7 @@ function renderChannelsPanel() {
       nameInput,
       colorPicker,
       colorTextInput: colorText,
+      sourceSelect,
       saveButton: saveBtn,
       statusEl: status,
       availabilityToggle,
@@ -2185,6 +2275,7 @@ function renderChannelsPanel() {
       }
       updateChannelCardState(channel.id);
     });
+    sourceSelect.addEventListener('change', () => updateChannelCardState(channel.id));
     availabilityToggle.addEventListener('change', () => handleChannelAvailabilityChange(channel.id, availabilityToggle));
     saveBtn.addEventListener('click', () => saveChannelChanges(channel.id));
 
@@ -2225,6 +2316,22 @@ function updateChannelCardState(channelId) {
   if (nextColor !== baseColor) {
     pending.color = nextColor;
     hasDiff = true;
+  }
+
+  if (refs.sourceSelect && !refs.sourceSelect.disabled) {
+    const selected = (refs.sourceSelect.value || '').trim().toLowerCase();
+    const normalizedSelected = selected === 'radio'
+      ? 'radio'
+      : (selected === 'spotify:b' ? 'spotify:b' : 'spotify:a');
+    const baseSource = (base.source || '').trim().toLowerCase();
+    const baseRef = (base.source_ref || '').trim().toLowerCase();
+    const normalizedBase = (baseSource === 'radio' || baseRef.startsWith('radio'))
+      ? 'radio'
+      : (baseRef === 'spotify:b' ? 'spotify:b' : 'spotify:a');
+    if (normalizedSelected !== normalizedBase) {
+      pending.source_ref = normalizedSelected;
+      hasDiff = true;
+    }
   }
   if (hasDiff) {
     channelPendingEdits.set(channelId, pending);
