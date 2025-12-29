@@ -4,6 +4,9 @@ async function fetchNodes(options = {}) {
     const res = await fetch('/api/nodes');
     await ensureOk(res);
     const data = await res.json();
+    if (typeof setNodeSections === 'function') {
+      setNodeSections(Array.isArray(data.sections) ? data.sections : []);
+    }
     renderNodes(data.nodes || [], options);
   } catch (err) {
     showError(`Failed to load nodes: ${err.message}`);
@@ -253,6 +256,78 @@ async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
     }
     if (dotEl) setChannelDotConnecting(dotEl, previous || null, false);
     throw err;
+  } finally {
+    if (selectEl) selectEl.disabled = false;
+  }
+}
+
+async function createNodeSection(name, btn, inputEl) {
+  const sectionName = typeof name === 'string' ? name.trim() : '';
+  if (!sectionName) {
+    showError('Section name required');
+    return;
+  }
+  if (btn) btn.disabled = true;
+  if (inputEl) inputEl.disabled = true;
+  try {
+    const res = await fetch('/api/sections', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: sectionName }),
+    });
+    await ensureOk(res);
+    showSuccess('Section created');
+    await fetchNodes({ force: true });
+  } catch (err) {
+    showError(`Failed to create section: ${err.message}`);
+  } finally {
+    if (btn) btn.disabled = false;
+    if (inputEl) inputEl.disabled = false;
+  }
+}
+
+async function reorderNodeSections(sectionIds) {
+  const ids = Array.isArray(sectionIds) ? sectionIds.filter(id => typeof id === 'string' && id) : [];
+  if (!ids.length) return;
+  try {
+    const res = await fetch('/api/sections/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ section_ids: ids }),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    if (typeof setNodeSections === 'function' && Array.isArray(data.sections)) {
+      setNodeSections(data.sections);
+    }
+    showSuccess('Sections reordered');
+    await fetchNodes({ force: true });
+  } catch (err) {
+    showError(`Failed to reorder sections: ${err.message}`);
+  }
+}
+
+async function setNodeSection(nodeId, sectionId, selectEl) {
+  const normalized = typeof sectionId === 'string' ? sectionId.trim() : '';
+  const previous = selectEl?.dataset?.previousSection ?? '';
+  if (previous === normalized) return;
+  if (selectEl) selectEl.disabled = true;
+  try {
+    const res = await fetch(`/api/nodes/${nodeId}/section`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ section_id: normalized || null }),
+    });
+    await ensureOk(res);
+    showSuccess('Section updated');
+    if (selectEl) selectEl.dataset.previousSection = normalized;
+    await fetchNodes({ force: true });
+  } catch (err) {
+    showError(`Failed to update section: ${err.message}`);
+    if (selectEl) {
+      selectEl.value = previous;
+      selectEl.dataset.previousSection = previous;
+    }
   } finally {
     if (selectEl) selectEl.disabled = false;
   }

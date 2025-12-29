@@ -1608,6 +1608,9 @@ function flushPendingNodeVolumeUpdate(nodeId) {
 }
 
 let nodesCache = [];
+let nodeSectionsCache = [];
+let nodeSectionsEditMode = false;
+const nodeSectionCollapsed = new Map();
 const nodeVolumeSliderRefs = new Map();
 const nodeVolumeUpdateTimers = new Map();
 const NODE_VOLUME_PUSH_DEBOUNCE_MS = 150;
@@ -1643,6 +1646,27 @@ function persistEqSkinPreference(value) {
   }
 }
 let eqSkin = loadEqSkinPreference();
+
+function setNodeSections(sections) {
+  nodeSectionsCache = Array.isArray(sections) ? sections.filter(s => s && typeof s === 'object') : [];
+}
+
+function getNodeSections() {
+  return Array.isArray(nodeSectionsCache) ? nodeSectionsCache : [];
+}
+
+function isNodeSectionEditMode() {
+  return nodeSectionsEditMode === true;
+}
+
+function toggleNodeSectionEditMode(force) {
+  if (typeof force === 'boolean') {
+    nodeSectionsEditMode = force;
+  } else {
+    nodeSectionsEditMode = !nodeSectionsEditMode;
+  }
+  renderNodes(nodesCache, { force: true });
+}
 const EQ_ICON_SVG = `
   <svg viewBox="0 0 24 24" aria-hidden="true" role="img" focusable="false" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
     <line x1="7" y1="3" x2="7" y2="9"></line>
@@ -1800,6 +1824,9 @@ function handleNodesSocketMessage(event) {
     return;
   }
   if (payload?.type === 'nodes' && Array.isArray(payload.nodes)) {
+    if (Array.isArray(payload.sections)) {
+      setNodeSections(payload.sections);
+    }
     renderNodes(payload.nodes);
     return;
   }
@@ -2087,6 +2114,110 @@ function renderNodeIdentityBadge(node) {
   return null;
 }
 
+function resolveNodeSectionId(node, sections) {
+  const sid = typeof node?.section_id === 'string' ? node.section_id : '';
+  if (sid && Array.isArray(sections) && sections.some(s => s?.id === sid)) return sid;
+  const fallback = Array.isArray(sections) && sections.length ? sections[0].id : null;
+  return fallback || null;
+}
+
+function createNodeSectionSelector(node, options = {}) {
+  const sections = Array.isArray(options.sections) ? options.sections : getNodeSections();
+  if (!sections.length || !node) return null;
+  const wrapper = document.createElement('div');
+  wrapper.className = 'node-section-selector';
+  const select = document.createElement('select');
+  select.className = 'node-section-select';
+  select.setAttribute('aria-label', `Section for ${node.name || 'node'}`);
+  sections.forEach(section => {
+    if (!section?.id) return;
+    const option = document.createElement('option');
+    option.value = section.id;
+    option.textContent = section.name || 'Section';
+    select.appendChild(option);
+  });
+  const resolvedId = resolveNodeSectionId(node, sections);
+  if (resolvedId) {
+    select.value = resolvedId;
+  }
+  select.dataset.previousSection = select.value;
+  select.disabled = options.disabled === true;
+  select.addEventListener('change', async () => {
+    if (typeof setNodeSection !== 'function') return;
+    await setNodeSection(node.id, select.value, select);
+  });
+  wrapper.appendChild(select);
+  return wrapper;
+}
+
+function createSectionHeader(section, options = {}) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'node-section-header';
+  const title = document.createElement('span');
+  title.className = 'node-section-title';
+  title.textContent = section?.name || 'Section';
+  btn.appendChild(title);
+  const meta = document.createElement('span');
+  meta.className = 'node-section-meta';
+  const count = typeof options.count === 'number' ? options.count : 0;
+  meta.textContent = `${count}`;
+  btn.appendChild(meta);
+  const icon = document.createElement('span');
+  icon.className = 'node-section-icon';
+  icon.textContent = options.collapsed ? '▸' : '▾';
+  btn.appendChild(icon);
+
+  if (options.editMode) {
+    const controls = document.createElement('span');
+    controls.className = 'node-section-controls';
+
+    const up = document.createElement('button');
+    up.type = 'button';
+    up.className = 'node-section-control-btn';
+    up.textContent = '↑';
+    up.disabled = options.index === 0;
+    up.setAttribute('aria-label', `Move ${section?.name || 'section'} up`);
+    up.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof reorderNodeSections !== 'function') return;
+      const order = Array.isArray(options.sectionOrder) ? options.sectionOrder.slice() : [];
+      const idx = options.index;
+      if (idx <= 0) return;
+      const tmp = order[idx - 1];
+      order[idx - 1] = order[idx];
+      order[idx] = tmp;
+      await reorderNodeSections(order);
+    });
+
+    const down = document.createElement('button');
+    down.type = 'button';
+    down.className = 'node-section-control-btn';
+    down.textContent = '↓';
+    down.disabled = typeof options.total === 'number' ? options.index >= options.total - 1 : false;
+    down.setAttribute('aria-label', `Move ${section?.name || 'section'} down`);
+    down.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (typeof reorderNodeSections !== 'function') return;
+      const order = Array.isArray(options.sectionOrder) ? options.sectionOrder.slice() : [];
+      const idx = options.index;
+      if (typeof options.total !== 'number' || idx >= options.total - 1) return;
+      const tmp = order[idx + 1];
+      order[idx + 1] = order[idx];
+      order[idx] = tmp;
+      await reorderNodeSections(order);
+    });
+
+    controls.appendChild(up);
+    controls.appendChild(down);
+    btn.appendChild(controls);
+  }
+
+  return btn;
+}
+
 function commitRenderNodes(nodes) {
   nodesEl.innerHTML = '';
   nodeVolumeSliderRefs.clear();
@@ -2096,7 +2227,76 @@ function commitRenderNodes(nodes) {
     refreshNodeSettingsModal();
     return;
   }
+
+  const sections = getNodeSections();
+  const editMode = isNodeSectionEditMode();
+  const resolvedSections = sections.length ? sections : [{ id: '__default__', name: 'Nodes' }];
+  const sectionOrder = resolvedSections.map(s => s.id).filter(Boolean);
+  const nodesBySection = new Map();
   nodes.forEach(n => {
+    const sid = resolveNodeSectionId(n, resolvedSections) || '__default__';
+    if (!nodesBySection.has(sid)) nodesBySection.set(sid, []);
+    nodesBySection.get(sid).push(n);
+  });
+
+  resolvedSections.forEach((section, sectionIndex) => {
+    const sectionId = section?.id || '__default__';
+    const sectionNodes = nodesBySection.get(sectionId) || [];
+    if (!sectionNodes.length && !editMode) return;
+
+    const collapsed = nodeSectionCollapsed.get(sectionId) === true;
+    const group = document.createElement('div');
+    group.className = 'node-section-group';
+
+    const header = createSectionHeader(section, {
+      count: sectionNodes.length,
+      collapsed,
+      editMode,
+      index: sectionIndex,
+      total: resolvedSections.length,
+      sectionOrder,
+    });
+
+    let longPressTimer = null;
+    let longPressFired = false;
+    header.addEventListener('pointerdown', () => {
+      longPressFired = false;
+      if (longPressTimer) clearTimeout(longPressTimer);
+      longPressTimer = setTimeout(() => {
+        longPressFired = true;
+        toggleNodeSectionEditMode();
+      }, 650);
+    });
+    const cancelLongPress = () => {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    };
+    header.addEventListener('pointerup', cancelLongPress);
+    header.addEventListener('pointercancel', cancelLongPress);
+    header.addEventListener('pointerleave', cancelLongPress);
+    header.addEventListener('click', (event) => {
+      if (longPressFired) {
+        event.preventDefault();
+        event.stopPropagation();
+        longPressFired = false;
+        return;
+      }
+      const next = !(nodeSectionCollapsed.get(sectionId) === true);
+      nodeSectionCollapsed.set(sectionId, next);
+      renderNodes(nodesCache, { force: true });
+    });
+
+    group.appendChild(header);
+
+    const body = document.createElement('div');
+    body.className = 'node-section-body';
+    body.hidden = collapsed;
+    group.appendChild(body);
+    nodesEl.appendChild(group);
+
+    sectionNodes.forEach(n => {
     hydrateEqFromNode(n);
     const wrapper = document.createElement('div');
     wrapper.className = 'panel';
@@ -2154,6 +2354,13 @@ function commitRenderNodes(nodes) {
         openEqModal(n.id, n.name);
       });
       gearWrap.insertBefore(eqBtn, gearBtn);
+    }
+
+    if (editMode) {
+      const sectionSelector = createNodeSectionSelector(n, { sections: resolvedSections, disabled: false });
+      if (sectionSelector) {
+        gearWrap.insertBefore(sectionSelector, eqBtn || gearBtn);
+      }
     }
     const channelSelector = createNodeChannelSelector(n, { disabled: disableNodeControls });
     if (channelSelector) {
@@ -2292,7 +2499,8 @@ function commitRenderNodes(nodes) {
     }
     wrapper.appendChild(actions);
 
-    nodesEl.appendChild(wrapper);
+    body.appendChild(wrapper);
+    });
   });
 
   const nodeIds = new Set(nodes.map(n => n.id));

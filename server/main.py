@@ -88,6 +88,21 @@ NODE_TERMINAL_TOKEN_TTL = int(os.getenv("NODE_TERMINAL_TOKEN_TTL", "60"))
 NODE_TERMINAL_MAX_DURATION = int(os.getenv("NODE_TERMINAL_MAX_DURATION", "900"))
 NODE_TERMINAL_STRICT_HOST_KEY = os.getenv("NODE_TERMINAL_STRICT_HOST_KEY", "0").lower() in {"1", "true", "yes"}
 USERS_PATH = Path(os.getenv("USERS_PATH", "/config/users.json"))
+
+
+def _normalize_section_name(name: Any) -> str:
+    value = (name or "")
+    if not isinstance(value, str):
+        value = str(value)
+    value = value.strip()
+    return value
+
+
+def _public_section(section: dict) -> dict:
+    return {
+        "id": section.get("id"),
+        "name": section.get("name"),
+    }
 USERS_PATH.parent.mkdir(parents=True, exist_ok=True)
 SERVER_DEFAULT_NAME = os.getenv("ROOMCAST_SERVER_NAME", "RoomCast").strip() or "RoomCast"
 LOCAL_AGENT_NAME_SUFFIX = os.getenv("LOCAL_AGENT_NAME_SUFFIX", " (local)").strip() or " (local)"
@@ -1425,6 +1440,7 @@ async def service_worker() -> FileResponse:
     return response
 
 nodes: Dict[str, dict] = {}
+sections: list[dict] = []
 browser_ws: Dict[str, WebSocket] = {}
 node_watchers: set[WebSocket] = set()
 webrtc_relay: Optional[WebAudioRelay] = None
@@ -1451,6 +1467,29 @@ pending_web_node_requests: Dict[str, dict] = {}
 
 sonos_connection_task: Optional[asyncio.Task] = None
 sonos_reconcile_lock = asyncio.Lock()
+
+
+def public_sections() -> list[dict]:
+    return [_public_section(section) for section in sections]
+
+
+def _find_section(section_id: Optional[str]) -> Optional[dict]:
+    if not section_id:
+        return None
+    for section in sections:
+        if section.get("id") == section_id:
+            return section
+    return None
+
+
+def _ensure_default_section() -> Optional[str]:
+    """Ensure at least one section exists; return its id or None."""
+    global sections
+    if sections:
+        return sections[0].get("id")
+    default_id = str(uuid.uuid4())
+    sections = [{"id": default_id, "name": "Nodes", "created_at": int(time.time()), "updated_at": int(time.time())}]
+    return default_id
 
 
 def _mark_radio_assignments_dirty() -> None:
@@ -1636,6 +1675,7 @@ def public_node(node: dict) -> dict:
     data["max_volume_percent"] = _get_node_max_volume(node)
     data["channel_id"] = resolve_node_channel_id(node)
     data["stereo_mode"] = _normalize_stereo_mode(node.get("stereo_mode"))
+    data["section_id"] = node.get("section_id")
     if node.get("wifi"):
         data["wifi"] = node.get("wifi")
     if node.get("type") == "sonos":
@@ -2163,7 +2203,11 @@ async def _broadcast_to_node_watchers(payload: dict) -> None:
 
 
 async def broadcast_nodes() -> None:
-    await _broadcast_to_node_watchers({"type": "nodes", "nodes": public_nodes()})
+    await _broadcast_to_node_watchers({
+        "type": "nodes",
+        "sections": public_sections(),
+        "nodes": public_nodes(),
+    })
 
 
 async def _broadcast_web_node_request_event(
@@ -3571,13 +3615,44 @@ async def _handle_webrtc_session_closed(node_id: str) -> None:
 
 
 def load_nodes() -> None:
-    global nodes
+    global nodes, sections
     if not NODES_PATH.exists():
         nodes = {}
+        sections = []
         return
     try:
-        data = json.loads(NODES_PATH.read_text())
+        raw = json.loads(NODES_PATH.read_text())
+        if isinstance(raw, dict):
+            data = raw.get("nodes") or []
+            section_data = raw.get("sections") or []
+        elif isinstance(raw, list):
+            data = raw
+            section_data = []
+        else:
+            data = []
+            section_data = []
+
+        sections = []
+        seen_section_ids: set[str] = set()
+        if isinstance(section_data, list):
+            for entry in section_data:
+                if not isinstance(entry, dict):
+                    continue
+                sid = entry.get("id") or str(uuid.uuid4())
+                if sid in seen_section_ids:
+                    continue
+                name = _normalize_section_name(entry.get("name")) or "Section"
+                section = {
+                    "id": sid,
+                    "name": name,
+                    "created_at": entry.get("created_at") or int(time.time()),
+                    "updated_at": entry.get("updated_at") or int(time.time()),
+                }
+                sections.append(section)
+                seen_section_ids.add(sid)
+
         nodes = {}
+        default_section_id = _ensure_default_section() if data else None
         for item in data:
             item = dict(item)
             item.pop("pan", None)
@@ -3625,19 +3700,44 @@ def load_nodes() -> None:
                 item["channel_id"] = _select_initial_channel_id(item.get("channel_id"), fallback=False)
             else:
                 item["channel_id"] = _select_initial_channel_id(None, fallback=item.get("type") != "browser")
+
+            # Sections migration / normalization.
+            section_id = item.get("section_id")
+            if not section_id or not _find_section(section_id):
+                if default_section_id:
+                    item["section_id"] = default_section_id
+                else:
+                    item["section_id"] = None
             snapclient_id = (item.get("snapclient_id") or "").strip() or None
             item["snapclient_id"] = snapclient_id
             nodes[item["id"]] = item
     except Exception:
         nodes = {}
+        sections = []
 
 
 def save_nodes() -> None:
-    serialized = []
+    serialized_nodes = []
     for node in nodes.values():
         entry = {k: v for k, v in node.items() if k not in TRANSIENT_NODE_FIELDS}
-        serialized.append(entry)
-    NODES_PATH.write_text(json.dumps(serialized, indent=2))
+        serialized_nodes.append(entry)
+
+    serialized_sections = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        sid = section.get("id")
+        name = _normalize_section_name(section.get("name"))
+        if not sid or not name:
+            continue
+        serialized_sections.append({
+            "id": sid,
+            "name": name,
+            "created_at": section.get("created_at") or int(time.time()),
+            "updated_at": section.get("updated_at") or int(time.time()),
+        })
+
+    NODES_PATH.write_text(json.dumps({"sections": serialized_sections, "nodes": serialized_nodes}, indent=2))
 
 
 load_nodes()
@@ -5161,7 +5261,70 @@ async def _channel_idle_loop() -> None:
 
 @app.get("/api/nodes")
 async def list_nodes() -> dict:
-    return {"nodes": public_nodes()}
+    return {"sections": public_sections(), "nodes": public_nodes()}
+
+
+class CreateSectionPayload(BaseModel):
+    name: str
+
+
+class ReorderSectionsPayload(BaseModel):
+    section_ids: list[str]
+
+
+class SetNodeSectionPayload(BaseModel):
+    section_id: Optional[str] = None
+
+
+@app.post("/api/sections")
+async def create_section(payload: CreateSectionPayload) -> dict:
+    global sections
+    name = _normalize_section_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Section name required")
+    section = {
+        "id": str(uuid.uuid4()),
+        "name": name,
+        "created_at": int(time.time()),
+        "updated_at": int(time.time()),
+    }
+    sections.insert(0, section)
+    save_nodes()
+    await broadcast_nodes()
+    return {"section": _public_section(section), "sections": public_sections()}
+
+
+@app.post("/api/sections/reorder")
+async def reorder_sections(payload: ReorderSectionsPayload) -> dict:
+    global sections
+    requested = [sid for sid in (payload.section_ids or []) if isinstance(sid, str) and sid]
+    current_ids = [section.get("id") for section in sections if section.get("id")]
+    if not requested or set(requested) != set(current_ids) or len(requested) != len(current_ids):
+        raise HTTPException(status_code=400, detail="Invalid section order")
+    lookup = {section.get("id"): section for section in sections}
+    sections = [lookup[sid] for sid in requested if sid in lookup]
+    now = int(time.time())
+    for section in sections:
+        section["updated_at"] = now
+    save_nodes()
+    await broadcast_nodes()
+    return {"sections": public_sections()}
+
+
+@app.post("/api/nodes/{node_id}/section")
+async def set_node_section(node_id: str, payload: SetNodeSectionPayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+    section_id = (payload.section_id or "").strip() or None
+    if not section_id:
+        raise HTTPException(status_code=400, detail="Section id required")
+    if not _find_section(section_id):
+        raise HTTPException(status_code=404, detail="Section not found")
+    node["section_id"] = section_id
+    save_nodes()
+    await broadcast_nodes()
+    return {"result": {"id": node_id, "section_id": section_id}}
 
 
 @app.get("/api/streams/diagnostics")
@@ -5367,7 +5530,7 @@ async def nodes_ws(ws: WebSocket):
     await ws.accept()
     node_watchers.add(ws)
     try:
-        await ws.send_json({"type": "nodes", "nodes": public_nodes()})
+        await ws.send_json({"type": "nodes", "sections": public_sections(), "nodes": public_nodes()})
         await ws.send_json({"type": "web_node_requests", "requests": _pending_web_node_snapshots()})
         while True:
             await ws.receive_text()
