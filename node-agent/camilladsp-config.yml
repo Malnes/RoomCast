@@ -12,7 +12,24 @@ devices:
     channels: 2
     format: S16LE
 
+mixers:
+  stereo_mode:
+    channels:
+      in: 2
+      out: 2
+    mapping:
+      - dest: 0
+        sources:
+          - channel: __STEREO_DEST0_SRC__
+            gain: 0.0
+      - dest: 1
+        sources:
+          - channel: __STEREO_DEST1_SRC__
+            gain: 0.0
+
 pipeline:
+  - type: Mixer
+    name: stereo_mode
   - type: Filter
     names:
       - peq_stack_00

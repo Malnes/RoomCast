@@ -1668,6 +1668,29 @@ const ICON_CONTROLLER_NODE = `
     <path d="M5 10v9h14v-9"></path>
     <rect x="10" y="13" width="4" height="6" rx="1"></rect>
   </svg>`;
+const ICON_NETWORK_WIFI = `
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" role="img">
+    <path d="M5 12.5a10 10 0 0 1 14 0"></path>
+    <path d="M8.5 16a5.5 5.5 0 0 1 7 0"></path>
+    <circle cx="12" cy="19" r="1.2" fill="currentColor" stroke="none"></circle>
+  </svg>`;
+const ICON_NETWORK_ETHERNET = `
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" role="img">
+    <rect x="5" y="9" width="14" height="8" rx="2"></rect>
+    <path d="M9 13h0.01"></path>
+    <path d="M12 13h0.01"></path>
+    <path d="M15 13h0.01"></path>
+    <path d="M12 17v3"></path>
+  </svg>`;
+const ICON_NETWORK_SONOSNET = `
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" role="img">
+    <circle cx="6.5" cy="16" r="1.6" fill="currentColor" stroke="none"></circle>
+    <circle cx="12" cy="7" r="1.6" fill="currentColor" stroke="none"></circle>
+    <circle cx="17.5" cy="16" r="1.6" fill="currentColor" stroke="none"></circle>
+    <path d="M7.9 14.9L10.9 9.1"></path>
+    <path d="M13.1 9.1L16.1 14.9"></path>
+    <path d="M8.3 16h7.4"></path>
+  </svg>`;
 const ICON_VOLUME_ON = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M15 9a3 3 0 010 6"/></svg>`;
 const ICON_VOLUME_OFF = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M11 5L6 9H3v6h3l5 4z"/><path d="M19 9l-6 6"/><path d="M13 9l6 6"/></svg>`;
 const ICON_SHUFFLE = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3h4v4"/><path d="M4 20l16-16"/><path d="M4 4l5 5"/><path d="M15 15l5 5v-4"/></svg>`;
@@ -1982,13 +2005,43 @@ function renderNodeWifiIndicator(node) {
   for (let i = 0; i < 4; i += 1) {
     meter.appendChild(document.createElement('span'));
   }
-  const accentColor = getNodeChannelAccent(node) || DEFAULT_CHANNEL_COLOR;
+  const accentColor = getNodeChannelAccent(node) || '#94a3b8';
   const wifiColor = !online
     ? '#f87171'
     : (state ? accentColor : '#e2e8f0');
   meter.style.setProperty('--node-wifi-color', wifiColor);
   indicator.appendChild(meter);
   return indicator;
+}
+
+function renderSonosNetworkIcon(node) {
+  const info = node?.sonos_network;
+  if (!info || typeof info !== 'object') return null;
+
+  const transport = String(info.transport || '').toLowerCase();
+  let label = null;
+  let icon = null;
+
+  if (transport === 'ethernet') {
+    label = 'Ethernet';
+    icon = ICON_NETWORK_ETHERNET;
+  } else if (transport === 'sonosnet') {
+    label = 'SonosNet';
+    icon = ICON_NETWORK_SONOSNET;
+  } else if (transport === 'wifi' || transport === 'wireless') {
+    label = 'Wi-Fi';
+    icon = ICON_NETWORK_WIFI;
+  }
+
+  if (!label || !icon) return null;
+
+  const mode = typeof info.wifi_mode_string === 'string' ? info.wifi_mode_string.trim() : '';
+  const fullLabel = mode ? `Sonos network: ${label} (${mode})` : `Sonos network: ${label}`;
+  return createNodeTypeIcon({
+    icon,
+    label: fullLabel,
+    className: 'node-type-network',
+  });
 }
 
 function createNodeTypeIcon(options) {
@@ -2023,7 +2076,7 @@ function renderNodeIdentityBadge(node) {
     });
   }
   if (node.type === 'browser') {
-    const accent = getNodeChannelAccent(node) || DEFAULT_CHANNEL_COLOR;
+    const accent = getNodeChannelAccent(node) || '#94a3b8';
     return createNodeTypeIcon({
       icon: ICON_BROWSER_NODE,
       label: 'Browser node',
@@ -2106,9 +2159,15 @@ function commitRenderNodes(nodes) {
     if (channelSelector) {
       gearWrap.insertBefore(channelSelector, eqBtn || gearBtn);
     }
-    if (!isBrowser) {
+    if (!isBrowser && !isSonos) {
       const wifiIndicator = renderNodeWifiIndicator(n);
       title.appendChild(wifiIndicator);
+    }
+    if (isSonos) {
+      const netIcon = renderSonosNetworkIcon(n);
+      if (netIcon) {
+        title.appendChild(netIcon);
+      }
     }
     if (!isBrowser && !isSonos && !paired) {
       const pairPill = document.createElement('span');
@@ -2153,10 +2212,16 @@ function commitRenderNodes(nodes) {
       statusRow.appendChild(updatingPill);
     }
     if (isSonos && typeof n.connection_error === 'string' && n.connection_error.trim()) {
-      const errPill = document.createElement('span');
+      const errPill = document.createElement('button');
+      errPill.type = 'button';
       errPill.className = 'status-pill err';
       errPill.textContent = 'Error';
       errPill.title = n.connection_error.trim();
+      errPill.setAttribute('aria-label', `Show error details for ${n.name}`);
+      errPill.addEventListener('click', (event) => {
+        event.stopPropagation();
+        openNodeSettingsModal(n.id);
+      });
       statusRow.appendChild(errPill);
     }
     wrapper.appendChild(statusRow);
@@ -2181,7 +2246,7 @@ function commitRenderNodes(nodes) {
     volInput.value = Number.isFinite(parsedVolume) ? parsedVolume : 75;
     volInput.disabled = disableNodeControls;
     volInput.style.width = '100%';
-    const nodeVolumeColor = getNodeChannelAccent(n);
+    const nodeVolumeColor = getNodeChannelAccent(n) || '#94a3b8';
     applyRangeAccent(volInput, nodeVolumeColor);
     setRangeProgress(volInput, volInput.value, volInput.max || 100);
     let volumeMeta = null;
@@ -2249,7 +2314,7 @@ function refreshNodeVolumeAccents() {
     if (!slider) return;
     const node = nodeMap.get(nodeId);
     if (!node) return;
-    const color = getNodeChannelAccent(node);
+    const color = getNodeChannelAccent(node) || '#94a3b8';
     applyRangeAccent(slider, color);
     setRangeProgress(slider, slider.value, slider.max || 100);
   });

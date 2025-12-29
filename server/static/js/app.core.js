@@ -1606,8 +1606,9 @@ function getChannelAccentColor(channelId) {
 }
 
 function getNodeChannelAccent(node) {
-  if (!node) return DEFAULT_CHANNEL_COLOR;
+  if (!node) return null;
   const resolvedId = resolveNodeChannelId(node);
+  if (!resolvedId) return null;
   return getChannelAccentColor(resolvedId) || DEFAULT_CHANNEL_COLOR;
 }
 

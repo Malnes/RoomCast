@@ -3,6 +3,7 @@ import asyncio
 import ipaddress
 import logging
 import os
+import re
 import secrets
 import socket
 import string
@@ -71,7 +72,7 @@ TRANSIENT_NODE_FIELDS = {
     "sonos_stream_active",
     "sonos_stream_last_client",
 }
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.21").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.22").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))
@@ -209,11 +210,11 @@ SONOS_STREAM_BITRATE_KBPS = int(os.getenv("SONOS_STREAM_BITRATE_KBPS", "192"))
 
 # Sonos link health monitoring + reconnection.
 SONOS_CONNECTION_POLL_INTERVAL = float(os.getenv("SONOS_CONNECTION_POLL_INTERVAL", "5.0"))
-SONOS_STREAM_STALE_SECONDS = float(os.getenv("SONOS_STREAM_STALE_SECONDS", "18.0"))
-SONOS_CONNECT_GRACE_SECONDS = float(os.getenv("SONOS_CONNECT_GRACE_SECONDS", "12.0"))
+SONOS_STREAM_STALE_SECONDS = float(os.getenv("SONOS_STREAM_STALE_SECONDS", "90.0"))
+SONOS_CONNECT_GRACE_SECONDS = float(os.getenv("SONOS_CONNECT_GRACE_SECONDS", "30.0"))
 SONOS_RECONNECT_ATTEMPTS = int(os.getenv("SONOS_RECONNECT_ATTEMPTS", "2"))
 SONOS_RECONNECT_WAIT_FOR_STREAM_SECONDS = float(
-    os.getenv("SONOS_RECONNECT_WAIT_FOR_STREAM_SECONDS", "8.0")
+    os.getenv("SONOS_RECONNECT_WAIT_FOR_STREAM_SECONDS", "20.0")
 )
 
 # If SSDP multicast discovery is blocked, fall back to a bounded HTTP probe.
@@ -1062,6 +1063,10 @@ class NodeChannelPayload(BaseModel):
     channel_id: Optional[str] = Field(default=None, max_length=120)
 
 
+class NodeStereoModePayload(BaseModel):
+    mode: Literal["both", "left", "right"] = Field(default="both")
+
+
 class SpotifyConfig(BaseModel):
     device_name: str = Field(default="RoomCast")
     bitrate: int = Field(default=320, ge=96, le=320)
@@ -1624,12 +1629,15 @@ def public_node(node: dict) -> dict:
     data["fingerprint"] = node.get("fingerprint")
     data["max_volume_percent"] = _get_node_max_volume(node)
     data["channel_id"] = resolve_node_channel_id(node)
+    if node.get("type") == "agent":
+        data["stereo_mode"] = (node.get("stereo_mode") or "both")
     if node.get("wifi"):
         data["wifi"] = node.get("wifi")
     if node.get("type") == "sonos":
         data["connection_state"] = node.get("connection_state")
         data["connection_error"] = node.get("connection_error")
         data["sonos_connecting_since"] = node.get("sonos_connecting_since")
+        data["sonos_network"] = node.get("sonos_network")
     data["is_controller"] = bool(node.get("is_controller"))
     return data
 
@@ -2642,6 +2650,56 @@ async def _sonos_ping(ip: str) -> bool:
         return False
 
 
+def _parse_sonos_network_from_review(text: str) -> Optional[dict]:
+    """Best-effort parse of Sonos /support/review for network type.
+
+    Sonos does not reliably expose RSSI via supported UPnP APIs.
+    Some firmwares expose useful (but undocumented) diagnostics via
+    /support/review; we only use it to determine the transport type.
+    """
+
+    if not text:
+        return None
+
+    normalized = text.strip()
+    if not normalized:
+        return None
+
+    link_match = re.search(r"<Link>(\d+)</Link>", normalized)
+    speed_match = re.search(r"<Speed>(\d+)</Speed>", normalized)
+    try:
+        link = int(link_match.group(1)) if link_match else 0
+    except (TypeError, ValueError):
+        link = 0
+    try:
+        speed = int(speed_match.group(1)) if speed_match else 0
+    except (TypeError, ValueError):
+        speed = 0
+
+    wifi_mode_match = re.search(r"<WifiModeString>([^<]+)</WifiModeString>", normalized)
+    wifi_mode_string = (wifi_mode_match.group(1).strip() if wifi_mode_match else "")
+
+    if link == 1 and speed > 0:
+        transport = "ethernet"
+    elif wifi_mode_string:
+        upper = wifi_mode_string.upper()
+        if "SONOSNET" in upper:
+            transport = "sonosnet"
+        elif "STATION" in upper:
+            transport = "wifi"
+        else:
+            transport = "wireless"
+    else:
+        transport = "unknown"
+
+    return {
+        "transport": transport,
+        "wifi_mode_string": wifi_mode_string or None,
+        "ethernet_link": bool(link == 1),
+        "ethernet_speed": speed if speed > 0 else None,
+    }
+
+
 def _sonos_find_node_by_ip(ip: Optional[str]) -> Optional[dict]:
     if not ip:
         return None
@@ -2714,6 +2772,9 @@ def _sonos_stream_is_stale(node: dict, *, now: float) -> bool:
             return False
         last_get = node.get("sonos_last_stream_get_ts")
         if not isinstance(last_get, (int, float)):
+            last_head = node.get("sonos_last_stream_head_ts")
+            if isinstance(last_head, (int, float)):
+                return (now - float(last_head)) > SONOS_STREAM_STALE_SECONDS
             return True
         return (now - float(last_get)) > SONOS_STREAM_STALE_SECONDS
 
@@ -2723,6 +2784,9 @@ def _sonos_stream_is_stale(node: dict, *, now: float) -> bool:
     last_get = node.get("sonos_last_stream_get_ts")
     if isinstance(last_get, (int, float)):
         return (now - float(last_get)) > SONOS_STREAM_STALE_SECONDS
+    last_head = node.get("sonos_last_stream_head_ts")
+    if isinstance(last_head, (int, float)):
+        return (now - float(last_head)) > SONOS_STREAM_STALE_SECONDS
     # Assigned but never seen any stream pull: treat as stale.
     return True
 
@@ -4186,6 +4250,28 @@ async def set_node_max_volume(node_id: str, payload: VolumePayload) -> dict:
     return {"ok": True, "max_volume_percent": percent}
 
 
+@app.post("/api/nodes/{node_id}/stereo")
+async def set_node_stereo_mode(node_id: str, payload: NodeStereoModePayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") != "agent":
+        raise HTTPException(status_code=400, detail="Stereo mode is only supported for hardware nodes")
+    mode = (payload.mode or "both").strip().lower()
+    if mode not in {"both", "left", "right"}:
+        raise HTTPException(status_code=400, detail="Invalid stereo mode")
+    try:
+        await _call_agent(node, "/stereo", {"mode": mode})
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to apply stereo mode: {exc}") from exc
+    node["stereo_mode"] = mode
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True, "stereo_mode": mode}
+
+
 @app.post("/api/nodes/{node_id}/mute")
 async def set_node_mute(node_id: str, payload: dict = Body(...)) -> dict:
     node = nodes.get(node_id)
@@ -4462,6 +4548,24 @@ async def _refresh_all_agent_nodes() -> None:
             if reachable:
                 node["last_seen"] = now
                 node["offline_since"] = None
+
+                # Best-effort network type detection for UI (Wi-Fi / Ethernet / SonosNet).
+                # This relies on undocumented Sonos diagnostics and may vary by firmware.
+                last_diag = node.get("sonos_network_last_refresh")
+                should_refresh = not isinstance(last_diag, (int, float)) or (now - float(last_diag)) >= 60.0
+                if should_refresh:
+                    headers = {"User-Agent": SONOS_HTTP_USER_AGENT}
+                    try:
+                        async with httpx.AsyncClient(timeout=SONOS_CONTROL_TIMEOUT) as client:
+                            resp = await client.get(f"http://{ip}:1400/support/review", headers=headers)
+                        if resp.status_code == 200:
+                            parsed = _parse_sonos_network_from_review(resp.text)
+                            if parsed and parsed != node.get("sonos_network"):
+                                node["sonos_network"] = parsed
+                            node["sonos_network_last_refresh"] = now
+                    except Exception:
+                        # Never fail the refresh loop on diagnostics.
+                        node["sonos_network_last_refresh"] = now
             else:
                 if prev_online:
                     node["offline_since"] = now
@@ -5929,7 +6033,11 @@ async def spotify_callback(code: str, state: str):
 async def spotify_player_status(channel_id: Optional[str] = Query(default=None)) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
-    resp = await spotify_request("GET", "/me/player", token, resolved)
+    try:
+        resp = await spotify_request("GET", "/me/player", token, resolved)
+    except httpx.RequestError as exc:
+        # Network/DNS issues should not crash the app with an ASGI exception.
+        raise HTTPException(status_code=503, detail=f"Spotify API request failed: {exc}") from exc
     if resp.status_code == 204:
         snapshot = _public_player_snapshot(_get_player_snapshot(resolved))
         payload: dict = {"active": False}

@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.21")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.22")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -94,7 +94,14 @@ def _needs_camilla_schema_migration(content: str) -> bool:
     stripped = (content or "").strip()
     if not stripped:
         return True
-    markers = ["peq_stack_00", "names:", "- type: Filter"]
+    markers = [
+        "peq_stack_00",
+        "names:",
+        "- type: Filter",
+        "mixers:",
+        "stereo_mode:",
+        "- type: Mixer",
+    ]
     if any(marker not in stripped for marker in markers):
         return True
     if "control:" in stripped:
@@ -318,6 +325,7 @@ DEFAULT_AGENT_CONFIG = {
     "snapserver_port": SNAPCLIENT_DEFAULT_PORT,
     "playback_device": PLAYBACK_DEVICE,
     "max_volume_percent": 100,
+    "stereo_mode": "both",
 }
 
 
@@ -481,16 +489,33 @@ def _wifi_signal_snapshot() -> dict | None:
     return snapshots[0]
 
 
-def _render_camilla_config(playback_device: str) -> str:
+def _normalize_stereo_mode(value: str | None) -> str:
+    mode = (value or "").strip().lower()
+    return mode if mode in {"both", "left", "right"} else "both"
+
+
+def _stereo_sources(mode: str) -> tuple[int, int]:
+    normalized = _normalize_stereo_mode(mode)
+    if normalized == "left":
+        return (0, 0)
+    if normalized == "right":
+        return (1, 1)
+    return (0, 1)
+
+
+def _render_camilla_config(playback_device: str, *, stereo_mode: str) -> str:
     template = _ensure_camilla_template_latest()
     if not template:
         raise RuntimeError("CamillaDSP template not found")
+    left_src, right_src = _stereo_sources(stereo_mode)
     rendered = template.replace("__PLAYBACK_DEVICE__", playback_device)
+    rendered = rendered.replace("__STEREO_DEST0_SRC__", str(left_src))
+    rendered = rendered.replace("__STEREO_DEST1_SRC__", str(right_src))
     return rendered
 
 
-def _write_camilla_config(playback_device: str) -> None:
-    rendered = _render_camilla_config(playback_device)
+def _write_camilla_config(playback_device: str, *, stereo_mode: str) -> None:
+    rendered = _render_camilla_config(playback_device, stereo_mode=stereo_mode)
     CAMILLA_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CAMILLA_CONFIG_PATH.write_text(rendered)
 
@@ -515,7 +540,8 @@ async def _set_playback_device(device: str) -> dict:
     agent_config["playback_device"] = normalized
     _persist_agent_config(agent_config)
     try:
-        await asyncio.get_running_loop().run_in_executor(None, _write_camilla_config, normalized)
+        mode = _normalize_stereo_mode(agent_config.get("stereo_mode"))
+        await asyncio.get_running_loop().run_in_executor(None, _write_camilla_config, normalized, stereo_mode=mode)
     except Exception as exc:
         log.exception("Failed to write Camilla config")
         raise HTTPException(status_code=500, detail=f"Failed to write Camilla config: {exc}")
@@ -736,6 +762,10 @@ class OutputSelectionPayload(BaseModel):
     device: str
 
 
+class StereoModePayload(BaseModel):
+    mode: str = Field(default="both")
+
+
 class CamillaController:
     def __init__(self, host: str, port: int, filter_path: str) -> None:
         self.host = host
@@ -937,7 +967,8 @@ async def _ensure_camilla_config_current() -> None:
     playback_device = _current_playback_device()
     loop = asyncio.get_running_loop()
     try:
-        await loop.run_in_executor(None, _write_camilla_config, playback_device)
+        mode = _normalize_stereo_mode(agent_config.get("stereo_mode"))
+        await loop.run_in_executor(None, _write_camilla_config, playback_device, stereo_mode=mode)
     except Exception as exc:  # pragma: no cover - filesystem edge
         log.warning("Failed to rewrite Camilla config during migration: %s", exc)
         return
@@ -1171,6 +1202,36 @@ async def set_eq(payload: EqPayload, request: Request) -> dict:
             log.exception("Failed to apply EQ via CamillaDSP")
             raise HTTPException(status_code=500, detail=f"Failed to apply EQ: {exc}")
     return {"ok": True, "eq": eq_state, "camilla_pending": pending}
+
+
+@app.post("/stereo")
+async def set_stereo_mode(payload: StereoModePayload, request: Request) -> dict:
+    _auth(request)
+    mode = _normalize_stereo_mode(payload.mode)
+    agent_config["stereo_mode"] = mode
+    _persist_agent_config(agent_config)
+    playback_device = _current_playback_device()
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _write_camilla_config, playback_device, stereo_mode=mode)
+    except Exception as exc:
+        log.exception("Failed to write Camilla config")
+        raise HTTPException(status_code=500, detail=f"Failed to write Camilla config: {exc}")
+    await _restart_camilla_service()
+    global camilla_pending_eq
+    try:
+        await _apply_camilla_eq()
+        camilla_pending_eq = False
+        _cancel_camilla_retry()
+        pending = False
+    except Exception as exc:  # pragma: no cover - hardware path
+        if CAMILLA_ENABLED and _is_connection_error(exc):
+            camilla_pending_eq = True
+            _schedule_camilla_retry()
+            pending = True
+        else:
+            log.exception("Failed to reapply EQ after stereo mode change")
+            raise HTTPException(status_code=500, detail=f"Failed to reapply EQ: {exc}")
+    return {"ok": True, "stereo_mode": mode, "camilla_pending": pending}
 
 
 @app.post("/update")

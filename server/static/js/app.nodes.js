@@ -373,6 +373,35 @@ async function setNodeOutput(nodeId, deviceId, selectEl) {
   }
 }
 
+async function setNodeStereoMode(nodeId, mode, selectEl) {
+  const normalized = typeof mode === 'string' ? mode.trim().toLowerCase() : 'both';
+  if (!['both', 'left', 'right'].includes(normalized)) {
+    showError('Invalid stereo mode');
+    return;
+  }
+  const previous = selectEl ? (selectEl.dataset.previousMode || selectEl.value) : null;
+  if (selectEl) selectEl.disabled = true;
+  try {
+    const res = await fetch(`/api/nodes/${nodeId}/stereo`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: normalized }),
+    });
+    await ensureOk(res);
+    showSuccess('Stereo mode updated');
+    if (selectEl) selectEl.dataset.previousMode = normalized;
+    await fetchNodes({ force: true });
+  } catch (err) {
+    showError(`Failed to set stereo mode: ${err.message}`);
+    if (selectEl && previous !== null) {
+      selectEl.value = previous;
+      selectEl.dataset.previousMode = previous;
+    }
+  } finally {
+    if (selectEl) selectEl.disabled = false;
+  }
+}
+
 async function checkNodeUpdates(nodeId, btn) {
   const originalLabel = btn ? btn.textContent : '';
   if (btn) {
@@ -577,6 +606,39 @@ function renderNodeSettingsContent() {
   }
   nodeSettingsContent.appendChild(detailsPanel);
 
+  const nodeError = typeof node.connection_error === 'string' ? node.connection_error.trim() : '';
+  if (nodeError) {
+    const errorPanel = document.createElement('div');
+    errorPanel.className = 'panel';
+    const errorTitle = document.createElement('div');
+    errorTitle.className = 'section-title';
+    errorTitle.textContent = 'Error';
+    errorPanel.appendChild(errorTitle);
+
+    const metaBits = [];
+    if (node.connection_state) metaBits.push(`State: ${node.connection_state}`);
+    if (isSonos && node.sonos_connecting_since) {
+      const ts = formatTimestamp(Number(node.sonos_connecting_since));
+      if (ts) metaBits.push(`Since: ${ts}`);
+    }
+    if (metaBits.length) {
+      const meta = document.createElement('div');
+      meta.className = 'muted';
+      meta.style.marginBottom = '8px';
+      meta.textContent = metaBits.join(' • ');
+      errorPanel.appendChild(meta);
+    }
+
+    const errorBody = document.createElement('div');
+    errorBody.className = 'label';
+    errorBody.style.whiteSpace = 'pre-wrap';
+    errorBody.style.wordBreak = 'break-word';
+    errorBody.textContent = nodeError;
+    errorPanel.appendChild(errorBody);
+
+    nodeSettingsContent.appendChild(errorPanel);
+  }
+
   if (!isBrowser && !isSonos) {
     const audioPanel = document.createElement('div');
     audioPanel.className = 'panel';
@@ -616,6 +678,35 @@ function renderNodeSettingsContent() {
       audioPanel.appendChild(select);
     }
     nodeSettingsContent.appendChild(audioPanel);
+
+    const stereoPanel = document.createElement('div');
+    stereoPanel.className = 'panel';
+    const stereoTitle = document.createElement('div');
+    stereoTitle.className = 'section-title';
+    stereoTitle.textContent = 'Stereo';
+    stereoPanel.appendChild(stereoTitle);
+    const stereoSelect = document.createElement('select');
+    stereoSelect.style.width = '100%';
+    const options = [
+      { id: 'both', label: 'Both (stereo)' },
+      { id: 'left', label: 'Left (mono)' },
+      { id: 'right', label: 'Right (mono)' },
+    ];
+    options.forEach(opt => {
+      const optionEl = document.createElement('option');
+      optionEl.value = opt.id;
+      optionEl.textContent = opt.label;
+      stereoSelect.appendChild(optionEl);
+    });
+    const currentStereo = (node.stereo_mode || 'both').toString().trim().toLowerCase();
+    stereoSelect.value = ['both', 'left', 'right'].includes(currentStereo) ? currentStereo : 'both';
+    stereoSelect.dataset.previousMode = stereoSelect.value;
+    stereoSelect.disabled = disableOutputs;
+    stereoSelect.addEventListener('change', () => {
+      setNodeStereoMode(node.id, stereoSelect.value, stereoSelect);
+    });
+    stereoPanel.appendChild(stereoSelect);
+    nodeSettingsContent.appendChild(stereoPanel);
   }
 
   const limitsPanel = document.createElement('div');
