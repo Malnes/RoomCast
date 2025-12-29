@@ -76,6 +76,13 @@
     let metadataTimer = null;
     let hasRenderedMetadata = false;
 
+    let audioCtx = null;
+    let inboundStream = null;
+    let streamSourceNode = null;
+    let streamDestNode = null;
+    let eqNodes = [];
+    let pendingEq = null;
+
     function setStatus(message) {
       statusEl.textContent = message;
     }
@@ -115,8 +122,8 @@
         pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
         pc.ontrack = (event) => {
           const [stream] = event.streams;
-          audio.srcObject = stream;
-          audio.play().catch(() => {});
+          inboundStream = stream;
+          ensureAudioGraph(stream);
           nodeVol.disabled = false;
         };
         pc.onconnectionstatechange = () => {
@@ -165,6 +172,82 @@
       }
     }
 
+    async function ensureAudioGraph(stream) {
+      if (!stream) return;
+      if (!audioCtx) {
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      }
+      if (audioCtx.state === 'suspended') {
+        try { await audioCtx.resume(); } catch (e) {}
+      }
+      if (!streamSourceNode) {
+        streamSourceNode = audioCtx.createMediaStreamSource(stream);
+      }
+      if (!streamDestNode) {
+        streamDestNode = audioCtx.createMediaStreamDestination();
+      }
+      rebuildEqGraph(pendingEq);
+      audio.srcObject = streamDestNode.stream;
+      audio.play().catch(() => {});
+    }
+
+    function teardownAudioGraph() {
+      try {
+        if (streamSourceNode) streamSourceNode.disconnect();
+      } catch (e) {}
+      eqNodes.forEach(n => {
+        try { n.disconnect(); } catch (e) {}
+      });
+      eqNodes = [];
+      streamSourceNode = null;
+      streamDestNode = null;
+      inboundStream = null;
+      if (audioCtx) {
+        try { audioCtx.close(); } catch (e) {}
+      }
+      audioCtx = null;
+    }
+
+    function rebuildEqGraph(eq) {
+      pendingEq = eq;
+      if (!audioCtx || !streamSourceNode || !streamDestNode) return;
+
+      // Disconnect previous graph.
+      try { streamSourceNode.disconnect(); } catch (e) {}
+      eqNodes.forEach(n => { try { n.disconnect(); } catch (e) {} });
+      eqNodes = [];
+
+      const bands = (eq && Array.isArray(eq.bands)) ? eq.bands : [];
+      const activeBands = bands
+        .map(b => ({
+          freq: clampNumber(Number(b.freq), 20, 20000),
+          gain: clampNumber(Number(b.gain), -24, 24),
+          q: clampNumber(Number(b.q ?? 1.0), 0.1, 10.0),
+        }))
+        .filter(b => Number.isFinite(b.freq) && Number.isFinite(b.gain) && Number.isFinite(b.q))
+        .filter(b => Math.abs(b.gain) >= 0.05);
+
+      let node = streamSourceNode;
+      if (activeBands.length) {
+        activeBands.forEach(band => {
+          const filter = audioCtx.createBiquadFilter();
+          filter.type = 'peaking';
+          filter.frequency.value = band.freq;
+          filter.Q.value = band.q;
+          filter.gain.value = band.gain;
+          node.connect(filter);
+          node = filter;
+          eqNodes.push(filter);
+        });
+      }
+      node.connect(streamDestNode);
+    }
+
+    function clampNumber(value, min, max) {
+      if (!Number.isFinite(value)) return min;
+      return Math.min(max, Math.max(min, value));
+    }
+
     async function connectControlSocket() {
       if (!nodeId) return;
       ws = new WebSocket(wsUrl(nodeId));
@@ -193,6 +276,10 @@
       } else if (msg.type === 'mute') {
         audio.muted = !!msg.muted;
         setStatus(msg.muted ? 'Muted' : 'Playing');
+      } else if (msg.type === 'eq') {
+        // Parametric EQ is applied locally using WebAudio BiquadFilterNodes.
+        rebuildEqGraph(msg.eq || null);
+        setStatus('EQ updated');
       } else if (msg.type === 'session' && msg.state === 'ended') {
         setStatus('Session ended by controller');
         disconnect(false);
@@ -236,6 +323,7 @@
       applyChannelAccent('#22c55e');
       stopMetadataPolling();
       setDefaultMetadata();
+      teardownAudioGraph();
       audio.pause();
       audio.srcObject = null;
       audio.currentTime = 0;

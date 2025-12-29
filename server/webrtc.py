@@ -424,17 +424,20 @@ class WebAudioTrack(MediaStreamTrack):
         sample_rate: int,
         channel_id: Optional[str],
         pan: float = 0.0,
+        stereo_mode: str = "both",
     ) -> None:
         super().__init__()
         self._relay = relay
         self._queue: Optional[asyncio.Queue[AudioChunk]] = None
         self._samples_sent = 0
         self._pan = float(pan)
+        self._stereo_mode = "both"
         self._sample_rate = max(8000, min(192000, int(sample_rate)))
         self._channel_id = channel_id
         self._silence_frame_bytes = _frame_bytes(self._sample_rate)
         self._silence_samples = _frame_samples(self._sample_rate)
         self._silence_chunk = bytes(self._silence_frame_bytes)
+        self.set_stereo_mode(stereo_mode)
 
     async def _ensure_queue(self) -> asyncio.Queue[AudioChunk]:
         if not self._channel_id:
@@ -445,6 +448,10 @@ class WebAudioTrack(MediaStreamTrack):
 
     def set_pan(self, pan: float) -> None:
         self._pan = max(-1.0, min(1.0, pan))
+
+    def set_stereo_mode(self, mode: str) -> None:
+        value = (mode or "both").strip().lower()
+        self._stereo_mode = value if value in {"both", "left", "right"} else "both"
 
     async def set_channel(self, channel_id: Optional[str]) -> None:
         if channel_id == self._channel_id:
@@ -476,6 +483,7 @@ class WebAudioTrack(MediaStreamTrack):
                 # Channel switched; resubscribe to the new source.
                 self._queue = None
                 continue
+            chunk = self._apply_stereo_mode(chunk)
             chunk = self._apply_pan(chunk)
             return self._build_frame(chunk)
 
@@ -505,6 +513,26 @@ class WebAudioTrack(MediaStreamTrack):
             if CHANNELS > 1 and i + 1 < len(data):
                 data[i + 1] = _clamp_sample(int(data[i + 1] * right_gain))
         return data.tobytes()
+
+    def _apply_stereo_mode(self, chunk: bytes) -> bytes:
+        mode = self._stereo_mode
+        if mode == "both":
+            return chunk
+        data = array("h")
+        data.frombytes(chunk)
+        if not data or CHANNELS < 2:
+            return chunk
+        if mode == "left":
+            for i in range(0, len(data) - 1, CHANNELS):
+                left = data[i]
+                data[i + 1] = left
+            return data.tobytes()
+        if mode == "right":
+            for i in range(0, len(data) - 1, CHANNELS):
+                right = data[i + 1]
+                data[i] = right
+            return data.tobytes()
+        return chunk
 
     async def shutdown(self) -> None:
         await self._release_queue()
@@ -708,6 +736,7 @@ class WebAudioRelay:
         channel_id: Optional[str],
         stream_id: Optional[str],
         pan: float = 0.0,
+        stereo_mode: str = "both",
     ) -> WebNodeSession:
         if channel_id and stream_id:
             await self._ensure_channel_source(channel_id, stream_id)
@@ -715,7 +744,13 @@ class WebAudioRelay:
             existing = self._sessions.get(node_id)
             if existing:
                 await existing.close()
-            track = WebAudioTrack(self, sample_rate=self._sample_rate, channel_id=channel_id, pan=pan)
+            track = WebAudioTrack(
+                self,
+                sample_rate=self._sample_rate,
+                channel_id=channel_id,
+                pan=pan,
+                stereo_mode=stereo_mode,
+            )
             pc = RTCPeerConnection(configuration=self._rtc_config)
             sender = pc.addTrack(track)
             params = None
@@ -773,6 +808,12 @@ class WebAudioRelay:
             session = self._sessions.get(node_id)
         if session:
             session.track.set_pan(pan)
+
+    async def set_stereo_mode(self, node_id: str, mode: str) -> None:
+        async with self._lock:
+            session = self._sessions.get(node_id)
+        if session:
+            session.track.set_stereo_mode(mode)
 
     async def _handle_session_closed(self, node_id: str) -> None:
         async with self._lock:

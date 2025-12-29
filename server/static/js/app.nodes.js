@@ -402,6 +402,23 @@ async function setNodeStereoMode(nodeId, mode, selectEl) {
   }
 }
 
+async function setSonosEq(nodeId, patch, sourceEl) {
+  try {
+    if (sourceEl) sourceEl.disabled = true;
+    const res = await fetch(`/api/nodes/${nodeId}/sonos-eq`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch || {}),
+    });
+    await ensureOk(res);
+    showSuccess('Sonos EQ updated');
+  } catch (err) {
+    showError(`Failed to set Sonos EQ: ${err.message}`);
+  } finally {
+    if (sourceEl) sourceEl.disabled = false;
+  }
+}
+
 async function checkNodeUpdates(nodeId, btn) {
   const originalLabel = btn ? btn.textContent : '';
   if (btn) {
@@ -639,6 +656,84 @@ function renderNodeSettingsContent() {
     nodeSettingsContent.appendChild(errorPanel);
   }
 
+  if (isSonos) {
+    const sonosEq = node.sonos_eq && typeof node.sonos_eq === 'object' ? node.sonos_eq : {};
+    const bassValue = Number.isFinite(Number(sonosEq.bass)) ? Number(sonosEq.bass) : 0;
+    const trebleValue = Number.isFinite(Number(sonosEq.treble)) ? Number(sonosEq.treble) : 0;
+    const loudnessValue = sonosEq.loudness === true;
+
+    const eqPanel = document.createElement('div');
+    eqPanel.className = 'panel';
+    const eqTitle = document.createElement('div');
+    eqTitle.className = 'section-title';
+    eqTitle.textContent = 'Sonos EQ';
+    eqPanel.appendChild(eqTitle);
+
+    const bassLabel = document.createElement('div');
+    bassLabel.className = 'label';
+    const bassSlider = document.createElement('input');
+    bassSlider.type = 'range';
+    bassSlider.min = -10;
+    bassSlider.max = 10;
+    bassSlider.step = 1;
+    bassSlider.value = bassValue;
+    bassSlider.disabled = !online || restarting || updating;
+    bassLabel.textContent = `Bass – ${bassSlider.value}`;
+    bassSlider.addEventListener('input', () => {
+      bassLabel.textContent = `Bass – ${bassSlider.value}`;
+      setRangeProgress(bassSlider, Number(bassSlider.value) - Number(bassSlider.min), Number(bassSlider.max) - Number(bassSlider.min));
+    });
+    bassSlider.addEventListener('change', () => {
+      setSonosEq(node.id, { bass: Number(bassSlider.value) }, bassSlider);
+    });
+    setRangeProgress(bassSlider, Number(bassSlider.value) - Number(bassSlider.min), Number(bassSlider.max) - Number(bassSlider.min));
+    eqPanel.appendChild(bassLabel);
+    eqPanel.appendChild(bassSlider);
+
+    const trebleLabel = document.createElement('div');
+    trebleLabel.className = 'label';
+    trebleLabel.style.marginTop = '10px';
+    const trebleSlider = document.createElement('input');
+    trebleSlider.type = 'range';
+    trebleSlider.min = -10;
+    trebleSlider.max = 10;
+    trebleSlider.step = 1;
+    trebleSlider.value = trebleValue;
+    trebleSlider.disabled = !online || restarting || updating;
+    trebleLabel.textContent = `Treble – ${trebleSlider.value}`;
+    trebleSlider.addEventListener('input', () => {
+      trebleLabel.textContent = `Treble – ${trebleSlider.value}`;
+      setRangeProgress(trebleSlider, Number(trebleSlider.value) - Number(trebleSlider.min), Number(trebleSlider.max) - Number(trebleSlider.min));
+    });
+    trebleSlider.addEventListener('change', () => {
+      setSonosEq(node.id, { treble: Number(trebleSlider.value) }, trebleSlider);
+    });
+    setRangeProgress(trebleSlider, Number(trebleSlider.value) - Number(trebleSlider.min), Number(trebleSlider.max) - Number(trebleSlider.min));
+    eqPanel.appendChild(trebleLabel);
+    eqPanel.appendChild(trebleSlider);
+
+    const loudRow = document.createElement('label');
+    loudRow.style.display = 'flex';
+    loudRow.style.alignItems = 'center';
+    loudRow.style.gap = '8px';
+    loudRow.style.marginTop = '10px';
+    const loudToggle = document.createElement('input');
+    loudToggle.type = 'checkbox';
+    loudToggle.checked = loudnessValue;
+    loudToggle.disabled = !online || restarting || updating;
+    loudToggle.addEventListener('change', () => {
+      setSonosEq(node.id, { loudness: !!loudToggle.checked }, loudToggle);
+    });
+    const loudText = document.createElement('span');
+    loudText.className = 'label';
+    loudText.textContent = 'Loudness';
+    loudRow.appendChild(loudToggle);
+    loudRow.appendChild(loudText);
+    eqPanel.appendChild(loudRow);
+
+    nodeSettingsContent.appendChild(eqPanel);
+  }
+
   if (!isBrowser && !isSonos) {
     const audioPanel = document.createElement('div');
     audioPanel.className = 'panel';
@@ -678,36 +773,36 @@ function renderNodeSettingsContent() {
       audioPanel.appendChild(select);
     }
     nodeSettingsContent.appendChild(audioPanel);
-
-    const stereoPanel = document.createElement('div');
-    stereoPanel.className = 'panel';
-    const stereoTitle = document.createElement('div');
-    stereoTitle.className = 'section-title';
-    stereoTitle.textContent = 'Stereo';
-    stereoPanel.appendChild(stereoTitle);
-    const stereoSelect = document.createElement('select');
-    stereoSelect.style.width = '100%';
-    const options = [
-      { id: 'both', label: 'Both (stereo)' },
-      { id: 'left', label: 'Left (mono)' },
-      { id: 'right', label: 'Right (mono)' },
-    ];
-    options.forEach(opt => {
-      const optionEl = document.createElement('option');
-      optionEl.value = opt.id;
-      optionEl.textContent = opt.label;
-      stereoSelect.appendChild(optionEl);
-    });
-    const currentStereo = (node.stereo_mode || 'both').toString().trim().toLowerCase();
-    stereoSelect.value = ['both', 'left', 'right'].includes(currentStereo) ? currentStereo : 'both';
-    stereoSelect.dataset.previousMode = stereoSelect.value;
-    stereoSelect.disabled = disableOutputs;
-    stereoSelect.addEventListener('change', () => {
-      setNodeStereoMode(node.id, stereoSelect.value, stereoSelect);
-    });
-    stereoPanel.appendChild(stereoSelect);
-    nodeSettingsContent.appendChild(stereoPanel);
   }
+
+  const stereoPanel = document.createElement('div');
+  stereoPanel.className = 'panel';
+  const stereoTitle = document.createElement('div');
+  stereoTitle.className = 'section-title';
+  stereoTitle.textContent = 'Stereo';
+  stereoPanel.appendChild(stereoTitle);
+  const stereoSelect = document.createElement('select');
+  stereoSelect.style.width = '100%';
+  const options = [
+    { id: 'both', label: 'Both (stereo)' },
+    { id: 'left', label: 'Left (mono)' },
+    { id: 'right', label: 'Right (mono)' },
+  ];
+  options.forEach(opt => {
+    const optionEl = document.createElement('option');
+    optionEl.value = opt.id;
+    optionEl.textContent = opt.label;
+    stereoSelect.appendChild(optionEl);
+  });
+  const currentStereo = (node.stereo_mode || 'both').toString().trim().toLowerCase();
+  stereoSelect.value = ['both', 'left', 'right'].includes(currentStereo) ? currentStereo : 'both';
+  stereoSelect.dataset.previousMode = stereoSelect.value;
+  stereoSelect.disabled = disableOutputs;
+  stereoSelect.addEventListener('change', () => {
+    setNodeStereoMode(node.id, stereoSelect.value, stereoSelect);
+  });
+  stereoPanel.appendChild(stereoSelect);
+  nodeSettingsContent.appendChild(stereoPanel);
 
   const limitsPanel = document.createElement('div');
   limitsPanel.className = 'panel';

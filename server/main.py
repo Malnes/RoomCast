@@ -1067,6 +1067,12 @@ class NodeStereoModePayload(BaseModel):
     mode: Literal["both", "left", "right"] = Field(default="both")
 
 
+class SonosEqPayload(BaseModel):
+    bass: Optional[int] = Field(default=None, ge=-10, le=10, description="Bass (-10..10)")
+    treble: Optional[int] = Field(default=None, ge=-10, le=10, description="Treble (-10..10)")
+    loudness: Optional[bool] = Field(default=None, description="Loudness on/off")
+
+
 class SpotifyConfig(BaseModel):
     device_name: str = Field(default="RoomCast")
     bitrate: int = Field(default=320, ge=96, le=320)
@@ -1629,8 +1635,7 @@ def public_node(node: dict) -> dict:
     data["fingerprint"] = node.get("fingerprint")
     data["max_volume_percent"] = _get_node_max_volume(node)
     data["channel_id"] = resolve_node_channel_id(node)
-    if node.get("type") == "agent":
-        data["stereo_mode"] = (node.get("stereo_mode") or "both")
+    data["stereo_mode"] = _normalize_stereo_mode(node.get("stereo_mode"))
     if node.get("wifi"):
         data["wifi"] = node.get("wifi")
     if node.get("type") == "sonos":
@@ -2200,7 +2205,12 @@ async def _establish_web_node_session_for_request(pending: dict) -> dict:
         await teardown_browser_node(node["id"])
         raise HTTPException(status_code=500, detail="Channel is missing snap_stream mapping")
     try:
-        session = await webrtc_relay.create_session(node["id"], channel_id, stream_id)
+        session = await webrtc_relay.create_session(
+            node["id"],
+            channel_id,
+            stream_id,
+            stereo_mode=_normalize_stereo_mode(node.get("stereo_mode")),
+        )
         answer = await session.accept(pending["offer_sdp"], pending["offer_type"])
     except Exception as exc:  # pragma: no cover - defensive logging
         log.exception("Failed to establish web node session")
@@ -2228,6 +2238,20 @@ def _sonos_ip_from_url(url: Optional[str]) -> Optional[str]:
         return None
     if url.startswith("sonos://"):
         return url[len("sonos://"):].strip("/") or None
+    return None
+
+
+def _normalize_stereo_mode(value: object) -> str:
+    mode = (str(value) if value is not None else "both").strip().lower()
+    return mode if mode in {"both", "left", "right"} else "both"
+
+
+def _ffmpeg_pan_filter_for_stereo_mode(mode: str) -> Optional[str]:
+    normalized = _normalize_stereo_mode(mode)
+    if normalized == "left":
+        return "pan=stereo|c0=c0|c1=c0"
+    if normalized == "right":
+        return "pan=stereo|c0=c1|c1=c1"
     return None
 
 
@@ -2481,6 +2505,40 @@ async def _sonos_set_mute(ip: str, muted: bool) -> None:
             "InstanceID": "0",
             "Channel": "Master",
             "DesiredMute": "1" if muted else "0",
+        },
+    )
+
+
+def _normalize_sonos_eq(value: object) -> dict:
+    data = value if isinstance(value, dict) else {}
+    bass = data.get("bass")
+    treble = data.get("treble")
+    loudness = data.get("loudness")
+    try:
+        bass_i = int(bass)
+    except (TypeError, ValueError):
+        bass_i = 0
+    try:
+        treble_i = int(treble)
+    except (TypeError, ValueError):
+        treble_i = 0
+    return {
+        "bass": max(-10, min(10, bass_i)),
+        "treble": max(-10, min(10, treble_i)),
+        "loudness": bool(loudness) if loudness is not None else False,
+    }
+
+
+async def _sonos_set_eq(ip: str, *, eq_type: str, value: int) -> None:
+    await _sonos_soap_action(
+        ip,
+        service="RenderingControl",
+        action="SetEQ",
+        control_path="/MediaRenderer/RenderingControl/Control",
+        arguments={
+            "InstanceID": "0",
+            "EQType": str(eq_type),
+            "DesiredValue": str(int(value)),
         },
     )
 
@@ -3201,6 +3259,7 @@ def _register_node_internal(
         "volume_percent": _normalize_percent(previous.get("volume_percent", 75), default=75),
         "max_volume_percent": _normalize_percent(previous.get("max_volume_percent", 100), default=100),
         "muted": previous.get("muted", False),
+        "stereo_mode": _normalize_stereo_mode(previous.get("stereo_mode")),
         "updating": bool(previous.get("updating", False)),
         "playback_device": previous.get("playback_device"),
         "outputs": previous.get("outputs", {}),
@@ -4255,21 +4314,64 @@ async def set_node_stereo_mode(node_id: str, payload: NodeStereoModePayload) -> 
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") != "agent":
-        raise HTTPException(status_code=400, detail="Stereo mode is only supported for hardware nodes")
-    mode = (payload.mode or "both").strip().lower()
+    mode = _normalize_stereo_mode(payload.mode)
     if mode not in {"both", "left", "right"}:
         raise HTTPException(status_code=400, detail="Invalid stereo mode")
-    try:
-        await _call_agent(node, "/stereo", {"mode": mode})
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to apply stereo mode: {exc}") from exc
+
+    if node.get("type") == "agent":
+        try:
+            await _call_agent(node, "/stereo", {"mode": mode})
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"Failed to apply stereo mode: {exc}") from exc
+    elif node.get("type") == "browser":
+        if webrtc_relay:
+            try:
+                await webrtc_relay.set_stereo_mode(node_id, mode)
+            except Exception:
+                # Session may not exist yet; setting is persisted regardless.
+                pass
+    elif node.get("type") == "sonos":
+        # Applied when the Sonos pulls the MP3 stream.
+        pass
+    else:
+        raise HTTPException(status_code=400, detail="Unknown node type")
     node["stereo_mode"] = mode
     save_nodes()
     await broadcast_nodes()
     return {"ok": True, "stereo_mode": mode}
+
+
+@app.post("/api/nodes/{node_id}/sonos-eq")
+async def set_sonos_eq(node_id: str, payload: SonosEqPayload) -> dict:
+    node = nodes.get(node_id)
+    if not node:
+        raise HTTPException(status_code=404, detail="Unknown node")
+    if node.get("type") != "sonos":
+        raise HTTPException(status_code=400, detail="Sonos EQ only applies to Sonos nodes")
+    ip = _sonos_ip_from_url(node.get("url"))
+    if not ip:
+        raise HTTPException(status_code=400, detail="Invalid Sonos node")
+
+    current = _normalize_sonos_eq(node.get("sonos_eq"))
+    desired = dict(current)
+    if payload.bass is not None:
+        desired["bass"] = int(payload.bass)
+    if payload.treble is not None:
+        desired["treble"] = int(payload.treble)
+    if payload.loudness is not None:
+        desired["loudness"] = bool(payload.loudness)
+    desired = _normalize_sonos_eq(desired)
+
+    await _sonos_set_eq(ip, eq_type="Bass", value=int(desired["bass"]))
+    await _sonos_set_eq(ip, eq_type="Treble", value=int(desired["treble"]))
+    await _sonos_set_eq(ip, eq_type="Loudness", value=1 if desired["loudness"] else 0)
+
+    node["sonos_eq"] = desired
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True, "sonos_eq": desired}
 
 
 @app.post("/api/nodes/{node_id}/mute")
@@ -4319,8 +4421,6 @@ async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="EQ is not supported for Sonos nodes")
     eq_data = payload.model_dump()
     node["eq"] = eq_data
     save_nodes()
@@ -4330,6 +4430,9 @@ async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
             raise HTTPException(status_code=503, detail="Browser node not connected")
         await ws.send_json({"type": "eq", "eq": eq_data})
         result = {"sent": True}
+    elif node.get("type") == "sonos":
+        # Applied when the Sonos pulls the MP3 stream.
+        result = {"sonos_stream": True}
     else:
         result = await _call_agent(node, "/eq", eq_data)
     await broadcast_nodes()
@@ -4598,6 +4701,35 @@ async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingRe
     client_id = f"roomcast-sonos-{uuid.uuid4()}"
     latency_ms = max(100, min(1200, int(WEBRTC_LATENCY_MS)))
     sample_rate = int(WEBRTC_SAMPLE_RATE)
+    sonos_node = _sonos_find_node_by_ip(client_host)
+    stereo_mode = _normalize_stereo_mode((sonos_node or {}).get("stereo_mode"))
+    pan_filter = _ffmpeg_pan_filter_for_stereo_mode(stereo_mode)
+
+    def _ffmpeg_eq_filters(eq: object) -> list[str]:
+        if not isinstance(eq, dict):
+            return []
+        bands = eq.get("bands")
+        if not isinstance(bands, list):
+            return []
+        filters: list[str] = []
+        for band in bands[:31]:
+            if not isinstance(band, dict):
+                continue
+            try:
+                freq = float(band.get("freq"))
+                gain = float(band.get("gain"))
+                q = float(band.get("q"))
+            except (TypeError, ValueError):
+                continue
+            freq = max(20.0, min(20000.0, freq))
+            gain = max(-12.0, min(12.0, gain))
+            q = max(0.2, min(10.0, q))
+            if abs(gain) < 0.05:
+                continue
+            filters.append(f"equalizer=f={freq:.2f}:width_type=q:width={q:.3f}:g={gain:.2f}")
+        return filters
+
+    eq_filters = _ffmpeg_eq_filters((sonos_node or {}).get("eq"))
 
     async def _iter_bytes() -> AsyncIterator[bytes]:
         snap_proc: Optional[asyncio.subprocess.Process] = None
@@ -4646,6 +4778,11 @@ async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingRe
 
             assign_task = asyncio.create_task(_assign())
 
+            filter_parts: list[str] = []
+            if pan_filter:
+                filter_parts.append(pan_filter)
+            filter_parts.extend(eq_filters)
+
             ff_args = [
                 "ffmpeg",
                 "-hide_banner",
@@ -4659,6 +4796,10 @@ async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingRe
                 "2",
                 "-i",
                 "pipe:0",
+            ]
+            if filter_parts:
+                ff_args += ["-af", ",".join(filter_parts)]
+            ff_args += [
                 "-vn",
                 "-b:a",
                 f"{max(64, SONOS_STREAM_BITRATE_KBPS)}k",

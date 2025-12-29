@@ -2142,7 +2142,7 @@ function commitRenderNodes(nodes) {
     const disableNodeControls = isBrowser ? false : (!online || restarting || (!isSonos && (!paired || !configured)));
 
     let eqBtn = null;
-    if (isBrowser || n.type === 'agent') {
+    if (isBrowser || isSonos || n.type === 'agent') {
       eqBtn = document.createElement('button');
       eqBtn.className = 'node-icon-btn';
       eqBtn.innerHTML = EQ_ICON_SVG;
