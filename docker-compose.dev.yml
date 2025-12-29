@@ -7,6 +7,7 @@ services:
       - config:/config
     network_mode: host
     environment:
+      PYTHONDONTWRITEBYTECODE: "1"
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
     # DISCOVERY_CIDR is no longer hardcoded
 

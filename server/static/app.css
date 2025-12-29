@@ -110,7 +110,7 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
   top: calc(100% + 8px);
   min-width: 160px;
   padding: 8px;
-  display: grid;
+  display: none;
   gap: 8px;
   border-radius: 14px;
   border: 1px solid rgba(148,163,184,0.25);
@@ -118,6 +118,8 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
   box-shadow: 0 18px 40px rgba(0,0,0,0.35);
   z-index: 50;
 }
+.add-menu:not([hidden]) { display: grid; }
+.add-menu[hidden] { display: none !important; }
 .add-menu .small-btn { width: 100%; justify-content: flex-start; }
 
 .node-section-group { margin-bottom: 12px; }
@@ -125,15 +127,21 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
   width: 100%;
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 10px;
-  padding: 10px 12px;
-  border-radius: 14px;
-  border: 1px solid rgba(148,163,184,0.18);
-  background: rgba(15,23,42,0.65);
+  padding: 8px 2px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
   color: #f8fafc;
+  cursor: pointer;
 }
 .node-section-title { font-weight: 700; }
+.node-section-divider {
+  flex: 1;
+  height: 0;
+  border-bottom: 1px solid rgba(148,163,184,0.18);
+  opacity: 0.9;
+}
 .node-section-meta { opacity: 0.65; font-size: 12px; font-weight: 700; }
 .node-section-icon { opacity: 0.75; font-size: 14px; }
 .node-section-controls { display: inline-flex; gap: 6px; margin-left: 8px; }
@@ -150,34 +158,69 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 }
 .node-section-control-btn:disabled { opacity: 0.45; }
 .node-section-body { margin-top: 10px; display: grid; gap: 10px; }
+.node-section-body[hidden] { display: none !important; }
 
-.node-section-selector {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 5px 8px;
-  border-radius: 999px;
-  border: 1px solid rgba(148,163,184,0.25);
-  background: transparent;
+.node-section-body.is-empty { min-height: 0; }
+
+.node-sections-edit-bar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 6px 0 10px;
 }
-.node-section-select {
-  appearance: none;
-  -webkit-appearance: none;
-  -moz-appearance: none;
-  border: none;
-  background: transparent;
-  color: #f8fafc;
-  font-size: 13px;
-  font-weight: 600;
-  padding: 4px 24px 4px 6px;
-  border-radius: 999px;
-  min-width: 120px;
-  width: auto;
-  cursor: pointer;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23f8fafc'%3E%3Cpath d='M7 10l5 5 5-5'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 4px center;
-  background-size: 12px;
+
+/* Node section edit mode: disable buttons, allow drag + drop. */
+#nodes.node-sections-edit-mode .node-draggable {
+  position: relative;
+  touch-action: none;
+  cursor: grab;
+}
+
+#nodes.node-sections-edit-mode .node-draggable::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: rgba(2, 6, 23, 0.45);
+  pointer-events: none;
+}
+
+#nodes.node-sections-edit-mode .node-draggable::before {
+  content: "⠿";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 24px;
+  font-weight: 800;
+  letter-spacing: 2px;
+  color: rgba(248, 250, 252, 0.9);
+  opacity: 0.85;
+  pointer-events: none;
+}
+
+#nodes.node-sections-edit-mode .node-draggable button,
+#nodes.node-sections-edit-mode .node-draggable input,
+#nodes.node-sections-edit-mode .node-draggable select,
+#nodes.node-sections-edit-mode .node-draggable a {
+  pointer-events: none;
+}
+
+#nodes.node-sections-edit-mode .node-draggable.node-dragging {
+  cursor: grabbing;
+}
+
+#nodes.node-sections-edit-mode .node-section-body.is-empty {
+  min-height: 54px;
+  border: 1px dashed rgba(148,163,184,0.35);
+  border-radius: 14px;
+  background: rgba(15,23,42,0.25);
+}
+
+.node-drop-placeholder {
+  border: 1px dashed rgba(148,163,184,0.55);
+  border-radius: 14px;
+  background: rgba(15,23,42,0.35);
 }
 .node-section-select:disabled { opacity: 0.5; cursor: not-allowed; }
 .node-section-select option { background: #0f172a; color: #f8fafc; }

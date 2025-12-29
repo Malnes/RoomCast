@@ -1676,6 +1676,7 @@ def public_node(node: dict) -> dict:
     data["channel_id"] = resolve_node_channel_id(node)
     data["stereo_mode"] = _normalize_stereo_mode(node.get("stereo_mode"))
     data["section_id"] = node.get("section_id")
+    data["section_order"] = node.get("section_order")
     if node.get("wifi"):
         data["wifi"] = node.get("wifi")
     if node.get("type") == "sonos":
@@ -1688,7 +1689,25 @@ def public_node(node: dict) -> dict:
 
 
 def public_nodes() -> list[dict]:
-    return [public_node(node) for node in nodes.values()]
+    section_rank = {section.get("id"): idx for idx, section in enumerate(sections) if section.get("id")}
+
+    def _node_key(entry: dict) -> tuple:
+        sid = entry.get("section_id")
+        # Unsectioned nodes should appear before user-defined sections.
+        if not sid:
+            rank = -1
+        else:
+            rank = section_rank.get(sid, 10**9)
+        order = entry.get("section_order")
+        try:
+            order_val = int(order)
+        except (TypeError, ValueError):
+            order_val = 10**9
+        name_val = (entry.get("name") or "").lower()
+        return (rank, order_val, name_val)
+
+    ordered = sorted(nodes.values(), key=_node_key)
+    return [public_node(node) for node in ordered]
 
 
 def _normalize_percent(value, *, default: int) -> int:
@@ -3652,7 +3671,7 @@ def load_nodes() -> None:
                 seen_section_ids.add(sid)
 
         nodes = {}
-        default_section_id = _ensure_default_section() if data else None
+        next_order_by_group: Dict[str, int] = {}
         for item in data:
             item = dict(item)
             item.pop("pan", None)
@@ -3701,13 +3720,27 @@ def load_nodes() -> None:
             else:
                 item["channel_id"] = _select_initial_channel_id(None, fallback=item.get("type") != "browser")
 
-            # Sections migration / normalization.
+            # Sections normalization: allow unsectioned nodes.
             section_id = item.get("section_id")
-            if not section_id or not _find_section(section_id):
-                if default_section_id:
-                    item["section_id"] = default_section_id
-                else:
-                    item["section_id"] = None
+            if isinstance(section_id, str):
+                section_id = section_id.strip() or None
+            else:
+                section_id = None
+            if section_id and not _find_section(section_id):
+                section_id = None
+            item["section_id"] = section_id
+
+            # Stable ordering within a group (section id or unsectioned group).
+            group_key = section_id or "__unsectioned__"
+            raw_order = item.get("section_order")
+            try:
+                order_val = int(raw_order)
+            except (TypeError, ValueError):
+                order_val = None
+            if order_val is None or order_val < 0:
+                order_val = next_order_by_group.get(group_key, 0)
+            item["section_order"] = order_val
+            next_order_by_group[group_key] = max(next_order_by_group.get(group_key, 0), order_val + 1)
             snapclient_id = (item.get("snapclient_id") or "").strip() or None
             item["snapclient_id"] = snapclient_id
             nodes[item["id"]] = item
@@ -3717,8 +3750,21 @@ def load_nodes() -> None:
 
 
 def save_nodes() -> None:
+    section_rank = {section.get("id"): idx for idx, section in enumerate(sections) if section.get("id")}
+
+    def _node_key(entry: dict) -> tuple:
+        sid = entry.get("section_id")
+        rank = section_rank.get(sid, 10**9)
+        order = entry.get("section_order")
+        try:
+            order_val = int(order)
+        except (TypeError, ValueError):
+            order_val = 10**9
+        name_val = (entry.get("name") or "").lower()
+        return (rank, order_val, name_val)
+
     serialized_nodes = []
-    for node in nodes.values():
+    for node in sorted(nodes.values(), key=_node_key):
         entry = {k: v for k, v in node.items() if k not in TRANSIENT_NODE_FIELDS}
         serialized_nodes.append(entry)
 
@@ -5268,12 +5314,25 @@ class CreateSectionPayload(BaseModel):
     name: str
 
 
+class UpdateSectionPayload(BaseModel):
+    name: str
+
+
 class ReorderSectionsPayload(BaseModel):
     section_ids: list[str]
 
 
 class SetNodeSectionPayload(BaseModel):
     section_id: Optional[str] = None
+
+
+class ReorderNodeSectionPayload(BaseModel):
+    section_id: Optional[str] = None
+    node_ids: list[str]
+
+
+class ReorderNodesPayload(BaseModel):
+    sections: list[ReorderNodeSectionPayload]
 
 
 @app.post("/api/sections")
@@ -5292,6 +5351,56 @@ async def create_section(payload: CreateSectionPayload) -> dict:
     save_nodes()
     await broadcast_nodes()
     return {"section": _public_section(section), "sections": public_sections()}
+
+
+@app.patch("/api/sections/{section_id}")
+async def update_section(section_id: str, payload: UpdateSectionPayload) -> dict:
+    section = _find_section(section_id)
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+    name = _normalize_section_name(payload.name)
+    if not name:
+        raise HTTPException(status_code=400, detail="Section name required")
+    section["name"] = name
+    section["updated_at"] = int(time.time())
+    save_nodes()
+    await broadcast_nodes()
+    return {"section": _public_section(section), "sections": public_sections()}
+
+
+@app.delete("/api/sections/{section_id}")
+async def delete_section(section_id: str) -> dict:
+    global sections
+    section = _find_section(section_id)
+    if not section:
+        raise HTTPException(status_code=404, detail="Section not found")
+
+    sections = [s for s in sections if s.get("id") != section_id]
+
+    # Move nodes in the deleted section to no-section.
+    moved = [node for node in nodes.values() if node.get("section_id") == section_id]
+    moved.sort(key=lambda n: (
+        int(n.get("section_order")) if isinstance(n.get("section_order"), int) else 10**9,
+        (n.get("name") or "").lower(),
+    ))
+    current_unsectioned = [
+        node for node in nodes.values() if not (node.get("section_id") or "")
+    ]
+    max_order = -1
+    for node in current_unsectioned:
+        try:
+            max_order = max(max_order, int(node.get("section_order")))
+        except (TypeError, ValueError):
+            continue
+    next_order = max_order + 1
+    for node in moved:
+        node["section_id"] = None
+        node["section_order"] = next_order
+        next_order += 1
+
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True, "sections": public_sections(), "nodes": public_nodes()}
 
 
 @app.post("/api/sections/reorder")
@@ -5316,15 +5425,79 @@ async def set_node_section(node_id: str, payload: SetNodeSectionPayload) -> dict
     node = nodes.get(node_id)
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-    section_id = (payload.section_id or "").strip() or None
-    if not section_id:
-        raise HTTPException(status_code=400, detail="Section id required")
-    if not _find_section(section_id):
+    section_id = payload.section_id
+    if isinstance(section_id, str):
+        section_id = section_id.strip() or None
+    else:
+        section_id = None
+
+    if section_id and not _find_section(section_id):
         raise HTTPException(status_code=404, detail="Section not found")
+
     node["section_id"] = section_id
+    if section_id is None:
+        # Keep it sortable within the unsectioned group.
+        try:
+            node["section_order"] = int(node.get("section_order"))
+        except (TypeError, ValueError):
+            node["section_order"] = None
     save_nodes()
     await broadcast_nodes()
     return {"result": {"id": node_id, "section_id": section_id}}
+
+
+@app.post("/api/nodes/reorder")
+async def reorder_nodes(payload: ReorderNodesPayload) -> dict:
+    if not payload.sections:
+        raise HTTPException(status_code=400, detail="No sections provided")
+
+    seen_nodes: set[str] = set()
+    section_updates: list[tuple[Optional[str], list[str]]] = []
+    for entry in payload.sections:
+        section_id: Optional[str] = entry.section_id
+        if isinstance(section_id, str):
+            section_id = section_id.strip() or None
+        else:
+            section_id = None
+        if section_id and not _find_section(section_id):
+            raise HTTPException(status_code=404, detail="Section not found")
+        node_ids = [nid for nid in (entry.node_ids or []) if isinstance(nid, str) and nid]
+        if len(node_ids) != len(entry.node_ids or []):
+            raise HTTPException(status_code=400, detail="Invalid node id")
+        if len(set(node_ids)) != len(node_ids):
+            raise HTTPException(status_code=400, detail="Duplicate node ids")
+        for nid in node_ids:
+            if nid in seen_nodes:
+                raise HTTPException(status_code=400, detail="Node appears in multiple sections")
+            if nid not in nodes:
+                raise HTTPException(status_code=404, detail=f"Node not found: {nid}")
+            seen_nodes.add(nid)
+        section_updates.append((section_id, node_ids))
+
+    # Apply requested ordering per section.
+    for section_id, node_ids in section_updates:
+        for idx, nid in enumerate(node_ids):
+            node = nodes[nid]
+            node["section_id"] = section_id
+            node["section_order"] = idx
+
+        # Ensure remaining nodes in this group get unique order values after the specified list.
+        remaining = [
+            node for node in nodes.values()
+            if node.get("section_id") == section_id and node.get("id") not in set(node_ids)
+        ]
+        remaining.sort(key=lambda n: (
+            int(n.get("section_order")) if isinstance(n.get("section_order"), int) else 10**9,
+            (n.get("name") or "").lower(),
+        ))
+        next_index = len(node_ids)
+        for node in remaining:
+            node["section_order"] = next_index
+            next_index += 1
+
+    save_nodes()
+    await broadcast_nodes()
+    return {"ok": True, "sections": public_sections(), "nodes": public_nodes()}
 
 
 @app.get("/api/streams/diagnostics")

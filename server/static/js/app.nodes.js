@@ -286,7 +286,66 @@ async function createNodeSection(name, btn, inputEl) {
   }
 }
 
-async function reorderNodeSections(sectionIds) {
+async function renameNodeSection(sectionId, name, options = {}) {
+  const sid = typeof sectionId === 'string' ? sectionId.trim() : '';
+  const sectionName = typeof name === 'string' ? name.trim() : '';
+  if (!sid) {
+    showError('Section id required');
+    return;
+  }
+  if (!sectionName) {
+    showError('Section name required');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/sections/${encodeURIComponent(sid)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: sectionName }),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    if (typeof setNodeSections === 'function' && Array.isArray(data.sections)) {
+      setNodeSections(data.sections);
+    }
+    if (!options?.silent) {
+      showSuccess('Section updated');
+    }
+    if (!options?.skipFetch) {
+      await fetchNodes({ force: true });
+    }
+  } catch (err) {
+    showError(`Failed to update section: ${err.message}`);
+  }
+}
+
+async function deleteNodeSection(sectionId, options = {}) {
+  const sid = typeof sectionId === 'string' ? sectionId.trim() : '';
+  if (!sid) {
+    showError('Section id required');
+    return;
+  }
+  try {
+    const res = await fetch(`/api/sections/${encodeURIComponent(sid)}`, {
+      method: 'DELETE',
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    if (typeof setNodeSections === 'function' && Array.isArray(data.sections)) {
+      setNodeSections(data.sections);
+    }
+    if (!options?.silent) {
+      showSuccess('Section deleted');
+    }
+    if (!options?.skipFetch) {
+      await fetchNodes({ force: true });
+    }
+  } catch (err) {
+    showError(`Failed to delete section: ${err.message}`);
+  }
+}
+
+async function reorderNodeSections(sectionIds, options = {}) {
   const ids = Array.isArray(sectionIds) ? sectionIds.filter(id => typeof id === 'string' && id) : [];
   if (!ids.length) return;
   try {
@@ -300,8 +359,12 @@ async function reorderNodeSections(sectionIds) {
     if (typeof setNodeSections === 'function' && Array.isArray(data.sections)) {
       setNodeSections(data.sections);
     }
-    showSuccess('Sections reordered');
-    await fetchNodes({ force: true });
+    if (!options?.silent) {
+      showSuccess('Sections reordered');
+    }
+    if (!options?.skipFetch) {
+      await fetchNodes({ force: true });
+    }
   } catch (err) {
     showError(`Failed to reorder sections: ${err.message}`);
   }
@@ -330,6 +393,25 @@ async function setNodeSection(nodeId, sectionId, selectEl) {
     }
   } finally {
     if (selectEl) selectEl.disabled = false;
+  }
+}
+
+async function reorderNodesInSections(sections, options = {}) {
+  const payloadSections = Array.isArray(sections) ? sections : [];
+  if (!payloadSections.length) return;
+  try {
+    const res = await fetch('/api/nodes/reorder', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sections: payloadSections }),
+    });
+    await ensureOk(res);
+    // Websocket broadcast will update UI; fetch as a fallback.
+    if (!options?.skipFetch) {
+      await fetchNodes({ force: true });
+    }
+  } catch (err) {
+    showError(`Failed to reorder nodes: ${err.message}`);
   }
 }
 

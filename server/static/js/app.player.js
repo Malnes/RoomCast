@@ -1104,6 +1104,9 @@ if (addNodeToggle) {
   });
 }
 
+// Ensure the Add menu starts closed (defensive against inconsistent DOM state).
+closeAddMenu();
+
 if (addMenuNodeBtn) {
   addMenuNodeBtn.addEventListener('click', (evt) => {
     evt.preventDefault();
