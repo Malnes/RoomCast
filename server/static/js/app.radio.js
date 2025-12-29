@@ -1633,7 +1633,7 @@ function loadEqSkinPreference() {
   } catch (_) {
     /* ignore storage errors */
   }
-  return 'classic';
+  return 'faders';
 }
 function persistEqSkinPreference(value) {
   try {
