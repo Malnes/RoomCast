@@ -169,6 +169,8 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
   margin: 6px 0 10px;
 }
 
+.node-sections-edit-bar[hidden] { display: none !important; }
+
 /* Node section edit mode: disable buttons, allow drag + drop. */
 #nodes.node-sections-edit-mode .node-draggable {
   position: relative;

@@ -1,14 +1,23 @@
 services:
   controller:
     image: ${ROOMCAST_CONTROLLER_IMAGE:-ghcr.io/malnes/roomcast-controller:latest}
-    network_mode: host
+    ports:
+      # UI (and general API). Override via ROOMCAST_UI_PORT.
+      - "${ROOMCAST_UI_PORT:-18080}:8000"
+      # Sonos pulls audio from the controller; expose a dedicated host port for it.
+      # Override via ROOMCAST_SONOS_PORT.
+      - "${ROOMCAST_SONOS_PORT:-18081}:8000"
     environment:
-      SNAPSERVER_HOST: ${SNAPSERVER_HOST:-127.0.0.1}
+      SNAPSERVER_HOST: ${SNAPSERVER_HOST:-snapserver}
       SNAPSERVER_PORT: ${SNAPSERVER_PORT:-1780}
       CONFIG_PATH: ${CONFIG_PATH:-/config/spotify.json}
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
-      SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:8000/api/spotify/callback}
+      # If you use Spotify auth, ensure the registered redirect URI matches this externally reachable URL.
+      SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:${ROOMCAST_UI_PORT:-18080}/api/spotify/callback}
+      # Sonos will be given absolute stream URLs using this host + port.
+      ROOMCAST_PUBLIC_HOST: ${ROOMCAST_PUBLIC_HOST:-127.0.0.1}
+      ROOMCAST_PUBLIC_PORT: ${ROOMCAST_PUBLIC_PORT:-${ROOMCAST_SONOS_PORT:-18081}}
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
     depends_on:
       - snapserver
@@ -39,7 +48,9 @@ services:
 
   snapserver:
     image: ${ROOMCAST_SNAPSERVER_IMAGE:-ghcr.io/malnes/roomcast-snapserver:latest}
-    network_mode: host
+    ports:
+      - "${SNAPSERVER_HTTP_PORT:-1780}:1780"
+      - "${SNAPSERVER_STREAM_PORT:-1704}:1704"
     command:
       - --stream.source
       - pipe:///tmp/snapfifo-ch1?name=Spotify_CH1&sampleformat=44100:16:2&codec=pcm
@@ -57,7 +68,6 @@ services:
 
   librespot_ch1:
     image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
-    network_mode: host
     depends_on:
       - snapserver
     volumes:
@@ -72,7 +82,6 @@ services:
 
   librespot_ch2:
     image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
-    network_mode: host
     depends_on:
       - snapserver
     volumes:
@@ -87,12 +96,11 @@ services:
 
   radio_worker:
     image: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
-    network_mode: host
     depends_on:
       - controller
       - snapserver
     environment:
-      CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://127.0.0.1:8000}
+      CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://controller:8000}
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
       RADIO_ASSIGNMENT_INTERVAL: ${RADIO_ASSIGNMENT_INTERVAL:-10}
     volumes:
