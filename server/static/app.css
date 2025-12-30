@@ -266,8 +266,10 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 .node-section-select:disabled { opacity: 0.5; cursor: not-allowed; }
 .node-section-select option { background: #0f172a; color: #f8fafc; }
 .node-header { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
-.node-gear { position: relative; display: flex; gap: 8px; align-items: center; }
-.node-channel-selector { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 999px; border: 1px solid rgba(148,163,184,0.25); background: transparent; box-shadow: none; }
+.node-title { min-width: 0; overflow: hidden; }
+.node-title strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-gear { position: relative; display: flex; gap: 8px; align-items: center; min-width: 0; }
+.node-channel-selector { display: inline-flex; align-items: center; gap: 6px; padding: 5px 8px; border-radius: 999px; border: 1px solid rgba(148,163,184,0.25); background: transparent; box-shadow: none; flex: 0 1 200px; max-width: 200px; min-width: 140px; }
 .node-channel-dot { width: 10px; height: 10px; border-radius: 50%; box-shadow: 0 0 0 2px rgba(0,0,0,0.35); box-sizing: border-box; }
 .node-channel-dot.is-connecting {
   background: transparent !important;
@@ -275,7 +277,7 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
   border-top-color: var(--node-channel-accent, #94a3b8);
   animation: spin 0.8s linear infinite;
 }
-.node-channel-select { appearance: none; -webkit-appearance: none; -moz-appearance: none; border: none; background: transparent; color: #f8fafc; font-size: 13px; font-weight: 600; padding: 4px 24px 4px 6px; border-radius: 999px; min-width: 112px; width: auto; cursor: pointer; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23f8fafc'%3E%3Cpath d='M7 10l5 5 5-5'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 4px center; background-size: 12px; transition: opacity 0.15s ease; box-shadow: none; }
+.node-channel-select { appearance: none; -webkit-appearance: none; -moz-appearance: none; border: none; background: transparent; color: #f8fafc; font-size: 13px; font-weight: 600; padding: 4px 24px 4px 6px; border-radius: 999px; min-width: 112px; width: 100%; max-width: 100%; cursor: pointer; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%23f8fafc'%3E%3Cpath d='M7 10l5 5 5-5'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: right 4px center; background-size: 12px; transition: opacity 0.15s ease; box-shadow: none; }
 .node-channel-select:focus,
 .node-channel-select:focus-visible { outline: none; opacity: 0.9; box-shadow: none !important; border: none !important; }
 .node-channel-select:hover:not(:disabled) { opacity: 0.9; }

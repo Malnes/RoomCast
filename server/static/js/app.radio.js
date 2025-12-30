@@ -2057,7 +2057,7 @@ function createNodeChannelSelector(node, options = {}) {
   const resolvedId = resolveNodeChannelId(node) || '';
   const unassignedOption = document.createElement('option');
   unassignedOption.value = '';
-  unassignedOption.textContent = hasPlayable ? 'Unassigned' : 'No enabled channels';
+  unassignedOption.textContent = hasPlayable ? 'Unassigned' : 'No channels';
   if (!hasPlayable) {
     unassignedOption.disabled = true;
   }
@@ -2674,6 +2674,7 @@ function commitRenderNodes(nodes) {
     const header = document.createElement('div');
     header.className = 'node-header';
     const title = document.createElement('div');
+    title.className = 'node-title';
     title.style.display = 'flex';
     title.style.alignItems = 'center';
     title.style.gap = '8px';
