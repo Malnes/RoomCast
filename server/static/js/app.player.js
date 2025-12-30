@@ -1096,10 +1096,31 @@ let providerAddModalList = null;
 
 let radioSlotsCache = null;
 
-function providerBadgeText(provider) {
-  const name = (provider?.name || provider?.id || '').trim();
-  if (!name) return '?';
-  return name.slice(0, 1).toUpperCase();
+function providerIconSrc(providerIdRaw) {
+  const pid = (providerIdRaw || '').trim().toLowerCase();
+  if (pid === 'spotify') return '/static/icons/providers/spotify.svg';
+  if (pid === 'radio') return '/static/icons/providers/radio.svg';
+  if (pid === 'audiobookshelf') return '/static/icons/providers/audiobookshelf.svg';
+  return '/static/icons/providers/generic.svg';
+}
+
+function createProviderIconEl(provider) {
+  const pid = (provider?.id || '').trim().toLowerCase();
+  const name = (provider?.name || provider?.id || '').trim() || 'Provider';
+  const img = document.createElement('img');
+  img.className = 'provider-icon';
+  img.alt = `${name} logo`;
+  img.decoding = 'async';
+  img.loading = 'lazy';
+  img.src = providerIconSrc(pid);
+  img.addEventListener(
+    'error',
+    () => {
+      img.src = '/static/icons/providers/generic.svg';
+    },
+    { once: true },
+  );
+  return img;
 }
 
 async function fetchRadioSlots() {
@@ -1217,10 +1238,7 @@ function renderProviderAddModal() {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'provider-option-btn';
-      const badge = document.createElement('span');
-      badge.className = 'provider-badge';
-      badge.textContent = providerBadgeText(provider);
-      btn.appendChild(badge);
+      btn.appendChild(createProviderIconEl(provider));
 
       const name = document.createElement('div');
       name.style.fontWeight = '900';
@@ -1398,10 +1416,7 @@ function renderInstalledProviders() {
       const left = document.createElement('div');
       left.className = 'provider-row-left';
 
-      const badge = document.createElement('span');
-      badge.className = 'provider-badge';
-      badge.textContent = providerBadgeText(provider);
-      left.appendChild(badge);
+      left.appendChild(createProviderIconEl(provider));
 
       const titleWrap = document.createElement('div');
       titleWrap.className = 'provider-row-title';
@@ -1420,7 +1435,7 @@ function renderInstalledProviders() {
       right.style.gap = '8px';
       const settingsBtn = document.createElement('button');
       settingsBtn.type = 'button';
-      settingsBtn.className = 'icon-only-btn';
+      settingsBtn.className = 'provider-gear-btn';
       settingsBtn.setAttribute('aria-label', 'Provider settings');
       settingsBtn.textContent = '⚙︎';
       settingsBtn.addEventListener('click', () => {

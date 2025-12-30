@@ -80,6 +80,22 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 .danger-btn { background: linear-gradient(135deg, #f97316, #ef4444); color: #fff; }
 .danger-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .icon-only-btn { width: 42px; height: 42px; border-radius: 999px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.08); color: #f8fafc; }
+.provider-gear-btn {
+  width: auto;
+  height: auto;
+  padding: 6px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #e2e8f0;
+  line-height: 1;
+}
+.provider-gear-btn:hover { background: transparent; opacity: 0.85; }
+.provider-gear-btn:active { transform: translateY(1px) scale(0.99); filter: none; }
+.provider-gear-btn:focus { outline: none; box-shadow: 0 0 0 2px rgba(var(--accent-rgb),0.25); }
 .header-actions { display: flex; gap: 8px; align-items: center; }
 .header-actions > * {
   min-height: 38px;
@@ -134,6 +150,20 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
   align-items: flex-start;
   gap: 10px;
   min-width: 0;
+}
+
+.provider-icon {
+  width: 34px;
+  height: 34px;
+  border-radius: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  color: #e2e8f0;
+  flex: 0 0 34px;
+  object-fit: contain;
 }
 
 .provider-badge {
