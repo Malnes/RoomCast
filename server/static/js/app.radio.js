@@ -2101,6 +2101,7 @@ function createNodeChannelSelector(node, options = {}) {
 
 function computeNodeTitleMarquee(titleEl) {
   if (!titleEl) return;
+  const strongEl = titleEl.querySelector('strong');
   const trackEl = titleEl.querySelector('.node-title-track');
   const primaryTextEl = titleEl.querySelector('.node-title-text:not(.is-clone)');
   if (!trackEl || !primaryTextEl) return;
@@ -2116,12 +2117,12 @@ function computeNodeTitleMarquee(titleEl) {
     existingClone.remove();
   }
 
-  const containerWidth = titleEl.clientWidth || 0;
+  const containerWidth = (strongEl?.clientWidth || titleEl.clientWidth || 0);
   const textWidth = primaryTextEl.scrollWidth || 0;
   const overflow = Math.max(0, textWidth - containerWidth);
   if (overflow <= 6) return;
 
-  const gap = 24;
+  const gap = 16;
   const distance = textWidth + gap;
   titleEl.style.setProperty('--node-title-gap', `${gap}px`);
   const clone = primaryTextEl.cloneNode(true);
@@ -2749,9 +2750,6 @@ function commitRenderNodes(nodes) {
     header.className = 'node-header';
     const title = document.createElement('div');
     title.className = 'node-title';
-    title.style.display = 'flex';
-    title.style.alignItems = 'center';
-    title.style.gap = '8px';
     const titleStrong = document.createElement('strong');
     const titleTrack = document.createElement('span');
     titleTrack.className = 'node-title-track';
