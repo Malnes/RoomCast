@@ -1624,7 +1624,7 @@ let nodeDragPlaceholder = null;
 let nodeDragOffsetX = 0;
 let nodeDragOffsetY = 0;
 let nodeDragSourceSectionId = null;
-const nodeSectionCollapsed = new Map();
+const nodeSectionViewState = new Map();
 const nodeVolumeSliderRefs = new Map();
 const nodeVolumeUpdateTimers = new Map();
 const NODE_VOLUME_PUSH_DEBOUNCE_MS = 150;
@@ -1686,7 +1686,7 @@ function enterNodeSectionEditMode() {
   if (isNodeSectionEditMode()) return;
   nodeSectionsEditSnapshot = {
     sections: getNodeSections().map(s => ({ ...s })),
-    collapsed: new Map(nodeSectionCollapsed),
+    viewState: new Map(nodeSectionViewState),
   };
   nodeSectionsEditStagedRenames = new Map();
   nodeSectionsEditStagedDeletions = new Set();
@@ -1708,11 +1708,23 @@ function cancelNodeSectionEdits() {
   if (nodeSectionsEditSnapshot?.sections) {
     setNodeSections(nodeSectionsEditSnapshot.sections);
   }
-  if (nodeSectionsEditSnapshot?.collapsed) {
-    nodeSectionCollapsed.clear();
-    nodeSectionsEditSnapshot.collapsed.forEach((value, key) => nodeSectionCollapsed.set(key, value));
+  if (nodeSectionsEditSnapshot?.viewState) {
+    nodeSectionViewState.clear();
+    nodeSectionsEditSnapshot.viewState.forEach((value, key) => nodeSectionViewState.set(key, value));
   }
   exitNodeSectionEditMode();
+}
+
+function getNodeSectionViewState(sectionId) {
+  const value = typeof sectionId === 'string' ? nodeSectionViewState.get(sectionId) : null;
+  return value === 'collapsed' || value === 'compact' || value === 'expanded' ? value : 'expanded';
+}
+
+function cycleNodeSectionViewState(sectionId) {
+  const current = getNodeSectionViewState(sectionId);
+  const next = current === 'expanded' ? 'compact' : (current === 'compact' ? 'collapsed' : 'expanded');
+  nodeSectionViewState.set(sectionId, next);
+  return next;
 }
 
 async function saveNodeSectionEdits() {
@@ -2671,7 +2683,8 @@ function commitRenderNodes(nodes) {
 
     const isVirtual = sectionId === UNSECTIONED_GROUP_ID;
 
-    const collapsed = !editMode && nodeSectionCollapsed.get(sectionId) === true;
+    const sectionView = editMode ? 'expanded' : getNodeSectionViewState(sectionId);
+    const collapsed = sectionView === 'collapsed';
     const group = document.createElement('div');
     group.className = 'node-section-group';
     group.dataset.sectionId = sectionId;
@@ -2715,8 +2728,7 @@ function commitRenderNodes(nodes) {
       if (isNodeSectionEditMode()) {
         return;
       }
-      const next = !(nodeSectionCollapsed.get(sectionId) === true);
-      nodeSectionCollapsed.set(sectionId, next);
+      cycleNodeSectionViewState(sectionId);
       renderNodes(nodesCache, { force: true });
     });
 
@@ -2742,10 +2754,75 @@ function commitRenderNodes(nodes) {
 
     sectionNodes.forEach(n => {
     hydrateEqFromNode(n);
+
+    const isBrowser = n.type === 'browser';
+    const isSonos = n.type === 'sonos';
+    const paired = isSonos ? true : !!n.paired;
+    const configured = (isBrowser || isSonos) ? true : !!n.configured;
+    const online = isBrowser ? true : n.online !== false;
+    const restarting = !!n.restarting;
+    const updateAvailable = hasAgentUpdate(n);
+    const updating = !!n.updating;
+    const disableNodeControls = isBrowser ? false : (!online || restarting || (!isSonos && (!paired || !configured)));
+
     const wrapper = document.createElement('div');
     wrapper.className = 'panel node-draggable';
     wrapper.dataset.nodeId = n.id;
     wrapper.dataset.sectionId = sectionId;
+
+    if (!editMode && sectionView === 'compact') {
+      wrapper.classList.add('node-compact');
+
+      const row = document.createElement('div');
+      row.className = 'node-compact-row';
+
+      const nameCell = document.createElement('div');
+      nameCell.className = 'node-compact-name';
+      const title = document.createElement('div');
+      title.className = 'node-title';
+      const titleStrong = document.createElement('strong');
+      const titleTrack = document.createElement('span');
+      titleTrack.className = 'node-title-track';
+      const titleText = document.createElement('span');
+      titleText.className = 'node-title-text';
+      titleText.textContent = n.name;
+      titleTrack.appendChild(titleText);
+      titleStrong.appendChild(titleTrack);
+      title.appendChild(titleStrong);
+      nameCell.appendChild(title);
+
+      const sliderCell = document.createElement('div');
+      sliderCell.className = 'node-compact-slider';
+      const volInput = document.createElement('input');
+      volInput.type = 'range';
+      volInput.min = 0;
+      volInput.max = 100;
+      const parsedVolume = Number(n.volume_percent);
+      volInput.value = Number.isFinite(parsedVolume) ? parsedVolume : 75;
+      volInput.disabled = disableNodeControls;
+      volInput.style.width = '100%';
+      const nodeVolumeColor = getNodeChannelAccent(n) || '#94a3b8';
+      applyRangeAccent(volInput, nodeVolumeColor);
+      setRangeProgress(volInput, volInput.value, volInput.max || 100);
+      volInput.addEventListener('input', () => {
+        setRangeProgress(volInput, volInput.value, volInput.max || 100);
+        queueNodeVolumeUpdate(n.id, volInput.value);
+      });
+      volInput.addEventListener('change', () => {
+        flushPendingNodeVolumeUpdate(n.id);
+        setNodeVolume(n.id, volInput.value);
+      });
+      nodeVolumeSliderRefs.set(n.id, volInput);
+      sliderCell.appendChild(volInput);
+
+      row.appendChild(nameCell);
+      row.appendChild(sliderCell);
+      wrapper.appendChild(row);
+      body.appendChild(wrapper);
+      scheduleNodeTitleMarquee(title);
+      return;
+    }
+
     const header = document.createElement('div');
     header.className = 'node-header';
     const title = document.createElement('div');
@@ -2781,15 +2858,7 @@ function commitRenderNodes(nodes) {
 
     const statusRow = document.createElement('div');
     statusRow.className = 'node-status';
-    const isBrowser = n.type === 'browser';
-    const isSonos = n.type === 'sonos';
-    const paired = isSonos ? true : !!n.paired;
-    const configured = (isBrowser || isSonos) ? true : !!n.configured;
-    const online = isBrowser ? true : n.online !== false;
-    const restarting = !!n.restarting;
-    const updateAvailable = hasAgentUpdate(n);
-    const updating = !!n.updating;
-    const disableNodeControls = isBrowser ? false : (!online || restarting || (!isSonos && (!paired || !configured)));
+
 
     let eqBtn = null;
     if (isBrowser || isSonos || n.type === 'agent') {
