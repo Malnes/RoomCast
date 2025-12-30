@@ -2099,6 +2099,80 @@ function createNodeChannelSelector(node, options = {}) {
   return wrapper;
 }
 
+function computeNodeTitleMarquee(titleEl) {
+  if (!titleEl) return;
+  const trackEl = titleEl.querySelector('.node-title-track');
+  const primaryTextEl = titleEl.querySelector('.node-title-text:not(.is-clone)');
+  if (!trackEl || !primaryTextEl) return;
+
+  titleEl.classList.remove('is-marquee');
+  titleEl.classList.remove('is-marquee-playing');
+  titleEl.style.removeProperty('--node-title-distance');
+  titleEl.style.removeProperty('--node-title-duration');
+  titleEl.style.removeProperty('--node-title-gap');
+
+  const existingClone = titleEl.querySelector('.node-title-text.is-clone');
+  if (existingClone) {
+    existingClone.remove();
+  }
+
+  const containerWidth = titleEl.clientWidth || 0;
+  const textWidth = primaryTextEl.scrollWidth || 0;
+  const overflow = Math.max(0, textWidth - containerWidth);
+  if (overflow <= 6) return;
+
+  const gap = 24;
+  const distance = textWidth + gap;
+  titleEl.style.setProperty('--node-title-gap', `${gap}px`);
+  const clone = primaryTextEl.cloneNode(true);
+  clone.classList.add('is-clone');
+  clone.setAttribute('aria-hidden', 'true');
+  trackEl.appendChild(clone);
+
+  titleEl.classList.add('is-marquee');
+  titleEl.style.setProperty('--node-title-distance', `${distance}px`);
+  const durationSeconds = Math.min(16, Math.max(4, distance / 40 + 2));
+  titleEl.style.setProperty('--node-title-duration', `${durationSeconds}s`);
+
+  if (titleEl.dataset.marqueeBound !== '1') {
+    titleEl.dataset.marqueeBound = '1';
+    const replay = () => {
+      computeNodeTitleMarquee(titleEl);
+      if (!titleEl.classList.contains('is-marquee')) return;
+      titleEl.classList.remove('is-marquee-playing');
+      void titleEl.offsetWidth;
+      titleEl.classList.add('is-marquee-playing');
+    };
+    titleEl.addEventListener('mouseenter', replay);
+    titleEl.addEventListener('focusin', replay);
+    titleEl.addEventListener('animationend', event => {
+      if (event.animationName !== 'node-title-marquee') return;
+      titleEl.classList.remove('is-marquee-playing');
+    });
+  }
+}
+
+function scheduleNodeTitleMarquee(titleEl) {
+  if (!titleEl) return;
+  requestAnimationFrame(() => {
+    computeNodeTitleMarquee(titleEl);
+    if (!titleEl.classList.contains('is-marquee')) return;
+    titleEl.classList.remove('is-marquee-playing');
+    void titleEl.offsetWidth;
+    titleEl.classList.add('is-marquee-playing');
+  });
+}
+
+let nodeTitleMarqueeResizeScheduled = false;
+window.addEventListener('resize', () => {
+  if (nodeTitleMarqueeResizeScheduled) return;
+  nodeTitleMarqueeResizeScheduled = true;
+  requestAnimationFrame(() => {
+    nodeTitleMarqueeResizeScheduled = false;
+    document.querySelectorAll('.node-title').forEach(el => computeNodeTitleMarquee(el));
+  });
+}, { passive: true });
+
 function clampWifiPercent(value) {
   if (!Number.isFinite(value)) return null;
   return Math.max(0, Math.min(100, Math.round(value)));
@@ -2679,7 +2753,13 @@ function commitRenderNodes(nodes) {
     title.style.alignItems = 'center';
     title.style.gap = '8px';
     const titleStrong = document.createElement('strong');
-    titleStrong.textContent = n.name;
+    const titleTrack = document.createElement('span');
+    titleTrack.className = 'node-title-track';
+    const titleText = document.createElement('span');
+    titleText.className = 'node-title-text';
+    titleText.textContent = n.name;
+    titleTrack.appendChild(titleText);
+    titleStrong.appendChild(titleTrack);
     title.appendChild(titleStrong);
     const identityBadge = renderNodeIdentityBadge(n);
     if (identityBadge) {
@@ -2866,6 +2946,7 @@ function commitRenderNodes(nodes) {
     wrapper.appendChild(actions);
 
     body.appendChild(wrapper);
+    scheduleNodeTitleMarquee(title);
     });
   });
 
