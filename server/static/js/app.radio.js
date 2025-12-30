@@ -818,8 +818,315 @@ async function fetchPlaylistSummary(playlist) {
   }
 }
 
+let playlistOverlayMode = 'spotify';
+let absLibraryId = null;
+let absPodcastsCache = [];
+let absEpisodesCache = [];
+let absSelectedPodcast = null;
+let absShowPlayed = false;
+
+let playlistOverlayBase = null;
+
+function capturePlaylistOverlayBase() {
+  if (playlistOverlayBase) return;
+  playlistOverlayBase = {
+    title: document.getElementById('playlist-modal-title')?.textContent || 'Playlists',
+    searchPlaceholder: playlistSearchInput?.getAttribute('placeholder') || 'Search playlists',
+    sortOptionsHtml: playlistSortSelect ? playlistSortSelect.innerHTML : '',
+    sortValue: playlistSortSelect?.value || 'recent',
+    backLabel: playlistBackBtn?.textContent || '← All playlists',
+    trackFilterPlaceholder: playlistTrackFilterInput?.getAttribute('placeholder') || 'Filter songs in this playlist',
+  };
+}
+
+function setPlaylistOverlayMode(mode) {
+  const next = mode === 'audiobookshelf' ? 'audiobookshelf' : 'spotify';
+  playlistOverlayMode = next;
+  capturePlaylistOverlayBase();
+  const titleEl = document.getElementById('playlist-modal-title');
+
+  if (next === 'audiobookshelf') {
+    if (titleEl) titleEl.textContent = 'Podcasts';
+    if (playlistSearchInput) {
+      playlistSearchInput.value = '';
+      playlistSearchInput.setAttribute('placeholder', 'Search podcasts');
+    }
+    if (playlistSortSelect) {
+      playlistSortSelect.innerHTML = '';
+      const optHide = document.createElement('option');
+      optHide.value = 'hide_played';
+      optHide.textContent = 'Hide played';
+      const optShow = document.createElement('option');
+      optShow.value = 'show_played';
+      optShow.textContent = 'Show played';
+      playlistSortSelect.appendChild(optHide);
+      playlistSortSelect.appendChild(optShow);
+      playlistSortSelect.value = absShowPlayed ? 'show_played' : 'hide_played';
+    }
+    if (playlistBackBtn) playlistBackBtn.textContent = '← All podcasts';
+    if (playlistTrackFilterInput) {
+      playlistTrackFilterInput.value = '';
+      playlistTrackFilterInput.setAttribute('placeholder', 'Filter episodes');
+    }
+    if (playlistTrackProgress) playlistTrackProgress.textContent = '';
+    if (playlistLoadMoreBtn) playlistLoadMoreBtn.hidden = true;
+  } else {
+    if (titleEl) titleEl.textContent = playlistOverlayBase?.title || 'Playlists';
+    if (playlistSearchInput) {
+      playlistSearchInput.setAttribute('placeholder', playlistOverlayBase?.searchPlaceholder || 'Search playlists');
+    }
+    if (playlistSortSelect) {
+      playlistSortSelect.innerHTML = playlistOverlayBase?.sortOptionsHtml || '';
+      playlistSortSelect.value = playlistOverlayBase?.sortValue || 'recent';
+    }
+    if (playlistBackBtn) playlistBackBtn.textContent = playlistOverlayBase?.backLabel || '← All playlists';
+    if (playlistTrackFilterInput) {
+      playlistTrackFilterInput.setAttribute('placeholder', playlistOverlayBase?.trackFilterPlaceholder || 'Filter songs in this playlist');
+    }
+  }
+}
+
+function renderAudiobookshelfPodcastGrid(items) {
+  if (!playlistGrid) return;
+  playlistGrid.innerHTML = '';
+  const list = Array.isArray(items) ? items : [];
+  const filtered = list.filter(item => {
+    if (!playlistSearchTerm) return true;
+    const haystack = `${item?.title || ''} ${item?.author || ''}`.toLowerCase();
+    return haystack.includes(playlistSearchTerm);
+  });
+  filtered.forEach(item => {
+    if (!item?.id) return;
+    const card = document.createElement('button');
+    card.type = 'button';
+    card.className = 'playlist-card';
+    card.setAttribute('role', 'listitem');
+    card.dataset.absPodcastId = item.id;
+    const cover = document.createElement('img');
+    cover.className = 'playlist-cover';
+    cover.alt = item?.title ? `${item.title} cover` : 'Podcast cover';
+    cover.src = item?.image || PLAYLIST_FALLBACK_COVER;
+    cover.loading = 'lazy';
+    const title = document.createElement('div');
+    title.className = 'playlist-card-title';
+    title.textContent = item?.title || 'Untitled podcast';
+    card.appendChild(cover);
+    card.appendChild(title);
+    if (item?.author) {
+      const owner = document.createElement('div');
+      owner.className = 'playlist-card-owner';
+      owner.textContent = item.author;
+      card.appendChild(owner);
+    }
+    card.addEventListener('click', () => selectAudiobookshelfPodcast(item));
+    playlistGrid.appendChild(card);
+  });
+  if (playlistEmpty) {
+    if (!list.length) {
+      playlistEmpty.hidden = false;
+      playlistEmpty.textContent = 'No podcasts available.';
+    } else if (!filtered.length) {
+      playlistEmpty.hidden = false;
+      playlistEmpty.textContent = 'No podcasts match your search.';
+    } else {
+      playlistEmpty.hidden = true;
+      playlistEmpty.textContent = '';
+    }
+  }
+}
+
+async function fetchAudiobookshelfPodcasts() {
+  absSelectedPodcast = null;
+  absEpisodesCache = [];
+  setPlaylistErrorMessage('');
+  setPlaylistLoadingState(true, 'Loading podcasts…');
+  if (playlistEmpty) playlistEmpty.hidden = true;
+  try {
+    const res = await fetch('/api/audiobookshelf/podcasts');
+    await ensureOk(res);
+    const data = await res.json();
+    absLibraryId = data?.library_id || null;
+    absPodcastsCache = Array.isArray(data?.podcasts) ? data.podcasts : [];
+    renderAudiobookshelfPodcastGrid(absPodcastsCache);
+  } catch (err) {
+    absPodcastsCache = [];
+    if (playlistGrid) playlistGrid.innerHTML = '';
+    if (playlistEmpty) {
+      playlistEmpty.hidden = false;
+      playlistEmpty.textContent = 'Unable to load podcasts right now.';
+    }
+    setPlaylistErrorMessage(`Failed to load podcasts: ${err.message}`);
+  } finally {
+    setPlaylistLoadingState(false);
+  }
+}
+
+async function fetchAudiobookshelfEpisodes(libraryItemId) {
+  if (!libraryItemId) return;
+  setPlaylistErrorMessage('');
+  setPlaylistLoadingState(true, 'Loading episodes…');
+  try {
+    const params = new URLSearchParams({ show_played: absShowPlayed ? 'true' : 'false' });
+    const res = await fetch(`/api/audiobookshelf/podcasts/${encodeURIComponent(libraryItemId)}/episodes?${params.toString()}`);
+    await ensureOk(res);
+    const data = await res.json();
+    absEpisodesCache = Array.isArray(data?.episodes) ? data.episodes : [];
+    renderAudiobookshelfEpisodes(absEpisodesCache);
+  } catch (err) {
+    absEpisodesCache = [];
+    if (playlistTracklist) playlistTracklist.innerHTML = '';
+    setPlaylistErrorMessage(`Failed to load episodes: ${err.message}`);
+  } finally {
+    setPlaylistLoadingState(false);
+  }
+}
+
+function renderAudiobookshelfEpisodes(items) {
+  if (!playlistTracklist) return;
+  const list = Array.isArray(items) ? items : [];
+  const filtered = !playlistTrackSearchTerm
+    ? list
+    : list.filter(ep => {
+      const haystack = `${ep?.title || ''}`.toLowerCase();
+      return haystack.includes(playlistTrackSearchTerm);
+    });
+  playlistTracklist.innerHTML = '';
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'playlist-empty muted';
+    empty.textContent = absShowPlayed ? 'No episodes found.' : 'No unplayed episodes found.';
+    playlistTracklist.appendChild(empty);
+    return;
+  }
+  if (!filtered.length) {
+    const empty = document.createElement('div');
+    empty.className = 'playlist-empty muted';
+    empty.textContent = 'No episodes match your filter.';
+    playlistTracklist.appendChild(empty);
+    return;
+  }
+  filtered.forEach(ep => {
+    if (!ep?.id) return;
+    const row = document.createElement('button');
+    row.type = 'button';
+    row.className = 'playlist-track-row';
+    row.setAttribute('role', 'listitem');
+    row.dataset.absEpisodeId = ep.id;
+    row.addEventListener('click', () => playAudiobookshelfEpisode(ep));
+
+    const coverWrap = document.createElement('div');
+    coverWrap.className = 'search-track-cover-wrap';
+    const cover = document.createElement('img');
+    cover.className = 'search-track-cover';
+    cover.alt = '';
+    cover.src = absSelectedPodcast?.image || PLAYLIST_FALLBACK_COVER;
+    const playOverlay = document.createElement('div');
+    playOverlay.className = 'search-track-play';
+    playOverlay.innerHTML = TRACK_PLAY_ICON;
+    coverWrap.appendChild(cover);
+    coverWrap.appendChild(playOverlay);
+
+    const meta = document.createElement('div');
+    meta.className = 'search-track-meta';
+    const title = document.createElement('div');
+    title.className = 'search-track-title';
+    title.textContent = ep?.title || 'Untitled episode';
+    meta.appendChild(title);
+
+    const subtitle = document.createElement('div');
+    subtitle.className = 'search-track-subtitle';
+    subtitle.textContent = ep?.finished ? 'Played' : '';
+    meta.appendChild(subtitle);
+
+    const extra = document.createElement('div');
+    extra.className = 'playlist-track-extra';
+    let hasExtra = false;
+    if (typeof ep?.duration_ms === 'number' && ep.duration_ms > 0) {
+      const duration = document.createElement('div');
+      duration.className = 'playlist-track-duration';
+      duration.textContent = msToTime(ep.duration_ms);
+      extra.appendChild(duration);
+      hasExtra = true;
+    }
+    if (hasExtra) meta.appendChild(extra);
+
+    row.appendChild(coverWrap);
+    row.appendChild(meta);
+    playlistTracklist.appendChild(row);
+  });
+}
+
+async function playAudiobookshelfEpisode(episode) {
+  const channelId = getActiveChannelId();
+  if (!channelId) {
+    showError('Select a channel to start playback.');
+    return;
+  }
+  if (!absSelectedPodcast?.id || !episode?.id) {
+    showError('Unable to start playback for this episode.');
+    return;
+  }
+  try {
+    const body = {
+      library_item_id: absSelectedPodcast.id,
+      episode_id: episode.id,
+      podcast_title: absSelectedPodcast.title || null,
+      episode_title: episode.title || null,
+    };
+    const res = await fetch(`/api/audiobookshelf/${encodeURIComponent(channelId)}/play`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    await ensureOk(res);
+    closePlaylistOverlay();
+    fetchPlayerStatus();
+  } catch (err) {
+    showError(`Failed to start playback: ${err.message}`);
+  }
+}
+
+function showAudiobookshelfPodcastsGrid() {
+  playlistAutoSelectId = null;
+  setPlaylistView('playlists');
+  if (playlistSubtitle) playlistSubtitle.textContent = '';
+  if (playlistTracklist) playlistTracklist.innerHTML = '';
+  setPlaylistErrorMessage('');
+  if (playlistGrid) playlistGrid.innerHTML = '';
+  if (playlistEmpty) {
+    playlistEmpty.hidden = true;
+    playlistEmpty.textContent = '';
+  }
+  resetPlaylistTrackFilter();
+  fetchAudiobookshelfPodcasts();
+}
+
+function selectAudiobookshelfPodcast(podcast) {
+  if (!podcast?.id) {
+    showError('Unable to open this podcast.');
+    return;
+  }
+  absSelectedPodcast = podcast;
+  setPlaylistErrorMessage('');
+  resetPlaylistTrackFilter();
+  setPlaylistView('tracks');
+  if (playlistTracklist) playlistTracklist.scrollTop = 0;
+  if (playlistSelectedName) playlistSelectedName.textContent = podcast?.title || 'Podcast';
+  if (playlistSelectedOwner) {
+    playlistSelectedOwner.textContent = podcast?.author || '';
+    playlistSelectedOwner.hidden = !podcast?.author;
+  }
+  if (playlistSummaryEl) {
+    playlistSummaryEl.textContent = absShowPlayed ? 'Showing played episodes' : 'Hiding played episodes';
+  }
+  fetchAudiobookshelfEpisodes(podcast.id);
+}
+
 function openPlaylistOverlay() {
   if (!playlistOverlay) return;
+  const channel = getActiveChannel();
+  const abs = isAudiobookshelfChannel(channel);
+  setPlaylistOverlayMode(abs ? 'audiobookshelf' : 'spotify');
   resetPlaylistFilters();
   resetPlaylistTrackFilter();
   playlistSelected = null;
@@ -830,6 +1137,16 @@ function openPlaylistOverlay() {
   if (playlistSubtitle) playlistSubtitle.textContent = '';
   setPlaylistErrorMessage('');
   if (playlistTracklist) playlistTracklist.innerHTML = '';
+  if (abs) {
+    absLibraryId = null;
+    absPodcastsCache = [];
+    absEpisodesCache = [];
+    absSelectedPodcast = null;
+    absShowPlayed = false;
+    if (playlistSortSelect) playlistSortSelect.value = 'hide_played';
+    showAudiobookshelfPodcastsGrid();
+    return;
+  }
   const contextPlaylistId = activePlaylistContextId || null;
   if (contextPlaylistId) {
     playlistAutoSelectId = null;
@@ -850,9 +1167,24 @@ function closePlaylistOverlay() {
   resetPlaylistFilters();
   resetPlaylistDetails();
   if (playlistTracklist) playlistTracklist.innerHTML = '';
+  absSelectedPodcast = null;
+  absEpisodesCache = [];
+  absPodcastsCache = [];
+  absLibraryId = null;
+  absShowPlayed = false;
+  setPlaylistOverlayMode('spotify');
 }
 
 function handlePlaylistBack() {
+  if (playlistOverlayMode === 'audiobookshelf') {
+    absSelectedPodcast = null;
+    absEpisodesCache = [];
+    if (playlistSubtitle) playlistSubtitle.textContent = '';
+    setPlaylistErrorMessage('');
+    playlistAutoSelectId = null;
+    showAudiobookshelfPodcastsGrid();
+    return;
+  }
   playlistSelected = null;
   playlistSummaryAbortController?.abort();
   playlistSummaryAbortController = null;

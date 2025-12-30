@@ -526,6 +526,28 @@
             <div class="label" style="margin-bottom:6px;">Radio settings</div>
             <div class="muted" style="font-size:12px;">No settings available for Radio yet.</div>
           </div>
+
+          <div id="provider-settings-audiobookshelf" hidden aria-hidden="true" style="margin-top:14px;">
+            <div class="label" style="margin-bottom:6px;">Audiobookshelf settings</div>
+            <div class="grid">
+              <div>
+                <label>Audiobookshelf base URL</label>
+                <input id="abs-base-url" placeholder="http://audiobookshelf.local:13378">
+              </div>
+              <div>
+                <label>API token</label>
+                <input id="abs-token" type="password" placeholder="Bearer token">
+              </div>
+              <div>
+                <label>Podcast library ID (optional)</label>
+                <input id="abs-library-id" placeholder="Leave blank to auto-pick">
+              </div>
+            </div>
+            <div style="margin-top:12px; display:flex; justify-content:flex-end;">
+              <button id="abs-provider-save" class="small-btn" type="button" style="min-width:90px;">Save</button>
+            </div>
+            <div class="muted" style="font-size:12px; margin-top:8px;">Used for browsing podcasts and starting episode playback.</div>
+          </div>
         </div>
       </div>
 

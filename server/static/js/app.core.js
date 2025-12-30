@@ -197,6 +197,10 @@ if (playlistLoadMoreBtn) {
 if (playlistTrackFilterInput) {
   playlistTrackFilterInput.addEventListener('input', () => {
     playlistTrackSearchTerm = playlistTrackFilterInput.value.trim().toLowerCase();
+    if (typeof playlistOverlayMode !== 'undefined' && playlistOverlayMode === 'audiobookshelf') {
+      renderAudiobookshelfEpisodes(typeof absEpisodesCache !== 'undefined' ? absEpisodesCache : []);
+      return;
+    }
     if (!playlistSelected) {
       if (!playlistTrackSearchTerm) return;
       return;
@@ -1573,6 +1577,11 @@ function isRadioChannel(channel) {
   return (channel.source || '').toLowerCase() === 'radio';
 }
 
+function isAudiobookshelfChannel(channel) {
+  if (!channel) return false;
+  return (channel.source || '').toLowerCase() === 'audiobookshelf';
+}
+
 function isSpotifyChannel(channel) {
   if (!channel) return false;
   return (channel.source || '').toLowerCase() === 'spotify';
@@ -1583,11 +1592,23 @@ function getRadioState(channel) {
   return channel.radio_state || null;
 }
 
+function getAudiobookshelfState(channel) {
+  if (!isAudiobookshelfChannel(channel)) return null;
+  return channel.abs_state || null;
+}
+
 function updateChannelRadioState(channelId, radioState) {
   if (!channelId) return;
   const idx = channelsCache.findIndex(ch => ch.id === channelId);
   if (idx === -1) return;
   channelsCache[idx] = { ...channelsCache[idx], radio_state: radioState || null };
+}
+
+function updateChannelAudiobookshelfState(channelId, absState) {
+  if (!channelId) return;
+  const idx = channelsCache.findIndex(ch => ch.id === channelId);
+  if (idx === -1) return;
+  channelsCache[idx] = { ...channelsCache[idx], abs_state: absState || null };
 }
 
 function resolveRadioPlaybackSnapshot(channel) {
@@ -2148,6 +2169,7 @@ function renderChannelsPanel() {
     : providersInstalledCache;
   const spotifyProviderEnabled = installedProviders.some(p => (p?.id || '').toLowerCase() === 'spotify' && p?.enabled);
   const radioProviderEnabled = installedProviders.some(p => (p?.id || '').toLowerCase() === 'radio' && p?.enabled);
+  const audiobookshelfProviderEnabled = installedProviders.some(p => (p?.id || '').toLowerCase() === 'audiobookshelf' && p?.enabled);
 
   channelsCache.forEach(channel => {
     const pending = channelPendingEdits.get(channel.id) || {};
@@ -2213,6 +2235,13 @@ function renderChannelsPanel() {
       sourceSelect.appendChild(optionRadio);
     }
 
+    if (audiobookshelfProviderEnabled) {
+      const optionAbs = document.createElement('option');
+      optionAbs.value = 'audiobookshelf';
+      optionAbs.textContent = 'Audiobookshelf';
+      sourceSelect.appendChild(optionAbs);
+    }
+
     if (spotifyProviderEnabled) {
       const sources = Array.isArray(spotifySourcesCache) ? spotifySourcesCache : [];
       if (!sources.length) {
@@ -2240,6 +2269,8 @@ function renderChannelsPanel() {
     let resolvedSelection = '';
     if (baseSource === 'radio' || baseRef.startsWith('radio')) {
       resolvedSelection = radioProviderEnabled ? 'radio' : '';
+    } else if (baseSource === 'audiobookshelf' || baseRef.startsWith('audiobookshelf')) {
+      resolvedSelection = audiobookshelfProviderEnabled ? 'audiobookshelf' : '';
     } else if (baseSource === 'spotify' || baseRef.startsWith('spotify:')) {
       resolvedSelection = spotifyProviderEnabled ? (baseRef || 'spotify:a') : '';
     }
@@ -2342,6 +2373,8 @@ function updateChannelCardState(channelId) {
     let normalizedBase = '';
     if (baseSource === 'radio' || baseRef.startsWith('radio')) {
       normalizedBase = 'radio';
+      } else if (baseSource === 'audiobookshelf' || baseRef.startsWith('audiobookshelf')) {
+        normalizedBase = 'audiobookshelf';
     } else if (baseSource === 'spotify' || baseRef.startsWith('spotify:')) {
       normalizedBase = baseRef || 'spotify:a';
     }

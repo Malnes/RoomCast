@@ -1,7 +1,14 @@
+let fetchNodesInFlight = false;
+const FETCH_NODES_TIMEOUT_MS = 8000;
+
 async function fetchNodes(options = {}) {
   if (!isAuthenticated()) return;
+  if (fetchNodesInFlight) return;
+  fetchNodesInFlight = true;
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), FETCH_NODES_TIMEOUT_MS);
   try {
-    const res = await fetch('/api/nodes');
+    const res = await fetch('/api/nodes', { signal: controller.signal });
     await ensureOk(res);
     const data = await res.json();
     if (typeof setNodeSections === 'function') {
@@ -9,7 +16,11 @@ async function fetchNodes(options = {}) {
     }
     renderNodes(data.nodes || [], options);
   } catch (err) {
+    if (err?.name === 'AbortError') return;
     showError(`Failed to load nodes: ${err.message}`);
+  } finally {
+    clearTimeout(timeoutId);
+    fetchNodesInFlight = false;
   }
 }
 

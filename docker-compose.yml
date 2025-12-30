@@ -36,12 +36,14 @@ services:
       DISCOVERY_CIDR: ${DISCOVERY_CIDR:-}
       ROOMCAST_LIBRESPOT_IMAGE: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
       ROOMCAST_RADIO_WORKER_IMAGE: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
+      ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE: ${ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE:-ghcr.io/malnes/roomcast-audiobookshelf-worker:latest}
       CONFIG_PATH: /config/spotify.json
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
       # If you use Spotify auth, ensure the registered redirect URI matches this externally reachable URL.
       SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:${ROOMCAST_UI_PORT:-18080}/api/spotify/callback}
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
+      AUDIOBOOKSHELF_WORKER_TOKEN: ${AUDIOBOOKSHELF_WORKER_TOKEN:-}
     depends_on:
       - snapserver
     volumes:
@@ -67,6 +69,10 @@ services:
       - pipe:///tmp/snapfifo-radio1?name=Radio_CH1&sampleformat=48000:16:2&codec=pcm
       - --stream.source
       - pipe:///tmp/snapfifo-radio2?name=Radio_CH2&sampleformat=48000:16:2&codec=pcm
+      - --stream.source
+      - pipe:///tmp/snapfifo-abs1?name=Audiobookshelf_CH1&sampleformat=48000:16:2&codec=pcm
+      - --stream.source
+      - pipe:///tmp/snapfifo-abs2?name=Audiobookshelf_CH2&sampleformat=48000:16:2&codec=pcm
       - --http-cors
       - '*'
     volumes:
@@ -104,6 +110,20 @@ services:
       CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://controller:8000}
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
       RADIO_ASSIGNMENT_INTERVAL: ${RADIO_ASSIGNMENT_INTERVAL:-10}
+    volumes:
+      - snapfifo:/tmp
+
+  audiobookshelf_worker:
+    image: ${ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE:-ghcr.io/malnes/roomcast-audiobookshelf-worker:latest}
+    build: ./audiobookshelf-worker
+    profiles: ["providers"]
+    depends_on:
+      - controller
+      - snapserver
+    environment:
+      CONTROLLER_BASE_URL: ${CONTROLLER_BASE_URL:-http://controller:8000}
+      AUDIOBOOKSHELF_WORKER_TOKEN: ${AUDIOBOOKSHELF_WORKER_TOKEN:-}
+      AUDIOBOOKSHELF_ASSIGNMENT_INTERVAL: ${AUDIOBOOKSHELF_ASSIGNMENT_INTERVAL:-10}
     volumes:
       - snapfifo:/tmp
 

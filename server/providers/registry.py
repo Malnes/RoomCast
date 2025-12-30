@@ -26,6 +26,12 @@ AVAILABLE_PROVIDERS: Dict[str, ProviderSpec] = {
         description="Internet radio stations via Radio Browser.",
         has_settings=True,
     ),
+    "audiobookshelf": ProviderSpec(
+        id="audiobookshelf",
+        name="Audiobookshelf",
+        description="Podcasts and audiobooks via an Audiobookshelf server.",
+        has_settings=True,
+    ),
 }
 
 

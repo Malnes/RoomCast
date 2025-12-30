@@ -130,7 +130,7 @@ function onActiveChannelChanged(previousId, nextId) {
   }
   fetchPlayerStatus();
   if (playlistOverlay && playlistOverlay.classList.contains('is-open')) {
-    fetchPlaylists();
+    openPlaylistOverlay();
   }
   if (queueOverlay && queueOverlay.classList.contains('is-open')) {
     fetchQueue();
@@ -140,8 +140,9 @@ function onActiveChannelChanged(previousId, nextId) {
 
 function updatePlayerDiscoveryButtons(channel) {
   const radio = isRadioChannel(channel);
+  const abs = isAudiobookshelfChannel(channel);
   if (playerPlaylistsBtn) {
-    playerPlaylistsBtn.setAttribute('aria-label', radio ? 'Discover radio stations' : 'Browse playlists');
+    playerPlaylistsBtn.setAttribute('aria-label', radio ? 'Discover radio stations' : abs ? 'Browse podcasts' : 'Browse playlists');
   }
   if (playerSearchBtn) {
     playerSearchBtn.setAttribute('aria-label', radio ? 'Search radio stations' : 'Search Spotify');

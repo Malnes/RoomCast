@@ -38,6 +38,7 @@ from providers.storage import ProviderState, infer_providers, load_providers as 
 from providers.docker_runtime import DockerUnavailable, detect_docker_context, ensure_container_absent, ensure_container_running
 from providers import spotify as spotify_provider
 from providers import radio as radio_provider
+from providers import audiobookshelf as audiobookshelf_provider
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -151,6 +152,25 @@ RADIO_BROWSER_CACHE_TTL = int(os.getenv("RADIO_BROWSER_CACHE_TTL", "300"))
 RADIO_BROWSER_USER_AGENT = os.getenv("RADIO_BROWSER_USER_AGENT", "RoomCast/Radio").strip() or "RoomCast/Radio"
 RADIO_WORKER_TOKEN = os.getenv("RADIO_WORKER_TOKEN", "").strip()
 RADIO_WORKER_PATH_PREFIX = "/api/radio/worker"
+ABS_WORKER_TOKEN = os.getenv("AUDIOBOOKSHELF_WORKER_TOKEN", "").strip()
+ABS_WORKER_PATH_PREFIX = "/api/audiobookshelf/worker"
+ABS_HTTP_TIMEOUT = float(os.getenv("AUDIOBOOKSHELF_HTTP_TIMEOUT", "12"))
+ABS_HTTP_TIMEOUT = max(3.0, min(ABS_HTTP_TIMEOUT, 60.0))
+ABS_STREAM_URL_TTL = int(os.getenv("AUDIOBOOKSHELF_STREAM_URL_TTL", "300"))
+ABS_STREAM_URL_TTL = max(30, min(ABS_STREAM_URL_TTL, 3600))
+
+ABS_CHANNEL_SLOTS = [
+    {
+        "label": "Audiobookshelf 1",
+        "snap_stream": "Audiobookshelf_CH1",
+        "fifo_path": "/tmp/snapfifo-abs1",
+    },
+    {
+        "label": "Audiobookshelf 2",
+        "snap_stream": "Audiobookshelf_CH2",
+        "fifo_path": "/tmp/snapfifo-abs2",
+    },
+]
 CHANNEL_IDLE_TIMEOUT = float(os.getenv("CHANNEL_IDLE_TIMEOUT", "600"))
 CHANNEL_IDLE_TIMEOUT = max(30.0, CHANNEL_IDLE_TIMEOUT)
 CHANNEL_IDLE_POLL_INTERVAL = float(os.getenv("CHANNEL_IDLE_POLL_INTERVAL", "15"))
@@ -315,6 +335,11 @@ def require_radio_provider() -> None:
         raise HTTPException(status_code=503, detail="Radio provider is not installed")
 
 
+def require_audiobookshelf_provider() -> None:
+    if not is_provider_enabled("audiobookshelf"):
+        raise HTTPException(status_code=503, detail="Audiobookshelf provider is not installed")
+
+
 def _reconcile_spotify_runtime(instances: int) -> None:
     image = (os.getenv("ROOMCAST_LIBRESPOT_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-librespot:latest"
     try:
@@ -339,6 +364,21 @@ def _reconcile_radio_runtime(enabled: bool) -> None:
             controller_base_url=os.getenv("CONTROLLER_BASE_URL", "http://controller:8000"),
             radio_worker_token=RADIO_WORKER_TOKEN,
             assignment_interval=int(os.getenv("RADIO_ASSIGNMENT_INTERVAL", "10")),
+        )
+    except DockerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+def _reconcile_audiobookshelf_runtime(enabled: bool) -> None:
+    image = (os.getenv("ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-audiobookshelf-worker:latest"
+    try:
+        audiobookshelf_provider.reconcile_runtime(
+            controller_container_id=_controller_container_id(),
+            enabled=enabled,
+            worker_image=image,
+            controller_base_url=os.getenv("CONTROLLER_BASE_URL", "http://controller:8000"),
+            worker_token=ABS_WORKER_TOKEN,
+            assignment_interval=int(os.getenv("AUDIOBOOKSHELF_ASSIGNMENT_INTERVAL", "10")),
         )
     except DockerUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc))
@@ -401,6 +441,11 @@ def _apply_radio_provider() -> None:
     _reconcile_radio_runtime(True)
 
 
+def _apply_audiobookshelf_provider() -> None:
+    # Audiobookshelf is a per-channel source; do not auto-create channels.
+    _reconcile_audiobookshelf_runtime(True)
+
+
 def _disable_radio_provider() -> None:
     # Detach radio channels.
     for channel in channels_by_id.values():
@@ -412,6 +457,19 @@ def _disable_radio_provider() -> None:
             channel.pop("radio_state", None)
     save_channels()
     _reconcile_radio_runtime(False)
+
+
+def _disable_audiobookshelf_provider() -> None:
+    # Detach Audiobookshelf channels.
+    for channel in channels_by_id.values():
+        if (channel.get("source") or "").strip().lower() == "audiobookshelf":
+            channel["source"] = "none"
+            channel["source_ref"] = None
+            channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
+            channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
+            channel.pop("abs_state", None)
+    save_channels()
+    _reconcile_audiobookshelf_runtime(False)
 
 
 class ProviderInstallPayload(BaseModel):
@@ -599,7 +657,7 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
     else:
         enabled = bool(enabled_value)
     source = (entry.get("source") or "none").strip().lower()
-    if source not in {"spotify", "radio", "none"}:
+    if source not in {"spotify", "radio", "audiobookshelf", "none"}:
         source = "none"
     source_ref_raw = (entry.get("source_ref") or "").strip().lower()
     source_ref: Optional[str] = None
@@ -610,9 +668,14 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
             source_ref = "spotify:b" if channel_id == f"{CHANNEL_ID_PREFIX}2" else "spotify:a"
     elif source == "radio":
         source_ref = "radio"
+    elif source == "audiobookshelf":
+        source_ref = "audiobookshelf"
     radio_state = None
     if source == "radio":
         radio_state = _normalize_radio_state(entry.get("radio_state"))
+    abs_state = None
+    if source == "audiobookshelf":
+        abs_state = _normalize_abs_state(entry.get("abs_state"))
     return {
         "id": channel_id,
         "name": name,
@@ -627,6 +690,7 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
         "source": source,
         "source_ref": source_ref,
         "radio_state": radio_state,
+        "abs_state": abs_state,
     }
 
 
@@ -661,6 +725,35 @@ def _normalize_radio_state(value: Optional[dict]) -> dict:
             else:
                 state["tags"] = []
             continue
+        if key == "playback_enabled":
+            raw = value.get("playback_enabled")
+            if isinstance(raw, str):
+                state[key] = raw.strip().lower() not in {"0", "false", "no"}
+            else:
+                state[key] = bool(raw) if raw is not None else True
+            continue
+        state[key] = value.get(key)
+    return state
+
+
+def _default_abs_state() -> dict:
+    return {
+        "library_item_id": None,
+        "episode_id": None,
+        "podcast_title": None,
+        "episode_title": None,
+        "playback_enabled": True,
+        "updated_at": None,
+        "content_url": None,
+        "content_url_ts": None,
+    }
+
+
+def _normalize_abs_state(value: Optional[dict]) -> dict:
+    state = _default_abs_state()
+    if not isinstance(value, dict):
+        return state
+    for key in state.keys():
         if key == "playback_enabled":
             raw = value.get("playback_enabled")
             if isinstance(raw, str):
@@ -1022,6 +1115,7 @@ def channels_public() -> list[dict]:
             "source": entry.get("source", "none"),
             "source_ref": entry.get("source_ref"),
             "radio_state": entry.get("radio_state"),
+            "abs_state": entry.get("abs_state"),
         })
     return items
 
@@ -1060,6 +1154,7 @@ def all_channel_details() -> list[dict]:
 def update_channel_metadata(channel_id: str, updates: dict) -> dict:
     channel = get_channel(channel_id)
     was_radio_channel = (channel.get("source") or "").strip().lower() == "radio"
+    was_abs_channel = (channel.get("source") or "").strip().lower() == "audiobookshelf"
     routing_changed = False
     previous_snap_stream = (channel.get("snap_stream") or "").strip()
     if "name" in updates:
@@ -1085,10 +1180,12 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
             channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
             channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
             channel.pop("radio_state", None)
+            channel.pop("abs_state", None)
             routing_changed = routing_changed or (channel["snap_stream"] != previous_snap_stream)
         else:
             requested_spotify = _normalize_spotify_source_id(raw_ref)
             requested_radio = raw_ref.startswith("radio")
+            requested_abs = raw_ref.startswith("audiobookshelf")
 
         if raw_ref and requested_spotify:
             require_spotify_provider()
@@ -1162,6 +1259,67 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
             channel["fifo_path"] = chosen_slot["fifo_path"]
             _ensure_radio_state(channel)
             routing_changed = routing_changed or (channel["snap_stream"] != previous_snap_stream)
+        elif raw_ref and requested_abs:
+            require_audiobookshelf_provider()
+
+            cid = channel.get("id")
+
+            def _channel_has_assigned_nodes(target_id: str) -> bool:
+                for node in nodes.values():
+                    if resolve_node_channel_id(node) == target_id:
+                        return True
+                return False
+
+            def _is_abs_active(entry: dict) -> bool:
+                if (entry.get("enabled") is None) or bool(entry.get("enabled")):
+                    return True
+                entry_id = entry.get("id")
+                return bool(entry_id and _channel_has_assigned_nodes(entry_id))
+
+            used_streams: set[str] = set()
+            for other_id, other in channels_by_id.items():
+                if other_id == cid:
+                    continue
+                if (other.get("source") or "").strip().lower() != "audiobookshelf":
+                    continue
+                if not _is_abs_active(other):
+                    continue
+                stream = (other.get("snap_stream") or "").strip()
+                if stream:
+                    used_streams.add(stream)
+
+            current_stream = (channel.get("snap_stream") or "").strip()
+            current_slot = None
+            for slot in ABS_CHANNEL_SLOTS:
+                if slot.get("snap_stream") == current_stream:
+                    current_slot = slot
+                    break
+
+            chosen_slot = None
+            if current_slot and current_stream and current_stream not in used_streams:
+                chosen_slot = current_slot
+            else:
+                for slot in ABS_CHANNEL_SLOTS:
+                    stream = (slot.get("snap_stream") or "").strip()
+                    if not stream:
+                        continue
+                    if stream in used_streams:
+                        continue
+                    chosen_slot = slot
+                    break
+
+            if not chosen_slot:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"No Audiobookshelf slots available (max {len(ABS_CHANNEL_SLOTS)}). Switch another channel away from Audiobookshelf first.",
+                )
+
+            channel["source"] = "audiobookshelf"
+            channel["source_ref"] = "audiobookshelf"
+            channel["snap_stream"] = chosen_slot["snap_stream"]
+            channel["fifo_path"] = chosen_slot["fifo_path"]
+            channel["abs_state"] = _normalize_abs_state(channel.get("abs_state"))
+            routing_changed = routing_changed or (channel["snap_stream"] != previous_snap_stream)
         elif raw_ref:
             raise HTTPException(status_code=400, detail="Invalid source_ref")
     if "order" in updates:
@@ -1171,8 +1329,11 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
             raise HTTPException(status_code=400, detail="Order must be a positive integer")
     save_channels()
     now_radio_channel = (channel.get("source") or "").strip().lower() == "radio"
+    now_abs_channel = (channel.get("source") or "").strip().lower() == "audiobookshelf"
     if was_radio_channel or now_radio_channel:
         _mark_radio_assignments_dirty()
+    if was_abs_channel or now_abs_channel:
+        _mark_abs_assignments_dirty()
     result = dict(channel)
     result["_routing_changed"] = routing_changed
     return result
@@ -1620,7 +1781,7 @@ async def session_middleware(request: Request, call_next):
     path = request.url.path
     token = request.cookies.get(SESSION_COOKIE_NAME)
     request.state.user = _resolve_session_user(token)
-    is_worker_endpoint = path.startswith(RADIO_WORKER_PATH_PREFIX)
+    is_worker_endpoint = path.startswith(RADIO_WORKER_PATH_PREFIX) or path.startswith(ABS_WORKER_PATH_PREFIX)
     is_public_path = path in PUBLIC_API_PATHS or path.startswith(PUBLIC_API_PREFIXES)
     requires_auth = path.startswith("/api/") and (not is_worker_endpoint) and (not is_public_path)
     if requires_auth:
@@ -1662,6 +1823,13 @@ radio_assignment_waiters: set[asyncio.Future] = set()
 RADIO_ASSIGNMENT_DEFAULT_WAIT = float(os.getenv("RADIO_ASSIGNMENT_WAIT", "10"))
 RADIO_ASSIGNMENT_DEFAULT_WAIT = max(1.0, min(RADIO_ASSIGNMENT_DEFAULT_WAIT, 30.0))
 RADIO_ASSIGNMENT_MAX_WAIT = 30.0
+
+abs_runtime_status: Dict[str, dict] = {}
+abs_assignments_version = 1
+abs_assignment_waiters: set[asyncio.Future] = set()
+ABS_ASSIGNMENT_DEFAULT_WAIT = float(os.getenv("AUDIOBOOKSHELF_ASSIGNMENT_WAIT", "10"))
+ABS_ASSIGNMENT_DEFAULT_WAIT = max(1.0, min(ABS_ASSIGNMENT_DEFAULT_WAIT, 30.0))
+ABS_ASSIGNMENT_MAX_WAIT = 30.0
 channel_idle_task: Optional[asyncio.Task] = None
 channel_idle_state: Dict[str, dict] = {}
 pending_web_node_requests: Dict[str, dict] = {}
@@ -1704,6 +1872,17 @@ def _mark_radio_assignments_dirty() -> None:
         waiter.set_result(True)
 
 
+def _mark_abs_assignments_dirty() -> None:
+    global abs_assignments_version
+    abs_assignments_version += 1
+    waiters = list(abs_assignment_waiters)
+    abs_assignment_waiters.clear()
+    for waiter in waiters:
+        if waiter.done():
+            continue
+        waiter.set_result(True)
+
+
 async def _wait_for_radio_assignments_change(since: Optional[int], timeout: float = RADIO_ASSIGNMENT_DEFAULT_WAIT) -> int:
     current = radio_assignments_version
     if since is None or since != current:
@@ -1723,6 +1902,26 @@ async def _wait_for_radio_assignments_change(since: Optional[int], timeout: floa
     except asyncio.TimeoutError:
         radio_assignment_waiters.discard(future)
     return radio_assignments_version
+
+
+async def _wait_for_abs_assignments_change(since: Optional[int], timeout: float = ABS_ASSIGNMENT_DEFAULT_WAIT) -> int:
+    current = abs_assignments_version
+    if since is None or since != current:
+        return current
+    loop = asyncio.get_running_loop()
+    future: asyncio.Future = loop.create_future()
+    abs_assignment_waiters.add(future)
+    current = abs_assignments_version
+    if since != current:
+        abs_assignment_waiters.discard(future)
+        if not future.done():
+            future.cancel()
+        return current
+    try:
+        await asyncio.wait_for(future, timeout)
+    except asyncio.TimeoutError:
+        abs_assignment_waiters.discard(future)
+    return abs_assignments_version
 
 
 def default_eq_state() -> dict:
@@ -1821,8 +2020,26 @@ def _require_radio_worker_token(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid radio worker token")
 
 
+def _require_abs_worker_token(request: Request) -> None:
+    if not ABS_WORKER_TOKEN:
+        return
+    header = request.headers.get("x-audiobookshelf-worker-token") or request.headers.get("authorization", "")
+    if header.lower().startswith("bearer "):
+        header = header[7:]
+    candidate = header.strip()
+    if not candidate or not secrets.compare_digest(candidate, ABS_WORKER_TOKEN):
+        raise HTTPException(status_code=401, detail="Invalid audiobookshelf worker token")
+
+
 def _radio_runtime_payload(channel_id: str) -> dict:
     status = radio_runtime_status.get(channel_id)
+    if not status:
+        return {"state": "idle", "message": None, "updated_at": None, "started_at": None}
+    return status
+
+
+def _abs_runtime_payload(channel_id: str) -> dict:
+    status = abs_runtime_status.get(channel_id)
     if not status:
         return {"state": "idle", "message": None, "updated_at": None, "started_at": None}
     return status
@@ -2197,6 +2414,8 @@ async def install_provider_api(payload: ProviderInstallPayload, _: dict = Depend
         _apply_spotify_provider(instances)
     elif pid == "radio":
         _apply_radio_provider()
+    elif pid == "audiobookshelf":
+        _apply_audiobookshelf_provider()
 
     return {"ok": True, "provider": _public_provider_state(state)}
 
@@ -2233,6 +2452,11 @@ async def update_provider_api(provider_id: str, payload: ProviderUpdatePayload, 
             _apply_radio_provider()
         else:
             _disable_radio_provider()
+    elif pid == "audiobookshelf":
+        if state.enabled:
+            _apply_audiobookshelf_provider()
+        else:
+            _disable_audiobookshelf_provider()
 
     return {"ok": True, "provider": _public_provider_state(state)}
 
@@ -6073,10 +6297,10 @@ async def decide_web_node_request(
 
 @app.websocket("/ws/web-node")
 async def web_node_ws(ws: WebSocket):
+    await ws.accept()
     user = await _require_ws_user(ws)
     if not user:
         return
-    await ws.accept()
     node_id = ws.query_params.get("node_id")
     if not node_id or node_id not in nodes:
         await ws.close(code=1008)
@@ -6093,10 +6317,10 @@ async def web_node_ws(ws: WebSocket):
 
 @app.websocket("/ws/nodes")
 async def nodes_ws(ws: WebSocket):
+    await ws.accept()
     user = await _require_ws_user(ws)
     if not user:
         return
-    await ws.accept()
     node_watchers.add(ws)
     try:
         await ws.send_json({"type": "nodes", "sections": public_sections(), "nodes": public_nodes()})
@@ -6113,6 +6337,7 @@ async def nodes_ws(ws: WebSocket):
 
 @app.websocket("/ws/terminal/{token}")
 async def terminal_ws(ws: WebSocket, token: str):
+    await ws.accept()
     if not NODE_TERMINAL_ENABLED:
         await ws.close(code=4403)
         return
@@ -6125,7 +6350,6 @@ async def terminal_ws(ws: WebSocket, token: str):
         await ws.close(code=4403)
         return
     target = session.get("target") or {}
-    await ws.accept()
     key_path = (target.get("key_path") or "").strip()
     if key_path:
         key_path = os.path.expanduser(key_path)
@@ -6627,6 +6851,506 @@ async def set_spotify_config(
     cfg_path.parent.mkdir(parents=True, exist_ok=True)
     cfg_path.write_text(json.dumps(payload, indent=2))
     return {"ok": True, "config": read_spotify_config(target)}
+
+
+def _abs_settings() -> dict:
+    settings = get_provider_settings("audiobookshelf")
+    if not isinstance(settings, dict):
+        return {}
+    return settings
+
+
+def _abs_base_url() -> str:
+    raw = (_abs_settings().get("base_url") or "").strip()
+    return raw.rstrip("/")
+
+
+def _abs_token() -> str:
+    return (_abs_settings().get("token") or "").strip()
+
+
+def _abs_library_id_setting() -> Optional[str]:
+    raw = (_abs_settings().get("library_id") or "").strip()
+    return raw or None
+
+
+def _require_abs_configured() -> tuple[str, str]:
+    require_audiobookshelf_provider()
+    base_url = _abs_base_url()
+    token = _abs_token()
+    if not base_url or not token:
+        raise HTTPException(status_code=400, detail="Audiobookshelf provider is not configured")
+    return base_url, token
+
+
+def _abs_headers(token: str) -> dict:
+    return {
+        "Accept": "application/json",
+        "Authorization": f"Bearer {token}",
+    }
+
+
+async def _abs_request(method: str, url: str, *, token: str, params: Optional[dict] = None, json_body: Any = None) -> Any:
+    timeout = httpx.Timeout(ABS_HTTP_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.request(method.upper(), url, headers=_abs_headers(token), params=params, json=json_body)
+        if resp.status_code >= 400:
+            detail = None
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+            raise HTTPException(status_code=502, detail=f"Audiobookshelf error ({resp.status_code}): {detail}")
+        try:
+            return resp.json()
+        except Exception:
+            raise HTTPException(status_code=502, detail="Audiobookshelf returned invalid JSON")
+
+
+async def _abs_list_libraries(base_url: str, token: str) -> list[dict]:
+    data = await _abs_request("GET", f"{base_url}/api/libraries", token=token)
+    libs = []
+    for item in (data or []):
+        if not isinstance(item, dict):
+            continue
+        libs.append(item)
+    return libs
+
+
+def _abs_is_podcast_library(entry: dict) -> bool:
+    media_type = (entry.get("mediaType") or entry.get("media_type") or "").strip().lower()
+    return media_type == "podcast"
+
+
+async def _abs_resolve_podcast_library_id(base_url: str, token: str, preferred: Optional[str]) -> str:
+    libs = await _abs_list_libraries(base_url, token)
+    podcast_libs = [lib for lib in libs if isinstance(lib, dict) and _abs_is_podcast_library(lib)]
+    if preferred and any((lib.get("id") == preferred) for lib in podcast_libs):
+        return preferred
+    if podcast_libs:
+        lid = (podcast_libs[0].get("id") or "").strip()
+        if lid:
+            return lid
+    raise HTTPException(status_code=404, detail="No podcast libraries found in Audiobookshelf")
+
+
+def _abs_pick(obj: dict, *keys: str) -> Optional[Any]:
+    for key in keys:
+        if key in obj:
+            return obj.get(key)
+    return None
+
+
+async def _abs_list_podcast_items(base_url: str, token: str, library_id: str) -> list[dict]:
+    data = await _abs_request("GET", f"{base_url}/api/libraries/{library_id}/items", token=token)
+    if isinstance(data, dict):
+        items = data.get("items") or data.get("results") or []
+    else:
+        items = data or []
+    if not isinstance(items, list):
+        return []
+    normalized = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        library_item_id = _abs_pick(item, "id", "libraryItemId", "library_item_id")
+        if not library_item_id:
+            continue
+        media = item.get("media") if isinstance(item.get("media"), dict) else {}
+        title = (
+            (item.get("title") or item.get("name") or _abs_pick(media, "title") or "").strip()
+        )
+        author = (item.get("author") or _abs_pick(media, "author") or "").strip() or None
+        image = item.get("imagePath") or item.get("image") or item.get("cover") or None
+        normalized.append({
+            "id": str(library_item_id),
+            "title": title or str(library_item_id),
+            "author": author,
+            "image": image,
+        })
+    normalized.sort(key=lambda x: (x.get("title") or "").lower())
+    return normalized
+
+
+async def _abs_fetch_item_expanded(base_url: str, token: str, library_item_id: str) -> dict:
+    params = {"expanded": "1"}
+    data = await _abs_request("GET", f"{base_url}/api/items/{library_item_id}", token=token, params=params)
+    return data if isinstance(data, dict) else {}
+
+
+async def _abs_fetch_episode_progress(base_url: str, token: str, library_item_id: str, episode_id: str) -> Optional[dict]:
+    timeout = httpx.Timeout(ABS_HTTP_TIMEOUT)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.get(
+            f"{base_url}/api/me/progress/{library_item_id}/{episode_id}",
+            headers=_abs_headers(token),
+        )
+        # Treat missing/unsupported progress endpoints as "unknown".
+        if resp.status_code in {404, 405}:
+            return None
+        if resp.status_code >= 400:
+            detail = None
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+            raise HTTPException(status_code=502, detail=f"Audiobookshelf error ({resp.status_code}): {detail}")
+        try:
+            data = resp.json()
+        except Exception:
+            return None
+        return data if isinstance(data, dict) else None
+
+
+async def _abs_list_episodes(
+    base_url: str,
+    token: str,
+    library_item_id: str,
+    *,
+    show_played: bool,
+) -> list[dict]:
+    data = await _abs_fetch_item_expanded(base_url, token, library_item_id)
+    media = data.get("media") if isinstance(data.get("media"), dict) else {}
+    episodes_raw = media.get("episodes") if isinstance(media.get("episodes"), list) else []
+    episodes = []
+    for entry in episodes_raw:
+        if not isinstance(entry, dict):
+            continue
+        episode_id = _abs_pick(entry, "id", "episodeId", "episode_id")
+        if not episode_id:
+            continue
+        title = (entry.get("title") or entry.get("name") or "").strip() or str(episode_id)
+        published_at = _abs_pick(entry, "publishedAt", "published_at")
+        try:
+            published_at_num = int(published_at) if published_at is not None else None
+        except (TypeError, ValueError):
+            published_at_num = None
+        duration = _abs_pick(entry, "duration", "durationMs", "duration_ms")
+        try:
+            duration_num = int(duration) if duration is not None else None
+        except (TypeError, ValueError):
+            duration_num = None
+        episodes.append({
+            "id": str(episode_id),
+            "title": title,
+            "published_at": published_at_num,
+            "duration_ms": duration_num,
+            "finished": None,
+        })
+
+    # Oldest -> newest (default requested).
+    episodes.sort(key=lambda e: (e.get("published_at") is None, e.get("published_at") or 0, e.get("title") or ""))
+
+    sem = asyncio.Semaphore(10)
+
+    async def _hydrate_finished(ep: dict) -> None:
+        async with sem:
+            progress = await _abs_fetch_episode_progress(base_url, token, library_item_id, ep["id"])
+        if isinstance(progress, dict) and "isFinished" in progress:
+            ep["finished"] = bool(progress.get("isFinished"))
+        elif isinstance(progress, dict) and "is_finished" in progress:
+            ep["finished"] = bool(progress.get("is_finished"))
+        else:
+            ep["finished"] = False
+
+    await asyncio.gather(*(_hydrate_finished(ep) for ep in episodes), return_exceptions=False)
+
+    if show_played:
+        return episodes
+    return [ep for ep in episodes if not ep.get("finished")]
+
+
+async def _abs_get_stream_url(base_url: str, token: str, library_item_id: str, episode_id: str) -> str:
+    data = await _abs_request("POST", f"{base_url}/api/items/{library_item_id}/play/{episode_id}", token=token)
+    if isinstance(data, dict):
+        tracks = data.get("audioTracks")
+        if isinstance(tracks, list) and tracks:
+            first = tracks[0] if isinstance(tracks[0], dict) else {}
+            url = (first.get("contentUrl") or first.get("content_url") or "").strip()
+            if url:
+                return url
+        url = (data.get("contentUrl") or data.get("content_url") or "").strip()
+        if url:
+            return url
+    raise HTTPException(status_code=502, detail="Audiobookshelf did not return a playable URL")
+
+
+async def _abs_mark_finished_best_effort(base_url: str, token: str, library_item_id: str, episode_id: str) -> None:
+    # Best-effort: API versions vary; do not fail playback advancement if this isn't supported.
+    try:
+        await _abs_request(
+            "PATCH",
+            f"{base_url}/api/me/progress/{library_item_id}/{episode_id}",
+            token=token,
+            json_body={"isFinished": True},
+        )
+    except HTTPException:
+        try:
+            await _abs_request(
+                "POST",
+                f"{base_url}/api/me/progress/{library_item_id}/{episode_id}",
+                token=token,
+                json_body={"isFinished": True},
+            )
+        except HTTPException:
+            return
+
+
+def _get_abs_channel_or_404(channel_id: str) -> dict:
+    channel = get_channel(channel_id)
+    if (channel.get("source") or "").strip().lower() != "audiobookshelf":
+        raise HTTPException(status_code=400, detail="Channel is not an audiobookshelf channel")
+    return channel
+
+
+@app.get("/api/audiobookshelf/libraries")
+async def list_abs_libraries() -> dict:
+    base_url, token = _require_abs_configured()
+    libs = await _abs_list_libraries(base_url, token)
+    podcast_libs = []
+    for lib in libs:
+        if not isinstance(lib, dict) or not _abs_is_podcast_library(lib):
+            continue
+        podcast_libs.append({
+            "id": lib.get("id"),
+            "name": lib.get("name"),
+            "mediaType": lib.get("mediaType"),
+        })
+    return {"libraries": podcast_libs}
+
+
+@app.get("/api/audiobookshelf/podcasts")
+async def list_abs_podcasts(library_id: Optional[str] = Query(default=None)) -> dict:
+    base_url, token = _require_abs_configured()
+    resolved_library = await _abs_resolve_podcast_library_id(base_url, token, library_id or _abs_library_id_setting())
+    items = await _abs_list_podcast_items(base_url, token, resolved_library)
+    return {"library_id": resolved_library, "podcasts": items}
+
+
+@app.get("/api/audiobookshelf/podcasts/{library_item_id}/episodes")
+async def list_abs_episodes(
+    library_item_id: str,
+    show_played: bool = Query(default=False),
+) -> dict:
+    base_url, token = _require_abs_configured()
+    episodes = await _abs_list_episodes(base_url, token, library_item_id, show_played=show_played)
+    return {"library_item_id": library_item_id, "episodes": episodes, "show_played": bool(show_played)}
+
+
+class AudiobookshelfPlayPayload(BaseModel):
+    library_item_id: str = Field(..., min_length=1)
+    episode_id: str = Field(..., min_length=1)
+    podcast_title: Optional[str] = None
+    episode_title: Optional[str] = None
+
+
+@app.post("/api/audiobookshelf/{channel_id}/play")
+async def audiobookshelf_play_episode(channel_id: str, payload: AudiobookshelfPlayPayload) -> dict:
+    require_audiobookshelf_provider()
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_abs_channel_or_404(resolved)
+    state = _normalize_abs_state(channel.get("abs_state"))
+    state.update({
+        "library_item_id": payload.library_item_id,
+        "episode_id": payload.episode_id,
+        "podcast_title": (payload.podcast_title or state.get("podcast_title")),
+        "episode_title": (payload.episode_title or state.get("episode_title")),
+        "updated_at": int(time.time()),
+        "playback_enabled": True,
+        "content_url": None,
+        "content_url_ts": None,
+    })
+    channel["abs_state"] = state
+    save_channels()
+    _mark_abs_assignments_dirty()
+    abs_runtime_status.pop(resolved, None)
+    return {"ok": True, "channel": channel_detail(resolved)}
+
+
+class AudiobookshelfPlaybackPayload(BaseModel):
+    action: str = Field(pattern="^(start|stop)$")
+
+
+@app.post("/api/audiobookshelf/{channel_id}/playback")
+async def audiobookshelf_playback_toggle(channel_id: str, payload: AudiobookshelfPlaybackPayload) -> dict:
+    require_audiobookshelf_provider()
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_abs_channel_or_404(resolved)
+    state = _normalize_abs_state(channel.get("abs_state"))
+    desired = payload.action == "start"
+    if desired and not (state.get("library_item_id") and state.get("episode_id")):
+        raise HTTPException(status_code=400, detail="Select an episode before starting playback")
+    state["playback_enabled"] = desired
+    state["updated_at"] = int(time.time())
+    channel["abs_state"] = state
+    save_channels()
+    _mark_abs_assignments_dirty()
+    if not desired:
+        abs_runtime_status[resolved] = {
+            "state": "idle",
+            "message": "Playback stopped",
+            "updated_at": state["updated_at"],
+            "started_at": None,
+        }
+    else:
+        abs_runtime_status.pop(resolved, None)
+    return {"ok": True}
+
+
+@app.get("/api/audiobookshelf/status/{channel_id}")
+async def audiobookshelf_status(channel_id: str) -> dict:
+    require_audiobookshelf_provider()
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_abs_channel_or_404(resolved)
+    state = _normalize_abs_state(channel.get("abs_state"))
+    channel["abs_state"] = state
+    runtime = _abs_runtime_payload(resolved)
+    return {
+        "channel_id": resolved,
+        "abs_state": state,
+        "runtime": runtime,
+        "enabled": channel.get("enabled", True),
+    }
+
+
+@app.get("/api/audiobookshelf/worker/assignments")
+async def audiobookshelf_worker_assignments(
+    request: Request,
+    since: Optional[int] = Query(None),
+    wait: Optional[float] = Query(None),
+) -> dict:
+    require_audiobookshelf_provider()
+    _require_abs_worker_token(request)
+    timeout = ABS_ASSIGNMENT_DEFAULT_WAIT if wait is None else float(wait)
+    timeout = max(1.0, min(timeout, ABS_ASSIGNMENT_MAX_WAIT))
+    version = abs_assignments_version
+    if since is not None:
+        version = await _wait_for_abs_assignments_change(since, timeout)
+
+    base_url = _abs_base_url()
+    token = _abs_token()
+    assignments = []
+    for cid in channel_order:
+        channel = channels_by_id.get(cid)
+        if not channel or (channel.get("source") or "").strip().lower() != "audiobookshelf":
+            continue
+        state = _normalize_abs_state(channel.get("abs_state"))
+        channel["abs_state"] = state
+        enabled = channel.get("enabled", True)
+        playback_enabled = state.get("playback_enabled", True)
+        library_item_id = (state.get("library_item_id") or "").strip() if isinstance(state.get("library_item_id"), str) else state.get("library_item_id")
+        episode_id = (state.get("episode_id") or "").strip() if isinstance(state.get("episode_id"), str) else state.get("episode_id")
+        stream_url = None
+        if enabled and playback_enabled and library_item_id and episode_id and base_url and token:
+            # Create/refresh a playback session URL when assignments are requested.
+            stream_url = await _abs_get_stream_url(base_url, token, str(library_item_id), str(episode_id))
+        assignments.append({
+            "channel_id": cid,
+            "enabled": enabled,
+            "snap_stream": channel.get("snap_stream"),
+            "fifo_path": channel.get("fifo_path"),
+            "stream_url": stream_url,
+            "token": token if token else None,
+            "library_item_id": library_item_id,
+            "episode_id": episode_id,
+            "playback_enabled": playback_enabled,
+            "updated_at": state.get("updated_at"),
+        })
+    return {"assignments": assignments, "version": version}
+
+
+class AudiobookshelfWorkerStatusPayload(BaseModel):
+    state: str = Field(pattern="^(playing|connecting|error|idle)$")
+    message: Optional[str] = None
+
+
+@app.post("/api/audiobookshelf/worker/status/{channel_id}")
+async def audiobookshelf_worker_status(channel_id: str, payload: AudiobookshelfWorkerStatusPayload, request: Request) -> dict:
+    require_audiobookshelf_provider()
+    _require_abs_worker_token(request)
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_abs_channel_or_404(resolved)
+    previous = abs_runtime_status.get(resolved) or {}
+    prev_state = previous.get("state")
+    prev_started_raw = previous.get("started_at")
+    prev_started = int(prev_started_raw) if isinstance(prev_started_raw, (int, float)) else None
+    now = int(time.time())
+    started_at = None
+    if payload.state == "playing":
+        if prev_state == "playing" and prev_started:
+            started_at = prev_started
+        else:
+            started_at = now
+    status_payload = {
+        "state": payload.state,
+        "message": payload.message,
+        "updated_at": now,
+        "started_at": started_at if payload.state == "playing" else None,
+    }
+    abs_runtime_status[resolved] = status_payload
+    return {"ok": True}
+
+
+class AudiobookshelfEndedPayload(BaseModel):
+    library_item_id: Optional[str] = None
+    episode_id: Optional[str] = None
+
+
+@app.post("/api/audiobookshelf/worker/ended/{channel_id}")
+async def audiobookshelf_worker_ended(channel_id: str, payload: AudiobookshelfEndedPayload, request: Request) -> dict:
+    require_audiobookshelf_provider()
+    _require_abs_worker_token(request)
+    resolved = resolve_channel_id(channel_id)
+    channel = _get_abs_channel_or_404(resolved)
+    state = _normalize_abs_state(channel.get("abs_state"))
+    channel["abs_state"] = state
+    library_item_id = payload.library_item_id or state.get("library_item_id")
+    episode_id = payload.episode_id or state.get("episode_id")
+    if not (library_item_id and episode_id):
+        return {"ok": True, "advanced": False}
+    base_url = _abs_base_url()
+    token = _abs_token()
+    if base_url and token:
+        await _abs_mark_finished_best_effort(base_url, token, str(library_item_id), str(episode_id))
+
+    # Advance to next episode (oldest -> newest, skipping finished).
+    advanced = False
+    if base_url and token:
+        episodes = await _abs_list_episodes(base_url, token, str(library_item_id), show_played=True)
+        ids = [ep.get("id") for ep in episodes if ep.get("id")]
+        try:
+            current_idx = ids.index(str(episode_id))
+        except ValueError:
+            current_idx = -1
+        next_ep = None
+        for candidate in episodes[current_idx + 1:]:
+            if not candidate.get("id"):
+                continue
+            if candidate.get("finished"):
+                continue
+            next_ep = candidate
+            break
+        if next_ep:
+            state.update({
+                "episode_id": next_ep.get("id"),
+                "episode_title": next_ep.get("title"),
+                "updated_at": int(time.time()),
+                "playback_enabled": True,
+                "content_url": None,
+                "content_url_ts": None,
+            })
+            channel["abs_state"] = state
+            save_channels()
+            _mark_abs_assignments_dirty()
+            advanced = True
+        else:
+            # No more episodes; stop playback.
+            state["playback_enabled"] = False
+            state["updated_at"] = int(time.time())
+            channel["abs_state"] = state
+            save_channels()
+            _mark_abs_assignments_dirty()
+    return {"ok": True, "advanced": advanced}
 
 
 @app.get("/api/radio/genres")

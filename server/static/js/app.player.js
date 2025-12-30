@@ -42,6 +42,7 @@ function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   playerPlay.disabled = true;
   playerNext.disabled = true;
   if (playerPlay) playerPlay.dataset.radioChannelId = '';
+  if (playerPlay) playerPlay.dataset.absChannelId = '';
   if (playerShuffleBtn) playerShuffleBtn.disabled = true;
   if (playerRepeatBtn) playerRepeatBtn.disabled = true;
   setShuffleActive(false);
@@ -54,29 +55,45 @@ const playerSaveServerNameBtn =
     ? saveServerNameBtn
     : document.getElementById('save-server-name');
 
+let fetchPlayerStatusInFlight = false;
+const PLAYER_STATUS_FETCH_TIMEOUT_MS = 8000;
+
 async function fetchPlayerStatus() {
   if (!isAuthenticated()) return;
+  if (fetchPlayerStatusInFlight) return;
+  fetchPlayerStatusInFlight = true;
   const channel = getActiveChannel();
-  if (!channel) {
-    setPlayerIdleState('Select a channel to control playback', { forceClear: true });
-    return;
+  try {
+    if (!channel) {
+      setPlayerIdleState('Select a channel to control playback', { forceClear: true });
+      return;
+    }
+    const source = (channel?.source || '').trim().toLowerCase();
+    if (!source || source === 'none') {
+      setPlayerIdleState('No music provider configured', { forceClear: true });
+      return;
+    }
+    if (isRadioChannel(channel)) {
+      await fetchRadioPlaybackStatus(channel);
+      return;
+    }
+    if (isAudiobookshelfChannel(channel)) {
+      await fetchAudiobookshelfPlaybackStatus(channel);
+      return;
+    }
+    await fetchSpotifyPlayerStatus(channel.id);
+  } finally {
+    fetchPlayerStatusInFlight = false;
   }
-  const source = (channel?.source || '').trim().toLowerCase();
-  if (!source || source === 'none') {
-    setPlayerIdleState('No music provider configured', { forceClear: true });
-    return;
-  }
-  if (isRadioChannel(channel)) {
-    await fetchRadioPlaybackStatus(channel);
-    return;
-  }
-  await fetchSpotifyPlayerStatus(channel.id);
 }
 
 async function fetchSpotifyPlayerStatus(channelId) {
   if (!channelId) return;
   try {
-    const res = await fetch(withChannel('/api/spotify/player/status', channelId));
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), PLAYER_STATUS_FETCH_TIMEOUT_MS);
+    const res = await fetch(withChannel('/api/spotify/player/status', channelId), { signal: controller.signal });
+    clearTimeout(timeoutId);
     await ensureOk(res);
     playerStatus = await res.json();
     const serverSnapshot = hydrateServerSnapshot(playerStatus?.snapshot);
@@ -98,6 +115,7 @@ async function fetchSpotifyPlayerStatus(channelId) {
     renderPlayer(playerStatus);
     markSpotifyHealthy();
   } catch (err) {
+    if (err?.name === 'AbortError') return;
     setPlayerIdleState('Player unavailable');
     reportSpotifyError(err);
   }
@@ -106,13 +124,121 @@ async function fetchSpotifyPlayerStatus(channelId) {
 async function fetchRadioPlaybackStatus(channel) {
   if (!channel?.id) return;
   try {
-    const res = await fetch(`/api/radio/status/${encodeURIComponent(channel.id)}`);
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), PLAYER_STATUS_FETCH_TIMEOUT_MS);
+    const res = await fetch(`/api/radio/status/${encodeURIComponent(channel.id)}`, { signal: controller.signal });
+    clearTimeout(timeoutId);
     await ensureOk(res);
     const payload = await res.json();
     renderRadioPlayer(channel, payload);
   } catch (err) {
+    if (err?.name === 'AbortError') return;
     renderRadioPlayer(channel, null, { error: err.message || 'Radio status unavailable' });
   }
+}
+
+async function fetchAudiobookshelfPlaybackStatus(channel) {
+  if (!channel?.id) return;
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), PLAYER_STATUS_FETCH_TIMEOUT_MS);
+    const res = await fetch(`/api/audiobookshelf/status/${encodeURIComponent(channel.id)}`, { signal: controller.signal });
+    clearTimeout(timeoutId);
+    await ensureOk(res);
+    const payload = await res.json();
+    const absState = payload?.abs_state || {};
+    updateChannelAudiobookshelfState(channel.id, absState);
+    renderAudiobookshelfPlayer(channel, payload);
+  } catch (err) {
+    if (err?.name === 'AbortError') return;
+    renderAudiobookshelfPlayer(channel, null, { error: err.message || 'Audiobookshelf status unavailable' });
+  }
+}
+
+function describeAudiobookshelfRuntimeState(state) {
+  if (!state) return '';
+  switch (state) {
+    case 'playing':
+      return 'Playing';
+    case 'connecting':
+      return 'Connecting';
+    case 'error':
+      return 'Error';
+    case 'idle':
+    default:
+      return state.charAt(0).toUpperCase() + state.slice(1);
+  }
+}
+
+function renderAudiobookshelfPlayer(channel, payload, options = {}) {
+  if (!playerPanel) return;
+  optimisticSeekState = null;
+  playerStatus = null;
+  playerPanel.style.display = 'flex';
+  const absState = payload?.abs_state || getAudiobookshelfState(channel) || {};
+  if (channel?.id) {
+    updateChannelAudiobookshelfState(channel.id, absState);
+  }
+  const runtime = payload?.runtime || {};
+  const enabled = payload?.enabled ?? channel?.enabled ?? true;
+  const playbackEnabled = absState.playback_enabled !== false;
+  const hasEpisode = !!absState.episode_id;
+  const runtimeLabel = describeAudiobookshelfRuntimeState(runtime.state);
+  const titleBase = absState.episode_title || absState.podcast_title || channel?.name || 'Audiobookshelf';
+  let subtitle = options.error || '';
+  if (!subtitle) {
+    const parts = [];
+    if (absState.podcast_title && absState.episode_title) parts.push(absState.podcast_title);
+    if (runtime.message) parts.push(runtime.message);
+    subtitle = parts.join(' • ');
+  }
+  if (!enabled) subtitle = 'Enable this channel in Settings to start playback.';
+  else if (!hasEpisode && !options.error) subtitle = 'Select an episode to start playback.';
+  if (!subtitle) subtitle = hasEpisode ? 'Streaming' : 'Idle';
+
+  playerTitle.textContent = runtimeLabel && hasEpisode ? `${titleBase} (${runtimeLabel})` : titleBase;
+  playerArtist.textContent = subtitle;
+
+  playerArt.style.display = 'none';
+  playerArt.alt = '';
+  setPlayerArtInteractivity(false);
+  lastCoverArtUrl = null;
+  applyCoverArtBackground();
+
+  playerSeek.disabled = true;
+  playerSeek.max = 100;
+  const sliderMax = Number(playerSeek.max) || 100;
+  const sliderValue = hasEpisode && playbackEnabled ? sliderMax : 0;
+  playerSeek.value = sliderValue;
+  setRangeProgress(playerSeek, sliderValue, sliderMax);
+  playerTimeCurrent.textContent = '—';
+  playerTimeTotal.textContent = hasEpisode ? 'Episode' : '0:00';
+  if (playerTick) {
+    clearInterval(playerTick);
+    playerTick = null;
+  }
+
+  const canToggle = enabled && hasEpisode;
+  let buttonLabel;
+  if (!enabled) buttonLabel = 'Enable this channel in Settings to start playback';
+  else if (!hasEpisode) buttonLabel = 'Select an episode to start playback';
+  else buttonLabel = playbackEnabled ? 'Stop' : 'Play';
+  setPlayButtonIcon(playbackEnabled && hasEpisode && enabled, { variant: 'radio', label: buttonLabel });
+  if (playerPlay) {
+    playerPlay.disabled = !canToggle;
+    playerPlay.dataset.absChannelId = channel?.id || '';
+  }
+  playerPrev.disabled = true;
+  playerNext.disabled = true;
+  if (playerShuffleBtn) {
+    playerShuffleBtn.disabled = true;
+    setShuffleActive(false);
+  }
+  if (playerRepeatBtn) {
+    playerRepeatBtn.disabled = true;
+    setRepeatMode('off');
+  }
+  setTakeoverBannerVisible(false);
 }
 
 function describeRadioRuntimeState(state) {
@@ -424,6 +550,9 @@ function renderPlayer(status) {
   if (playerPlay && playerPlay.dataset.radioChannelId) {
     playerPlay.dataset.radioChannelId = '';
   }
+  if (playerPlay && playerPlay.dataset.absChannelId) {
+    playerPlay.dataset.absChannelId = '';
+  }
   playerNext.disabled = !active;
   playerSeek.disabled = !active;
   if (playerShuffleBtn) {
@@ -491,6 +620,42 @@ async function handleRadioPlayToggle(channel) {
     return;
   }
   await fetchRadioPlaybackStatus(getChannelById(channel.id) || channel);
+}
+
+async function handleAudiobookshelfPlayToggle(channel) {
+  if (!channel || !channel.id) {
+    showError('Select an Audiobookshelf channel before toggling playback.');
+    return;
+  }
+  const state = getAudiobookshelfState(channel) || {};
+  const hasEpisode = !!state.episode_id;
+  if (!hasEpisode) {
+    showError('Select an episode to start playback.');
+    return;
+  }
+  const enabled = isChannelEnabled(channel);
+  if (!enabled) {
+    showError('Enable this channel in Settings to control playback.');
+    return;
+  }
+  const playbackEnabled = state.playback_enabled !== false;
+  const action = playbackEnabled ? 'stop' : 'start';
+  if (playerPlay) {
+    playerPlay.disabled = true;
+  }
+  try {
+    const res = await fetch(`/api/audiobookshelf/${encodeURIComponent(channel.id)}/playback`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+    });
+    await ensureOk(res);
+  } catch (err) {
+    if (playerPlay) playerPlay.disabled = false;
+    showError(`Failed to ${action === 'start' ? 'start' : 'stop'} playback: ${err.message}`);
+    return;
+  }
+  await fetchAudiobookshelfPlaybackStatus(getChannelById(channel.id) || channel);
 }
 
 function buildPlayerActionPath(path, body, channelId) {
@@ -907,8 +1072,14 @@ const providerAddButton = document.getElementById('provider-add-button');
 const providersInstalledList = document.getElementById('providers-installed-list');
 const providerSettingsSpotify = document.getElementById('provider-settings-spotify');
 const providerSettingsRadio = document.getElementById('provider-settings-radio');
+const providerSettingsAudiobookshelf = document.getElementById('provider-settings-audiobookshelf');
 const spotifyProviderInstances = document.getElementById('spotify-provider-instances');
 const spotifyProviderSaveBtn = document.getElementById('spotify-provider-save');
+
+const absBaseUrlInput = document.getElementById('abs-base-url');
+const absTokenInput = document.getElementById('abs-token');
+const absLibraryIdInput = document.getElementById('abs-library-id');
+const absProviderSaveBtn = document.getElementById('abs-provider-save');
 
 let providersAvailableCache = [];
 let providersInstalledCache = [];
@@ -959,6 +1130,7 @@ function openProviderSettingsModal(providerId) {
   let panelEl = null;
   if (pid === 'spotify') panelEl = providerSettingsSpotify;
   else if (pid === 'radio') panelEl = providerSettingsRadio;
+  else if (pid === 'audiobookshelf') panelEl = providerSettingsAudiobookshelf;
 
   if (!panelEl) {
     showError('This provider has no settings UI.');
@@ -1033,6 +1205,7 @@ function setProviderSettingsVisible(el, visible) {
 function syncProviderSettingsPanels() {
   const spotifyInstalled = !!getInstalledProvider('spotify');
   const radioInstalled = !!getInstalledProvider('radio');
+  const absInstalled = !!getInstalledProvider('audiobookshelf');
   const modalPid = providerSettingsModalProviderId;
   setProviderSettingsVisible(
     providerSettingsSpotify,
@@ -1042,12 +1215,22 @@ function syncProviderSettingsPanels() {
     providerSettingsRadio,
     radioInstalled && (providerSettingsOpenId === 'radio' || modalPid === 'radio'),
   );
+  setProviderSettingsVisible(
+    providerSettingsAudiobookshelf,
+    absInstalled && (providerSettingsOpenId === 'audiobookshelf' || modalPid === 'audiobookshelf'),
+  );
 
   const spotifyProvider = getInstalledProvider('spotify');
   const instances = spotifyProvider?.settings?.instances;
   if (spotifyProviderInstances && instances) {
     spotifyProviderInstances.value = String(instances);
   }
+
+  const absProvider = getInstalledProvider('audiobookshelf');
+  const absSettings = absProvider?.settings && typeof absProvider.settings === 'object' ? absProvider.settings : {};
+  if (absBaseUrlInput) absBaseUrlInput.value = absSettings?.base_url || '';
+  if (absTokenInput) absTokenInput.value = absSettings?.token || '';
+  if (absLibraryIdInput) absLibraryIdInput.value = absSettings?.library_id || '';
 }
 
 function renderProviderAddSelect() {
@@ -1238,6 +1421,40 @@ async function saveSpotifyProviderSettings() {
   }
 }
 
+async function saveAudiobookshelfProviderSettings() {
+  if (!absProviderSaveBtn || !absBaseUrlInput || !absTokenInput) return;
+  if (!isAdminUser()) {
+    showError('Only admins can update provider settings.');
+    return;
+  }
+  const base_url = (absBaseUrlInput.value || '').trim().replace(/\/+$/, '');
+  const token = (absTokenInput.value || '').trim();
+  const library_id = (absLibraryIdInput?.value || '').trim();
+  if (!base_url) {
+    showError('Audiobookshelf base URL is required.');
+    return;
+  }
+  if (!token) {
+    showError('Audiobookshelf API token is required.');
+    return;
+  }
+  try {
+    absProviderSaveBtn.disabled = true;
+    const res = await fetch('/api/providers/audiobookshelf', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings: { base_url, token, library_id: library_id || null } }),
+    });
+    await ensureOk(res);
+    showSuccess('Audiobookshelf provider updated.');
+    await refreshProvidersState();
+  } catch (err) {
+    showError(`Failed to update Audiobookshelf provider: ${err.message}`);
+  } finally {
+    absProviderSaveBtn.disabled = false;
+  }
+}
+
 async function openSettings() {
   settingsOverlay.style.display = 'flex';
   collapseAllPanels();
@@ -1412,6 +1629,7 @@ startDiscoverBtn.addEventListener('click', discoverNodes);
 saveSpotifyBtn.addEventListener('click', saveSpotify);
 if (providerAddButton) providerAddButton.addEventListener('click', installSelectedProvider);
 if (spotifyProviderSaveBtn) spotifyProviderSaveBtn.addEventListener('click', saveSpotifyProviderSettings);
+if (absProviderSaveBtn) absProviderSaveBtn.addEventListener('click', saveAudiobookshelfProviderSettings);
 if (spInitVol) {
   spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
 }
@@ -1714,14 +1932,28 @@ if (playlistBackBtn) playlistBackBtn.addEventListener('click', handlePlaylistBac
 if (playlistSearchInput) {
   playlistSearchInput.addEventListener('input', evt => {
     playlistSearchTerm = (evt.target.value || '').trim().toLowerCase();
-    renderPlaylistGrid(playlistsCache);
+    if (typeof playlistOverlayMode !== 'undefined' && playlistOverlayMode === 'audiobookshelf') {
+      renderAudiobookshelfPodcastGrid(typeof absPodcastsCache !== 'undefined' ? absPodcastsCache : []);
+    } else {
+      renderPlaylistGrid(playlistsCache);
+    }
   });
 }
 if (playlistSortSelect) {
   playlistSortSelect.addEventListener('change', evt => {
     const value = (evt.target.value || '').toLowerCase();
-    playlistSortOrder = value === 'name' ? 'name' : 'recent';
-    renderPlaylistGrid(playlistsCache);
+    if (typeof playlistOverlayMode !== 'undefined' && playlistOverlayMode === 'audiobookshelf') {
+      absShowPlayed = value === 'show_played';
+      if (typeof absSelectedPodcast !== 'undefined' && absSelectedPodcast?.id) {
+        fetchAudiobookshelfEpisodes(absSelectedPodcast.id);
+      }
+      if (playlistSummaryEl) {
+        playlistSummaryEl.textContent = absShowPlayed ? 'Showing played episodes' : 'Hiding played episodes';
+      }
+    } else {
+      playlistSortOrder = value === 'name' ? 'name' : 'recent';
+      renderPlaylistGrid(playlistsCache);
+    }
   });
 }
 
@@ -1817,6 +2049,10 @@ playerPlay.addEventListener('click', async () => {
   const channel = getActiveChannel();
   if (isRadioChannel(channel)) {
     handleRadioPlayToggle(channel);
+    return;
+  }
+  if (isAudiobookshelfChannel(channel)) {
+    handleAudiobookshelfPlayToggle(channel);
     return;
   }
   if (playerStatus?.is_playing) playerAction('/api/spotify/player/pause');
