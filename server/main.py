@@ -5675,11 +5675,21 @@ async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingRe
                 assert snap_proc and snap_proc.stdout and ff_proc and ff_proc.stdin
                 try:
                     while True:
-                        chunk = await snap_proc.stdout.read(16 * 1024)
+                        try:
+                            chunk = await asyncio.wait_for(
+                                snap_proc.stdout.read(16 * 1024),
+                                timeout=1.0,
+                            )
+                        except asyncio.TimeoutError:
+                            if snap_proc and snap_proc.returncode is not None:
+                                break
+                            continue
                         if not chunk:
                             break
                         ff_proc.stdin.write(chunk)
                         await ff_proc.stdin.drain()
+                except asyncio.CancelledError:
+                    return
                 except Exception:
                     return
                 finally:
@@ -5691,9 +5701,18 @@ async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingRe
             pump_task = asyncio.create_task(_pump_pcm())
             assert ff_proc.stdout is not None
             while True:
-                if await request.is_disconnected():
+                try:
+                    if await request.is_disconnected():
+                        return
+                except asyncio.CancelledError:
                     return
-                chunk = await ff_proc.stdout.read(32 * 1024)
+
+                try:
+                    chunk = await asyncio.wait_for(ff_proc.stdout.read(32 * 1024), timeout=1.0)
+                except asyncio.TimeoutError:
+                    continue
+                except asyncio.CancelledError:
+                    return
                 if not chunk:
                     return
                 now = time.time()
