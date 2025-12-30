@@ -40,6 +40,10 @@ from providers import spotify as spotify_provider
 from providers import radio as radio_provider
 from providers import audiobookshelf as audiobookshelf_provider
 
+from api.auth import create_auth_router
+from api.nodes import NodeRegistration, VolumePayload, create_nodes_router
+from api.providers import create_providers_router
+
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("roomcast")
@@ -489,27 +493,6 @@ def _disable_audiobookshelf_provider() -> None:
             channel.pop("abs_state", None)
     save_channels()
     _reconcile_audiobookshelf_runtime(False)
-
-
-class ProviderInstallPayload(BaseModel):
-    id: str = Field(..., min_length=1, max_length=40)
-
-
-class ProviderUpdatePayload(BaseModel):
-    enabled: Optional[bool] = None
-    settings: Dict[str, Any] = Field(default_factory=dict)
-
-
-def _public_provider_state(state: ProviderState) -> dict:
-    spec = get_provider_spec(state.id)
-    return {
-        "id": state.id,
-        "name": spec.name if spec else state.id,
-        "description": spec.description if spec else "",
-        "enabled": bool(state.enabled),
-        "settings": state.settings or {},
-        "has_settings": bool(spec.has_settings) if spec else True,
-    }
 
 
 def _sanitize_channel_color(value: Optional[str]) -> Optional[str]:
@@ -1401,21 +1384,6 @@ async def _apply_channel_routing(channel_id: str) -> None:
     save_nodes()
 
 
-class NodeRegistration(BaseModel):
-    id: Optional[str] = None
-    name: str
-    url: str = Field(min_length=1)
-    fingerprint: Optional[str] = None
-
-
-class RenameNodePayload(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
-
-
-class VolumePayload(BaseModel):
-    percent: int = Field(ge=0, le=100)
-
-
 class ShufflePayload(BaseModel):
     state: bool = Field(description="Enable shuffle when true")
     device_id: Optional[str] = Field(default=None, description="Target device ID")
@@ -1430,47 +1398,6 @@ class ActivateRoomcastPayload(BaseModel):
     play: bool = Field(default=False, description="Start playback immediately after transfer")
 
 
-class EqBand(BaseModel):
-    freq: float = Field(gt=10, lt=24000, description="Frequency in Hz")
-    gain: float = Field(ge=-24, le=24, description="Gain in dB")
-    q: float = Field(default=1.0, gt=0.05, lt=36, description="Quality factor")
-
-
-class EqPayload(BaseModel):
-    preset: Optional[str] = None
-    bands: list[EqBand] = Field(default_factory=list)
-    band_count: int = Field(default=15, ge=1, le=31)
-
-
-class OutputSelectionPayload(BaseModel):
-    device: str = Field(min_length=1)
-
-
-class WebNodeOffer(BaseModel):
-    name: str = Field(default="Web node", min_length=1)
-    sdp: str
-    type: str
-
-
-class WebNodeRequestDecisionPayload(BaseModel):
-    action: Literal["approve", "deny"]
-    reason: Optional[str] = Field(default=None, max_length=200)
-
-
-class NodeChannelPayload(BaseModel):
-    channel_id: Optional[str] = Field(default=None, max_length=120)
-
-
-class NodeStereoModePayload(BaseModel):
-    mode: Literal["both", "left", "right"] = Field(default="both")
-
-
-class SonosEqPayload(BaseModel):
-    bass: Optional[int] = Field(default=None, ge=-10, le=10, description="Bass (-10..10)")
-    treble: Optional[int] = Field(default=None, ge=-10, le=10, description="Treble (-10..10)")
-    loudness: Optional[bool] = Field(default=None, description="Loudness on/off")
-
-
 class SpotifyConfig(BaseModel):
     device_name: str = Field(default="RoomCast")
     bitrate: int = Field(default=320, ge=96, le=320)
@@ -1479,33 +1406,6 @@ class SpotifyConfig(BaseModel):
     client_id: Optional[str] = None
     client_secret: Optional[str] = None
     redirect_uri: Optional[str] = None
-
-
-class InitializePayload(BaseModel):
-    server_name: str = Field(default="RoomCast", min_length=1, max_length=120)
-    username: str = Field(min_length=1, max_length=60)
-    password: str = Field(min_length=4, max_length=128)
-
-
-class LoginPayload(BaseModel):
-    username: str = Field(min_length=1, max_length=60)
-    password: str = Field(min_length=1, max_length=128)
-
-
-class CreateUserPayload(BaseModel):
-    username: str = Field(min_length=1, max_length=60)
-    password: str = Field(min_length=4, max_length=128)
-    role: str = Field(pattern="^(admin|member)$")
-
-
-class UpdateUserPayload(BaseModel):
-    username: Optional[str] = Field(default=None, min_length=1, max_length=60)
-    password: Optional[str] = Field(default=None, min_length=4, max_length=128)
-    role: Optional[str] = Field(default=None, pattern="^(admin|member)$")
-
-
-class ServerNamePayload(BaseModel):
-    server_name: str = Field(min_length=1, max_length=120)
 
 
 class ChannelUpdatePayload(BaseModel):
@@ -2390,123 +2290,173 @@ def require_admin(request: Request) -> dict:
     return user
 
 
-@app.get("/api/providers/available")
-async def list_available_providers_api() -> dict:
-    items = []
-    for pid, spec in sorted(AVAILABLE_PROVIDERS.items()):
-        installed = pid in providers_by_id
-        enabled = bool(providers_by_id.get(pid).enabled) if installed else False
-        items.append({
-            "id": spec.id,
-            "name": spec.name,
-            "description": spec.description,
-            "installed": installed,
-            "enabled": enabled,
-            "has_settings": spec.has_settings,
-        })
-    return {"providers": items}
+def _auth_server_name() -> str:
+    return auth_state.get("server_name", SERVER_DEFAULT_NAME)
 
 
-@app.get("/api/providers/installed")
-async def list_installed_providers_api() -> dict:
-    return {"providers": [_public_provider_state(state) for state in providers_by_id.values()]}
+def _auth_set_server_name(value: str) -> None:
+    auth_state["server_name"] = (value or "").strip() or SERVER_DEFAULT_NAME
+    _save_auth_state()
 
 
-@app.post("/api/providers/install")
-async def install_provider_api(payload: ProviderInstallPayload, _: dict = Depends(require_admin)) -> dict:
-    pid = (payload.id or "").strip().lower()
-    spec = get_provider_spec(pid)
-    if not spec:
-        raise HTTPException(status_code=404, detail="Unknown provider")
-    existing = providers_by_id.get(pid)
-    if existing:
-        existing.enabled = True
-        if existing.settings is None:
-            existing.settings = {}
-        state = existing
-    else:
-        defaults = {}
-        if pid == "spotify":
-            defaults = {"instances": 1}
-        state = ProviderState(id=pid, enabled=True, settings=defaults)
-        providers_by_id[pid] = state
-    save_providers_state()
-
-    if pid == "spotify":
-        instances = spotify_provider.normalize_instances((state.settings or {}).get("instances"), default=1)
-        state.settings = {**(state.settings or {}), "instances": instances}
-        save_providers_state()
-        _apply_spotify_provider(instances)
-    elif pid == "radio":
-        _apply_radio_provider()
-    elif pid == "audiobookshelf":
-        _apply_audiobookshelf_provider()
-
-    return {"ok": True, "provider": _public_provider_state(state)}
+def _auth_get_user_by_username(lowered: str) -> Optional[dict]:
+    return users_by_username.get((lowered or "").strip().lower())
 
 
-@app.patch("/api/providers/{provider_id}")
-async def update_provider_api(provider_id: str, payload: ProviderUpdatePayload, _: dict = Depends(require_admin)) -> dict:
-    pid = (provider_id or "").strip().lower()
-    spec = get_provider_spec(pid)
-    if not spec:
-        raise HTTPException(status_code=404, detail="Unknown provider")
-    state = providers_by_id.get(pid)
-    if not state:
-        raise HTTPException(status_code=404, detail="Provider not installed")
-
-    updates = payload.model_dump(exclude_unset=True)
-    if "enabled" in updates and updates["enabled"] is not None:
-        state.enabled = bool(updates["enabled"])
-    if "settings" in updates and isinstance(updates["settings"], dict):
-        merged = dict(state.settings or {})
-        merged.update(updates["settings"])
-        state.settings = merged
-    save_providers_state()
-
-    if pid == "spotify":
-        if state.enabled:
-            instances = spotify_provider.normalize_instances((state.settings or {}).get("instances"), default=1)
-            state.settings = {**(state.settings or {}), "instances": instances}
-            save_providers_state()
-            _apply_spotify_provider(instances)
-        else:
-            _disable_spotify_provider()
-    elif pid == "radio":
-        if state.enabled:
-            _apply_radio_provider()
-        else:
-            _disable_radio_provider()
-    elif pid == "audiobookshelf":
-        if state.enabled:
-            _apply_audiobookshelf_provider()
-        else:
-            _disable_audiobookshelf_provider()
-
-    return {"ok": True, "provider": _public_provider_state(state)}
+def _auth_list_users() -> list[dict]:
+    return list(users_by_id.values())
 
 
-@app.delete("/api/providers/{provider_id}")
-async def remove_provider_api(provider_id: str, _: dict = Depends(require_admin)) -> dict:
-    pid = (provider_id or "").strip().lower()
-    spec = get_provider_spec(pid)
-    if not spec:
-        raise HTTPException(status_code=404, detail="Unknown provider")
-    state = providers_by_id.get(pid)
-    if not state:
-        raise HTTPException(status_code=404, detail="Provider not installed")
+app.include_router(
+    create_auth_router(
+        is_initialized=_is_initialized,
+        get_server_name=_auth_server_name,
+        set_server_name=_auth_set_server_name,
+        public_user=_public_user,
+        get_user_by_username=_auth_get_user_by_username,
+        create_user=_create_user,
+        update_user=_update_user,
+        delete_user=_delete_user,
+        list_users=_auth_list_users,
+        verify_password=_verify_password,
+        set_session_cookie=_set_session_cookie,
+        clear_session_cookie=_clear_session_cookie,
+        require_admin=require_admin,
+        server_default_name=SERVER_DEFAULT_NAME,
+    )
+)
 
-    # Disable runtime and detach channels/sources as needed.
-    if pid == "spotify":
-        _disable_spotify_provider()
-    elif pid == "radio":
-        _disable_radio_provider()
-    elif pid == "audiobookshelf":
-        _disable_audiobookshelf_provider()
 
-    providers_by_id.pop(pid, None)
-    save_providers_state()
-    return {"ok": True}
+def _providers() -> Dict[str, ProviderState]:
+    return providers_by_id
+
+
+app.include_router(
+    create_providers_router(
+        available_providers=AVAILABLE_PROVIDERS,
+        get_provider_spec=get_provider_spec,
+        providers=_providers,
+        provider_state_cls=ProviderState,
+        save_providers_state=save_providers_state,
+        require_admin=require_admin,
+        spotify_provider=spotify_provider,
+        apply_spotify_provider=_apply_spotify_provider,
+        disable_spotify_provider=_disable_spotify_provider,
+        apply_radio_provider=_apply_radio_provider,
+        disable_radio_provider=_disable_radio_provider,
+        apply_audiobookshelf_provider=_apply_audiobookshelf_provider,
+        disable_audiobookshelf_provider=_disable_audiobookshelf_provider,
+    )
+)
+
+
+def _auth_state() -> dict:
+    return auth_state
+
+
+def _nodes() -> dict:
+    return nodes
+
+
+def _sections() -> list:
+    return sections
+
+
+def _set_sections(value: list) -> None:
+    global sections
+    sections = value
+
+
+def _browser_ws() -> dict:
+    return browser_ws
+
+
+def _node_watchers() -> set:
+    return node_watchers
+
+
+def _terminal_sessions() -> Dict[str, dict]:
+    return terminal_sessions
+
+
+def _pending_web_node_requests() -> Dict[str, dict]:
+    return pending_web_node_requests
+
+
+def _webrtc_relay() -> Optional[WebAudioRelay]:
+    return webrtc_relay
+
+
+app.include_router(
+    create_nodes_router(
+        nodes=_nodes,
+        sections=_sections,
+        set_sections=_set_sections,
+        save_nodes=lambda: save_nodes(),
+        broadcast_nodes=lambda: broadcast_nodes(),
+        public_node=lambda node: public_node(node),
+        public_nodes=lambda: public_nodes(),
+        public_sections=lambda: public_sections(),
+        require_admin=require_admin,
+        require_ws_user=_require_ws_user,
+        auth_state=_auth_state,
+        server_default_name=SERVER_DEFAULT_NAME,
+        local_agent_name_suffix=LOCAL_AGENT_NAME_SUFFIX,
+        local_agent_url=local_agent_url,
+        ensure_local_agent_running=ensure_local_agent_running,
+        stop_local_agent=stop_local_agent,
+        controller_node=lambda: _controller_node(),
+        refresh_agent_metadata=lambda node, persist=True: refresh_agent_metadata(node, persist=persist),
+        register_node_payload=lambda reg, mark_controller=False: _register_node_payload(reg, mark_controller=mark_controller),
+        call_agent=lambda node, path, payload: _call_agent(node, path, payload),
+        sync_node_max_volume=lambda node, percent=None: _sync_node_max_volume(node, percent=percent),
+        get_node_max_volume=lambda node: _get_node_max_volume(node),
+        send_browser_volume=lambda node, percent: _send_browser_volume(node, percent),
+        browser_ws=_browser_ws,
+        node_watchers=_node_watchers,
+        normalize_percent=lambda value, default=75: _normalize_percent(value, default=default),
+        normalize_stereo_mode=lambda mode: _normalize_stereo_mode(mode),
+        apply_volume_limit=lambda node, percent: _apply_volume_limit(node, percent),
+        sonos_ip_from_url=lambda url: _sonos_ip_from_url(url),
+        sonos_set_volume=lambda ip, percent: _sonos_set_volume(ip, percent),
+        sonos_set_mute=lambda ip, muted: _sonos_set_mute(ip, muted),
+        sonos_set_eq=lambda ip, eq_type, value: _sonos_set_eq(ip, eq_type=eq_type, value=value),
+        normalize_sonos_eq=lambda value: _normalize_sonos_eq(value),
+        request_agent_secret=lambda node, force=False, recovery_code=None: request_agent_secret(node, force=force, recovery_code=recovery_code),
+        configure_agent_audio=lambda node: configure_agent_audio(node),
+        set_node_channel=lambda node, channel_id: _set_node_channel(node, channel_id),
+        schedule_agent_refresh=lambda *args, **kwargs: schedule_agent_refresh(*args, **kwargs),
+        schedule_restart_watch=lambda node_id: schedule_restart_watch(node_id),
+        node_restart_timeout=NODE_RESTART_TIMEOUT,
+        resolve_terminal_target=lambda node: _resolve_terminal_target(node),
+        cleanup_terminal_sessions=lambda: _cleanup_terminal_sessions(),
+        terminal_sessions=_terminal_sessions,
+        node_terminal_enabled=NODE_TERMINAL_ENABLED,
+        node_terminal_token_ttl=NODE_TERMINAL_TOKEN_TTL,
+        node_terminal_max_duration=NODE_TERMINAL_MAX_DURATION,
+        node_terminal_strict_host_key=NODE_TERMINAL_STRICT_HOST_KEY,
+        cancel_node_rediscovery=lambda node_id: cancel_node_rediscovery(node_id),
+        teardown_browser_node=lambda *args, **kwargs: teardown_browser_node(*args, **kwargs),
+        get_webrtc_relay=_webrtc_relay,
+        normalize_section_name=_normalize_section_name,
+        find_section=lambda section_id: _find_section(section_id),
+        public_section=_public_section,
+        webrtc_enabled=WEBRTC_ENABLED,
+        get_web_node_snapshot=lambda entry: _get_web_node_snapshot(entry),
+        broadcast_web_node_request_event=lambda event, **kwargs: _broadcast_web_node_request_event(event, **kwargs),
+        pending_web_node_requests=_pending_web_node_requests,
+        pending_web_node_snapshots=lambda: _pending_web_node_snapshots(),
+        pop_pending_web_node_request=lambda request_id: _pop_pending_web_node_request(request_id),
+        establish_web_node_session_for_request=lambda pending: _establish_web_node_session_for_request(pending),
+        web_node_approval_timeout=WEB_NODE_APPROVAL_TIMEOUT,
+        detect_discovery_networks=lambda: _detect_discovery_networks(),
+        hosts_for_networks=lambda networks, limit=DISCOVERY_MAX_HOSTS: _hosts_for_networks(networks, limit=limit),
+        stream_host_probes=lambda hosts: _stream_host_probes(hosts),
+        sonos_ssdp_discover=lambda: _sonos_ssdp_discover(),
+        discovery_max_hosts=DISCOVERY_MAX_HOSTS,
+        sonos_discovery_timeout=SONOS_DISCOVERY_TIMEOUT,
+    )
+)
 
 def _extract_node_host(node: dict) -> Optional[str]:
     override = (node.get("ssh_host") or "").strip()
@@ -4694,94 +4644,6 @@ async def health() -> dict:
     return {"status": "ok"}
 
 
-@app.get("/api/auth/status")
-async def auth_status(request: Request) -> dict:
-    user = getattr(request.state, "user", None)
-    return {
-        "initialized": _is_initialized(),
-        "server_name": auth_state.get("server_name", SERVER_DEFAULT_NAME),
-        "authenticated": bool(user),
-        "user": _public_user(user) if user else None,
-    }
-
-
-@app.post("/api/auth/initialize")
-async def initialize_instance(payload: InitializePayload) -> JSONResponse:
-    if _is_initialized():
-        raise HTTPException(status_code=409, detail="Instance already initialized")
-    server_name = payload.server_name.strip() or SERVER_DEFAULT_NAME
-    auth_state["server_name"] = server_name
-    user = _create_user(payload.username, payload.password, role="admin")
-    response = JSONResponse({
-        "ok": True,
-        "server_name": server_name,
-        "user": _public_user(user),
-    })
-    _set_session_cookie(response, user["id"])
-    return response
-
-
-@app.post("/api/auth/login")
-async def login(payload: LoginPayload) -> JSONResponse:
-    if not _is_initialized():
-        raise HTTPException(status_code=403, detail="Instance setup required")
-    user = users_by_username.get(payload.username.strip().lower()) if payload.username else None
-    if not user or not _verify_password(payload.password, user.get("password_hash")):
-        raise HTTPException(status_code=401, detail="Invalid credentials")
-    response = JSONResponse({"ok": True, "user": _public_user(user)})
-    _set_session_cookie(response, user["id"])
-    return response
-
-
-@app.post("/api/auth/logout")
-async def logout() -> JSONResponse:
-    response = JSONResponse({"ok": True})
-    _clear_session_cookie(response)
-    return response
-
-
-@app.get("/api/users")
-async def list_users(_: dict = Depends(require_admin)) -> dict:
-    return {"users": [_public_user(user) for user in users_by_id.values()]}
-
-
-@app.post("/api/users")
-async def create_user(payload: CreateUserPayload, _: dict = Depends(require_admin)) -> dict:
-    user = _create_user(payload.username, payload.password, role=payload.role)
-    return {"ok": True, "user": _public_user(user)}
-
-
-@app.patch("/api/users/{user_id}")
-async def update_user(user_id: str, payload: UpdateUserPayload, _: dict = Depends(require_admin)) -> dict:
-    updates = payload.model_dump(exclude_unset=True)
-    user = _update_user(
-        user_id,
-        username=updates.get("username"),
-        password=updates.get("password"),
-        role=updates.get("role"),
-    )
-    return {"ok": True, "user": _public_user(user)}
-
-
-@app.delete("/api/users/{user_id}")
-async def delete_user(user_id: str, request: Request, _: dict = Depends(require_admin)) -> JSONResponse:
-    current_user = getattr(request.state, "user", None)
-    deleting_self = current_user and current_user.get("id") == user_id
-    _delete_user(user_id)
-    response = JSONResponse({"ok": True, "removed": user_id, "self_removed": bool(deleting_self)})
-    if deleting_self:
-        _clear_session_cookie(response)
-    return response
-
-
-@app.post("/api/server/name")
-async def update_server_name(payload: ServerNamePayload, _: dict = Depends(require_admin)) -> dict:
-    name = payload.server_name.strip() or SERVER_DEFAULT_NAME
-    auth_state["server_name"] = name
-    _save_auth_state()
-    return {"ok": True, "server_name": name}
-
-
 @app.get("/api/snapcast/status")
 async def snapcast_status() -> dict:
     try:
@@ -4924,37 +4786,6 @@ async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool
     await broadcast_nodes()
     return public_node(node)
 
-
-@app.post("/api/nodes/register")
-async def register_node(reg: NodeRegistration) -> dict:
-    return await _register_node_payload(reg)
-
-
-@app.post("/api/nodes/register-controller")
-async def register_controller_node(_: dict = Depends(require_admin)) -> dict:
-    existing = _controller_node()
-    if existing:
-        if existing.get("online") is False:
-            try:
-                await ensure_local_agent_running()
-                await refresh_agent_metadata(existing)
-            except Exception:
-                pass
-        return public_node(existing)
-    try:
-        await ensure_local_agent_running()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Failed to start local agent: {exc}") from exc
-    name = f"{auth_state.get('server_name') or SERVER_DEFAULT_NAME}{LOCAL_AGENT_NAME_SUFFIX}"
-    reg = NodeRegistration(name=name, url=local_agent_url())
-    try:
-        return await _register_node_payload(reg, mark_controller=True)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
 async def _call_agent(node: dict, path: str, payload: dict) -> dict:
     url = f"{node['url']}{path}"
     secret = node.get("agent_secret")
@@ -5093,151 +4924,6 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
         await webrtc_relay.update_session_channel(node["id"], resolved, stream_id)
     node["channel_id"] = resolved
 
-
-@app.post("/api/nodes/{node_id}/volume")
-async def set_node_volume(node_id: str, payload: VolumePayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    requested = _normalize_percent(payload.percent, default=node.get("volume_percent", 75))
-    if node.get("type") == "browser":
-        ws = browser_ws.get(node_id)
-        if not ws:
-            raise HTTPException(status_code=503, detail="Browser node not connected")
-        await _send_browser_volume(node, requested)
-        result = {"sent": True}
-    elif node.get("type") == "sonos":
-        ip = _sonos_ip_from_url(node.get("url"))
-        if not ip:
-            raise HTTPException(status_code=400, detail="Invalid Sonos node")
-        effective = _apply_volume_limit(node, requested)
-        await _sonos_set_volume(ip, effective)
-        result = {"sonos": True, "effective": effective}
-    else:
-        result = await _call_agent(node, "/volume", {"percent": requested})
-    node["volume_percent"] = requested
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "result": result}
-
-
-@app.post("/api/nodes/{node_id}/max-volume")
-async def set_node_max_volume(node_id: str, payload: VolumePayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    percent = _normalize_percent(payload.percent, default=_get_node_max_volume(node))
-    if node.get("type") == "agent":
-        await _sync_node_max_volume(node, percent=percent)
-    node["max_volume_percent"] = percent
-    save_nodes()
-    if node.get("type") == "browser":
-        await _send_browser_volume(node, node.get("volume_percent", 75))
-    if node.get("type") == "sonos":
-        ip = _sonos_ip_from_url(node.get("url"))
-        if ip:
-            try:
-                effective = _apply_volume_limit(node, int(node.get("volume_percent", 75)))
-                await _sonos_set_volume(ip, effective)
-            except Exception:
-                pass
-    await broadcast_nodes()
-    return {"ok": True, "max_volume_percent": percent}
-
-
-@app.post("/api/nodes/{node_id}/stereo")
-async def set_node_stereo_mode(node_id: str, payload: NodeStereoModePayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    mode = _normalize_stereo_mode(payload.mode)
-    if mode not in {"both", "left", "right"}:
-        raise HTTPException(status_code=400, detail="Invalid stereo mode")
-
-    if node.get("type") == "agent":
-        try:
-            await _call_agent(node, "/stereo", {"mode": mode})
-        except HTTPException:
-            raise
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Failed to apply stereo mode: {exc}") from exc
-    elif node.get("type") == "browser":
-        if webrtc_relay:
-            try:
-                await webrtc_relay.set_stereo_mode(node_id, mode)
-            except Exception:
-                # Session may not exist yet; setting is persisted regardless.
-                pass
-    elif node.get("type") == "sonos":
-        # Applied when the Sonos pulls the MP3 stream.
-        pass
-    else:
-        raise HTTPException(status_code=400, detail="Unknown node type")
-    node["stereo_mode"] = mode
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "stereo_mode": mode}
-
-
-@app.post("/api/nodes/{node_id}/sonos-eq")
-async def set_sonos_eq(node_id: str, payload: SonosEqPayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") != "sonos":
-        raise HTTPException(status_code=400, detail="Sonos EQ only applies to Sonos nodes")
-    ip = _sonos_ip_from_url(node.get("url"))
-    if not ip:
-        raise HTTPException(status_code=400, detail="Invalid Sonos node")
-
-    current = _normalize_sonos_eq(node.get("sonos_eq"))
-    desired = dict(current)
-    if payload.bass is not None:
-        desired["bass"] = int(payload.bass)
-    if payload.treble is not None:
-        desired["treble"] = int(payload.treble)
-    if payload.loudness is not None:
-        desired["loudness"] = bool(payload.loudness)
-    desired = _normalize_sonos_eq(desired)
-
-    await _sonos_set_eq(ip, eq_type="Bass", value=int(desired["bass"]))
-    await _sonos_set_eq(ip, eq_type="Treble", value=int(desired["treble"]))
-    await _sonos_set_eq(ip, eq_type="Loudness", value=1 if desired["loudness"] else 0)
-
-    node["sonos_eq"] = desired
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "sonos_eq": desired}
-
-
-@app.post("/api/nodes/{node_id}/mute")
-async def set_node_mute(node_id: str, payload: dict = Body(...)) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    muted = payload.get("muted") if payload else None
-    if muted is None:
-        raise HTTPException(status_code=400, detail="Missing muted")
-    if node.get("type") == "browser":
-        ws = browser_ws.get(node_id)
-        if not ws:
-            raise HTTPException(status_code=503, detail="Browser node not connected")
-        await ws.send_json({"type": "mute", "muted": bool(muted)})
-        result = {"sent": True}
-    elif node.get("type") == "sonos":
-        ip = _sonos_ip_from_url(node.get("url"))
-        if not ip:
-            raise HTTPException(status_code=400, detail="Invalid Sonos node")
-        await _sonos_set_mute(ip, bool(muted))
-        result = {"sonos": True}
-    else:
-        result = await _call_agent(node, "/mute", {"muted": bool(muted)})
-    node["muted"] = bool(muted)
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "result": result}
-
-
 @app.post("/api/snapcast/master-volume")
 async def snapcast_master_volume(payload: VolumePayload) -> dict:
     try:
@@ -5250,224 +4936,6 @@ async def snapcast_master_volume(payload: VolumePayload) -> dict:
     except Exception as exc:  # pragma: no cover
         log.exception("Failed to set master volume")
         raise HTTPException(status_code=502, detail=str(exc))
-
-
-@app.post("/api/nodes/{node_id}/eq")
-async def set_node_eq(node_id: str, payload: EqPayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    eq_data = payload.model_dump()
-    node["eq"] = eq_data
-    save_nodes()
-    if node.get("type") == "browser":
-        ws = browser_ws.get(node_id)
-        if not ws:
-            raise HTTPException(status_code=503, detail="Browser node not connected")
-        await ws.send_json({"type": "eq", "eq": eq_data})
-        result = {"sent": True}
-    elif node.get("type") == "sonos":
-        # Applied when the Sonos pulls the MP3 stream.
-        result = {"sonos_stream": True}
-    else:
-        result = await _call_agent(node, "/eq", eq_data)
-    await broadcast_nodes()
-    return {"ok": True, "result": result}
-
-
-@app.post("/api/nodes/{node_id}/pair")
-async def pair_node(node_id: str, payload: dict | None = Body(default=None)) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "browser":
-        raise HTTPException(status_code=400, detail="Browser nodes do not support pairing")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="Sonos nodes do not support pairing")
-    force = True if payload is None else bool(payload.get("force", False))
-    recovery_code = None if payload is None else payload.get("recovery_code")
-    secret = await request_agent_secret(node, force=force, recovery_code=recovery_code)
-    node["agent_secret"] = secret
-    await configure_agent_audio(node)
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True}
-
-
-@app.post("/api/nodes/{node_id}/rename")
-async def rename_node(node_id: str, payload: RenameNodePayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    new_name = payload.name.strip()
-    if not new_name:
-        raise HTTPException(status_code=400, detail="Name must not be empty")
-    node["name"] = new_name
-    node["name_is_custom"] = True
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "name": new_name}
-
-
-@app.post("/api/nodes/{node_id}/channel")
-async def update_node_channel(node_id: str, payload: NodeChannelPayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    await _set_node_channel(node, payload.channel_id)
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "channel_id": node.get("channel_id")}
-
-
-@app.post("/api/nodes/{node_id}/configure")
-async def configure_node(node_id: str) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "browser":
-        raise HTTPException(status_code=400, detail="Browser nodes do not require configuration")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="Sonos nodes do not require configuration")
-    result = await configure_agent_audio(node)
-    await _sync_node_max_volume(node)
-    await broadcast_nodes()
-    return {"ok": True, "result": result}
-
-
-@app.post("/api/nodes/{node_id}/outputs")
-async def set_node_output(node_id: str, payload: OutputSelectionPayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "browser":
-        raise HTTPException(status_code=400, detail="Browser nodes do not support hardware outputs")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="Sonos nodes do not support hardware outputs")
-    result = await _call_agent(node, "/outputs", payload.model_dump())
-    outputs = result.get("outputs") if isinstance(result, dict) else None
-    if isinstance(outputs, dict):
-        node["outputs"] = outputs
-        selected = outputs.get("selected")
-        if isinstance(selected, str) and selected:
-            node["playback_device"] = selected
-    else:
-        node["playback_device"] = payload.device
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "result": result}
-
-
-@app.post("/api/nodes/{node_id}/check-updates")
-async def check_node_updates(node_id: str) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "browser":
-        raise HTTPException(status_code=400, detail="Browser nodes do not support updates")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="Sonos nodes do not support updates")
-    reachable, changed = await refresh_agent_metadata(node)
-    if not reachable:
-        raise HTTPException(status_code=504, detail="Node agent is not responding")
-    if node.get("agent_version"):
-        log.info("Checked updates for node %s (version %s)", node_id, node.get("agent_version"))
-    await broadcast_nodes()
-    public = public_node(node)
-    return {
-        "ok": True,
-        "agent_version": public.get("agent_version"),
-        "update_available": public.get("update_available"),
-        "changed": changed,
-    }
-
-
-@app.post("/api/nodes/{node_id}/update")
-async def update_agent_node(node_id: str) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "browser":
-        raise HTTPException(status_code=400, detail="Browser nodes cannot be updated from the controller")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="Sonos nodes cannot be updated from the controller")
-    result = await _call_agent(node, "/update", {})
-    node["updating"] = True
-    node["audio_configured"] = False
-    node["_needs_reconfig"] = True
-    save_nodes()
-    await broadcast_nodes()
-    schedule_agent_refresh(node_id, delay=20.0, repeat=True, attempts=12)
-    return {"ok": True, "result": result}
-
-
-@app.post("/api/nodes/{node_id}/restart")
-async def restart_agent_node(node_id: str) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "browser":
-        raise HTTPException(status_code=400, detail="Browser nodes cannot be restarted from the controller")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="Sonos nodes cannot be restarted from the controller")
-    result = await _call_agent(node, "/restart", {})
-    schedule_restart_watch(node_id)
-    await broadcast_nodes()
-    return {"ok": True, "result": result, "timeout": NODE_RESTART_TIMEOUT}
-
-
-@app.post("/api/nodes/{node_id}/terminal-session")
-async def create_terminal_session(node_id: str) -> dict:
-    if not NODE_TERMINAL_ENABLED:
-        raise HTTPException(status_code=503, detail="Terminal access is disabled")
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    if node.get("type") == "browser":
-        raise HTTPException(status_code=400, detail="Browser nodes do not support terminal access")
-    if node.get("type") == "sonos":
-        raise HTTPException(status_code=400, detail="Sonos nodes do not support terminal access")
-    if node.get("online") is False:
-        raise HTTPException(status_code=409, detail="Node is offline")
-    target = _resolve_terminal_target(node)
-    if not target:
-        raise HTTPException(status_code=400, detail="Terminal credentials are not configured")
-    _cleanup_terminal_sessions()
-    token = secrets.token_urlsafe(32)
-    now = time.time()
-    expires_at = now + max(5, NODE_TERMINAL_TOKEN_TTL)
-    deadline = now + max(30, NODE_TERMINAL_MAX_DURATION)
-    terminal_sessions[token] = {
-        "node_id": node_id,
-        "target": target,
-        "created_at": now,
-        "expires_at": expires_at,
-        "deadline": deadline,
-    }
-    return {
-        "token": token,
-        "expires_at": expires_at,
-        "ws_path": f"/ws/terminal/{token}",
-        "page_url": f"/static/terminal.html?token={token}",
-    }
-
-
-@app.delete("/api/nodes/{node_id}")
-async def unregister_node(node_id: str) -> dict:
-    node = nodes.pop(node_id, None)
-    if not node:
-        raise HTTPException(status_code=404, detail="Unknown node")
-    cancel_node_rediscovery(node_id)
-    save_nodes()
-    await broadcast_nodes()
-    if node.get("is_controller"):
-        await stop_local_agent()
-    if node.get("type") == "browser":
-        if webrtc_relay:
-            await webrtc_relay.drop_session(node_id)
-        else:
-            await teardown_browser_node(node_id, remove_entry=False)
-    return {"ok": True, "removed": node_id}
 
 
 async def _refresh_all_agent_nodes() -> None:
@@ -6040,201 +5508,6 @@ async def _channel_idle_loop() -> None:
         pass
 
 
-@app.get("/api/nodes")
-async def list_nodes() -> dict:
-    return {"sections": public_sections(), "nodes": public_nodes()}
-
-
-class CreateSectionPayload(BaseModel):
-    name: str
-
-
-class UpdateSectionPayload(BaseModel):
-    name: str
-
-
-class ReorderSectionsPayload(BaseModel):
-    section_ids: list[str]
-
-
-class SetNodeSectionPayload(BaseModel):
-    section_id: Optional[str] = None
-
-
-class ReorderNodeSectionPayload(BaseModel):
-    section_id: Optional[str] = None
-    node_ids: list[str]
-
-
-class ReorderNodesPayload(BaseModel):
-    sections: list[ReorderNodeSectionPayload]
-
-
-@app.post("/api/sections")
-async def create_section(payload: CreateSectionPayload) -> dict:
-    global sections
-    name = _normalize_section_name(payload.name)
-    if not name:
-        raise HTTPException(status_code=400, detail="Section name required")
-    section = {
-        "id": str(uuid.uuid4()),
-        "name": name,
-        "created_at": int(time.time()),
-        "updated_at": int(time.time()),
-    }
-    sections.insert(0, section)
-    save_nodes()
-    await broadcast_nodes()
-    return {"section": _public_section(section), "sections": public_sections()}
-
-
-@app.patch("/api/sections/{section_id}")
-async def update_section(section_id: str, payload: UpdateSectionPayload) -> dict:
-    section = _find_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail="Section not found")
-    name = _normalize_section_name(payload.name)
-    if not name:
-        raise HTTPException(status_code=400, detail="Section name required")
-    section["name"] = name
-    section["updated_at"] = int(time.time())
-    save_nodes()
-    await broadcast_nodes()
-    return {"section": _public_section(section), "sections": public_sections()}
-
-
-@app.delete("/api/sections/{section_id}")
-async def delete_section(section_id: str) -> dict:
-    global sections
-    section = _find_section(section_id)
-    if not section:
-        raise HTTPException(status_code=404, detail="Section not found")
-
-    sections = [s for s in sections if s.get("id") != section_id]
-
-    # Move nodes in the deleted section to no-section.
-    moved = [node for node in nodes.values() if node.get("section_id") == section_id]
-    moved.sort(key=lambda n: (
-        int(n.get("section_order")) if isinstance(n.get("section_order"), int) else 10**9,
-        (n.get("name") or "").lower(),
-    ))
-    current_unsectioned = [
-        node for node in nodes.values() if not (node.get("section_id") or "")
-    ]
-    max_order = -1
-    for node in current_unsectioned:
-        try:
-            max_order = max(max_order, int(node.get("section_order")))
-        except (TypeError, ValueError):
-            continue
-    next_order = max_order + 1
-    for node in moved:
-        node["section_id"] = None
-        node["section_order"] = next_order
-        next_order += 1
-
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "sections": public_sections(), "nodes": public_nodes()}
-
-
-@app.post("/api/sections/reorder")
-async def reorder_sections(payload: ReorderSectionsPayload) -> dict:
-    global sections
-    requested = [sid for sid in (payload.section_ids or []) if isinstance(sid, str) and sid]
-    current_ids = [section.get("id") for section in sections if section.get("id")]
-    if not requested or set(requested) != set(current_ids) or len(requested) != len(current_ids):
-        raise HTTPException(status_code=400, detail="Invalid section order")
-    lookup = {section.get("id"): section for section in sections}
-    sections = [lookup[sid] for sid in requested if sid in lookup]
-    now = int(time.time())
-    for section in sections:
-        section["updated_at"] = now
-    save_nodes()
-    await broadcast_nodes()
-    return {"sections": public_sections()}
-
-
-@app.post("/api/nodes/{node_id}/section")
-async def set_node_section(node_id: str, payload: SetNodeSectionPayload) -> dict:
-    node = nodes.get(node_id)
-    if not node:
-        raise HTTPException(status_code=404, detail="Node not found")
-    section_id = payload.section_id
-    if isinstance(section_id, str):
-        section_id = section_id.strip() or None
-    else:
-        section_id = None
-
-    if section_id and not _find_section(section_id):
-        raise HTTPException(status_code=404, detail="Section not found")
-
-    node["section_id"] = section_id
-    if section_id is None:
-        # Keep it sortable within the unsectioned group.
-        try:
-            node["section_order"] = int(node.get("section_order"))
-        except (TypeError, ValueError):
-            node["section_order"] = None
-    save_nodes()
-    await broadcast_nodes()
-    return {"result": {"id": node_id, "section_id": section_id}}
-
-
-@app.post("/api/nodes/reorder")
-async def reorder_nodes(payload: ReorderNodesPayload) -> dict:
-    if not payload.sections:
-        raise HTTPException(status_code=400, detail="No sections provided")
-
-    seen_nodes: set[str] = set()
-    section_updates: list[tuple[Optional[str], list[str]]] = []
-    for entry in payload.sections:
-        section_id: Optional[str] = entry.section_id
-        if isinstance(section_id, str):
-            section_id = section_id.strip() or None
-        else:
-            section_id = None
-        if section_id and not _find_section(section_id):
-            raise HTTPException(status_code=404, detail="Section not found")
-        node_ids = [nid for nid in (entry.node_ids or []) if isinstance(nid, str) and nid]
-        if len(node_ids) != len(entry.node_ids or []):
-            raise HTTPException(status_code=400, detail="Invalid node id")
-        if len(set(node_ids)) != len(node_ids):
-            raise HTTPException(status_code=400, detail="Duplicate node ids")
-        for nid in node_ids:
-            if nid in seen_nodes:
-                raise HTTPException(status_code=400, detail="Node appears in multiple sections")
-            if nid not in nodes:
-                raise HTTPException(status_code=404, detail=f"Node not found: {nid}")
-            seen_nodes.add(nid)
-        section_updates.append((section_id, node_ids))
-
-    # Apply requested ordering per section.
-    for section_id, node_ids in section_updates:
-        for idx, nid in enumerate(node_ids):
-            node = nodes[nid]
-            node["section_id"] = section_id
-            node["section_order"] = idx
-
-        # Ensure remaining nodes in this group get unique order values after the specified list.
-        remaining = [
-            node for node in nodes.values()
-            if node.get("section_id") == section_id and node.get("id") not in set(node_ids)
-        ]
-        remaining.sort(key=lambda n: (
-            int(n.get("section_order")) if isinstance(n.get("section_order"), int) else 10**9,
-            (n.get("name") or "").lower(),
-        ))
-        next_index = len(node_ids)
-        for node in remaining:
-            node["section_order"] = next_index
-            next_index += 1
-
-    save_nodes()
-    await broadcast_nodes()
-    return {"ok": True, "sections": public_sections(), "nodes": public_nodes()}
-
-
 @app.get("/api/streams/diagnostics")
 async def stream_diagnostics(channel_id: Optional[str] = Query(None)) -> dict:
     if channel_id:
@@ -6323,279 +5596,6 @@ async def stream_diagnostics(channel_id: Optional[str] = Query(None)) -> dict:
     if webrtc_diag:
         response["webrtc"] = {"sample_rate": webrtc_diag.get("sample_rate")}
     return response
-
-
-@app.post("/api/web-nodes/session")
-async def web_node_session(payload: WebNodeOffer, request: Request) -> dict:
-    if not WEBRTC_ENABLED or not webrtc_relay:
-        raise HTTPException(status_code=503, detail="Web nodes are disabled")
-    name = payload.name.strip() or "Web node"
-    loop = asyncio.get_running_loop()
-    future: asyncio.Future = loop.create_future()
-    request_id = secrets.token_urlsafe(16)
-    client_host = request.client.host if request.client else None
-    entry = {
-        "id": request_id,
-        "name": name,
-        "offer_sdp": payload.sdp,
-        "offer_type": payload.type,
-        "future": future,
-        "client_host": client_host,
-        "created_at": time.time(),
-    }
-    snapshot = _get_web_node_snapshot(entry)
-    pending_web_node_requests[request_id] = entry
-    await _broadcast_web_node_request_event("created", snapshot=snapshot)
-    try:
-        result = await asyncio.wait_for(future, timeout=WEB_NODE_APPROVAL_TIMEOUT)
-    except asyncio.TimeoutError:
-        pending = pending_web_node_requests.pop(request_id, None)
-        pending_snapshot = _get_web_node_snapshot(pending) if pending else snapshot
-        if pending and not pending["future"].done():
-            pending["future"].set_result({"status": "expired", "status_code": 408})
-        await _broadcast_web_node_request_event("resolved", snapshot=pending_snapshot, status="expired")
-        raise HTTPException(status_code=408, detail="Approval timed out")
-    except HTTPException as exc:
-        raise exc
-    except Exception as exc:  # pragma: no cover - defensive
-        raise HTTPException(status_code=500, detail=str(exc))
-    finally:
-        pending_web_node_requests.pop(request_id, None)
-    if result.get("status") != "approved":
-        status_code = result.get("status_code", 403)
-        detail = result.get("message") or "Web node request denied"
-        raise HTTPException(status_code=status_code, detail=detail)
-    return {
-        "node": result["node"],
-        "answer": result["answer"],
-        "answer_type": result["answer_type"],
-    }
-
-
-@app.get("/api/web-nodes/requests")
-async def list_web_node_requests(_: dict = Depends(require_admin)) -> dict:
-    return {"requests": _pending_web_node_snapshots()}
-
-
-@app.post("/api/web-nodes/requests/{request_id}")
-async def decide_web_node_request(
-    request_id: str,
-    payload: WebNodeRequestDecisionPayload,
-    _: dict = Depends(require_admin),
-) -> dict:
-    action = payload.action.lower().strip()
-    pending = _pop_pending_web_node_request(request_id)
-    snapshot = _get_web_node_snapshot(pending)
-    future: asyncio.Future = pending.get("future")
-    if action == "approve":
-        try:
-            result = await _establish_web_node_session_for_request(pending)
-        except HTTPException as exc:
-            if future and not future.done():
-                future.set_result({
-                    "status": "failed",
-                    "status_code": exc.status_code,
-                    "message": exc.detail,
-                })
-            await _broadcast_web_node_request_event("resolved", snapshot=snapshot, status="failed", reason=exc.detail)
-            raise
-        if future and not future.done():
-            future.set_result({"status": "approved", **result})
-        await _broadcast_web_node_request_event("resolved", snapshot=snapshot, status="approved")
-        return {"ok": True, "status": "approved"}
-    reason = (payload.reason or "Request denied").strip() or "Request denied"
-    if future and not future.done():
-        future.set_result({"status": "denied", "message": reason, "status_code": 403})
-    await _broadcast_web_node_request_event("resolved", snapshot=snapshot, status="denied", reason=reason)
-    return {"ok": True, "status": "denied"}
-
-
-@app.websocket("/ws/web-node")
-async def web_node_ws(ws: WebSocket):
-    await ws.accept()
-    user = await _require_ws_user(ws)
-    if not user:
-        return
-    node_id = ws.query_params.get("node_id")
-    if not node_id or node_id not in nodes:
-        await ws.close(code=1008)
-        return
-    browser_ws[node_id] = ws
-    try:
-        while True:
-            await ws.receive_text()
-    except Exception:
-        pass
-    finally:
-        browser_ws.pop(node_id, None)
-
-
-@app.websocket("/ws/nodes")
-async def nodes_ws(ws: WebSocket):
-    await ws.accept()
-    user = await _require_ws_user(ws)
-    if not user:
-        return
-    node_watchers.add(ws)
-    try:
-        await ws.send_json({"type": "nodes", "sections": public_sections(), "nodes": public_nodes()})
-        await ws.send_json({"type": "web_node_requests", "requests": _pending_web_node_snapshots()})
-        while True:
-            await ws.receive_text()
-    except WebSocketDisconnect:
-        pass
-    except Exception:
-        pass
-    finally:
-        node_watchers.discard(ws)
-
-
-@app.websocket("/ws/terminal/{token}")
-async def terminal_ws(ws: WebSocket, token: str):
-    await ws.accept()
-    if not NODE_TERMINAL_ENABLED:
-        await ws.close(code=4403)
-        return
-    user = await _require_ws_user(ws)
-    if not user:
-        return
-    session = terminal_sessions.pop(token, None)
-    now = time.time()
-    if not session or session.get("expires_at", 0) < now:
-        await ws.close(code=4403)
-        return
-    target = session.get("target") or {}
-    key_path = (target.get("key_path") or "").strip()
-    if key_path:
-        key_path = os.path.expanduser(key_path)
-        if not Path(key_path).exists():
-            await ws.send_json({"type": "error", "message": "SSH key not found"})
-            await ws.close(code=1011)
-            return
-    password = (target.get("password") or "").strip()
-    if not key_path and not password:
-        await ws.send_json({"type": "error", "message": "No SSH credentials configured"})
-        await ws.close(code=1011)
-        return
-    ssh_host = target.get("host")
-    if not ssh_host:
-        await ws.send_json({"type": "error", "message": "Terminal host unavailable"})
-        await ws.close(code=1011)
-        return
-    ssh_kwargs = {
-        "host": ssh_host,
-        "port": target.get("port", 22),
-        "username": target.get("user"),
-        "client_keys": [key_path] if key_path else None,
-        "password": password or None,
-    }
-    if not ssh_kwargs["username"]:
-        await ws.send_json({"type": "error", "message": "Terminal user is not configured"})
-        await ws.close(code=1011)
-        return
-    if not NODE_TERMINAL_STRICT_HOST_KEY:
-        ssh_kwargs["known_hosts"] = None
-    term_size = asyncssh.TermSize(80, 24)
-    deadline = session.get("deadline", now + NODE_TERMINAL_MAX_DURATION)
-
-    async def _send_error(message: str) -> None:
-        try:
-            await ws.send_json({"type": "error", "message": message})
-        finally:
-            await ws.close(code=1011)
-
-    try:
-        async with asyncssh.connect(
-            ssh_kwargs["host"],
-            port=ssh_kwargs.get("port") or 22,
-            username=ssh_kwargs.get("username"),
-            client_keys=ssh_kwargs.get("client_keys"),
-            password=ssh_kwargs.get("password"),
-            known_hosts=ssh_kwargs.get("known_hosts"),
-        ) as conn:
-            process = await conn.create_process(term_type="xterm-256color", term_size=term_size, encoding=None)
-
-            async def pump_stream(stream):
-                try:
-                    while True:
-                        chunk = await stream.read(1024)
-                        if not chunk:
-                            break
-                        if isinstance(chunk, bytes):
-                            text = chunk.decode("utf-8", errors="ignore")
-                        else:
-                            text = chunk
-                        try:
-                            await ws.send_json({"type": "output", "data": text})
-                        except Exception:
-                            break
-                except Exception:
-                    return
-
-            async def pump_input():
-                try:
-                    while True:
-                        if time.time() > deadline:
-                            await ws.send_json({"type": "error", "message": "Terminal session expired"})
-                            break
-                        raw = await ws.receive_text()
-                        payload = json.loads(raw)
-                        msg_type = payload.get("type")
-                        if msg_type == "input":
-                            data = payload.get("data", "")
-                            if data:
-                                process.stdin.write(data)
-                                await process.stdin.drain()
-                        elif msg_type == "resize":
-                            cols = int(payload.get("cols") or 80)
-                            rows = int(payload.get("rows") or 24)
-                            try:
-                                set_size = getattr(process.channel, "set_terminal_size", None)
-                                if asyncio.iscoroutinefunction(set_size):
-                                    await set_size(cols, rows)
-                                elif set_size:
-                                    set_size(cols, rows)
-                            except Exception:
-                                pass
-                        elif msg_type == "close":
-                            break
-                except WebSocketDisconnect:
-                    pass
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        process.stdin.write_eof()
-                    except Exception:
-                        pass
-
-            tasks = [asyncio.create_task(pump_input())]
-            if process.stdout:
-                tasks.append(asyncio.create_task(pump_stream(process.stdout)))
-            if process.stderr:
-                tasks.append(asyncio.create_task(pump_stream(process.stderr)))
-
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
-            await process.wait()
-            try:
-                await ws.send_json({"type": "exit", "code": process.exit_status})
-            except Exception:
-                pass
-            try:
-                await ws.close()
-            except Exception:
-                pass
-    except asyncssh.PermissionDenied as exc:
-        await _send_error(f"Permission denied: {exc}")
-    except asyncssh.Error as exc:
-        await _send_error(f"SSH error: {exc}")
-    except Exception as exc:
-        await _send_error(f"Terminal failed: {exc}")
-
 
 async def _probe_host(host: str) -> Optional[dict]:
     url = f"http://{host}:{AGENT_PORT}"
@@ -6758,69 +5758,6 @@ async def _rediscover_node(node_id: str, fingerprint: str) -> None:
         pass
     finally:
         node_rediscovery_tasks.pop(node_id, None)
-
-
-@app.get("/api/nodes/discover")
-async def discover_nodes() -> StreamingResponse:
-    networks = _detect_discovery_networks()
-    if not networks:
-        raise HTTPException(status_code=503, detail="No IPv4 networks available for discovery")
-    hosts = _hosts_for_networks(networks)
-    if not hosts:
-        raise HTTPException(status_code=503, detail="No hosts available for discovery")
-
-    async def _event_stream() -> AsyncIterator[str]:
-        found = 0
-        limited = len(hosts) >= DISCOVERY_MAX_HOSTS
-        yield json.dumps({
-            "type": "start",
-            "networks": networks,
-            "host_count": len(hosts),
-            "limited": limited,
-        }) + "\n"
-        sonos_task: Optional[asyncio.Task[list[dict]]] = None
-        sonos_emitted = False
-        try:
-            # Run Sonos SSDP discovery concurrently with agent probing.
-            sonos_task = asyncio.create_task(_sonos_ssdp_discover())
-            async for result in _stream_host_probes(hosts):
-                found += 1
-                yield json.dumps({"type": "discovered", "data": result}) + "\n"
-                if sonos_task and not sonos_emitted and sonos_task.done():
-                    sonos_emitted = True
-                    try:
-                        sonos_items = sonos_task.result() or []
-                    except Exception:
-                        sonos_items = []
-                    for item in sonos_items:
-                        found += 1
-                        yield json.dumps({"type": "discovered", "data": item}) + "\n"
-            sonos_items: list[dict] = []
-            if sonos_task:
-                try:
-                    sonos_items = await asyncio.wait_for(
-                        sonos_task,
-                        timeout=max(0.5, SONOS_DISCOVERY_TIMEOUT + 1.0),
-                    )
-                except Exception:
-                    sonos_items = []
-            if not sonos_emitted:
-                for item in sonos_items or []:
-                    found += 1
-                    yield json.dumps({"type": "discovered", "data": item}) + "\n"
-        except asyncio.CancelledError:
-            yield json.dumps({"type": "cancelled", "found": found}) + "\n"
-            raise
-        except Exception as exc:  # pragma: no cover - defensive
-            log.exception("Discovery failed", exc_info=exc)
-            yield json.dumps({"type": "error", "message": "Discovery failed"}) + "\n"
-        else:
-            yield json.dumps({"type": "complete", "found": found}) + "\n"
-        finally:
-            if sonos_task and not sonos_task.done():
-                sonos_task.cancel()
-
-    return StreamingResponse(_event_stream(), media_type="application/x-ndjson")
 
 
 @app.get("/api/channels")
