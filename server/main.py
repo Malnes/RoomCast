@@ -2834,6 +2834,33 @@ async def _sonos_get_current_uri(ip: str) -> Optional[str]:
     return uri.strip() if uri else None
 
 
+async def _sonos_get_zone_name(ip: str) -> Optional[str]:
+    """Return the Sonos app 'room' / zone name for this device."""
+
+    try:
+        xml_text = await _sonos_soap_action_text(
+            ip,
+            service="DeviceProperties",
+            action="GetZoneAttributes",
+            control_path="/DeviceProperties/Control",
+            arguments={},
+        )
+    except Exception as exc:
+        log.warning("Sonos GetZoneAttributes failed (ip=%s): %s", ip, exc)
+        return None
+
+    try:
+        root = ElementTree.fromstring(xml_text)
+    except Exception as exc:
+        log.warning("Sonos GetZoneAttributes parse failed (ip=%s): %s", ip, exc)
+        return None
+    name = root.findtext(".//{*}CurrentZoneName")
+    if not name:
+        return None
+    resolved = name.strip()
+    return resolved or None
+
+
 async def _sonos_set_volume(ip: str, percent: int) -> None:
     await _sonos_soap_action(
         ip,
@@ -4521,6 +4548,7 @@ async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool
     normalized_url = _normalize_node_url(reg.url)
     reg.url = normalized_url
     fingerprint = reg.fingerprint
+    desc: Optional[dict] = None
     if normalized_url.startswith("sonos://"):
         ip = _sonos_ip_from_url(normalized_url)
         if not ip:
@@ -4539,13 +4567,37 @@ async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool
         ip = _sonos_ip_from_url(node.get("url"))
         if not ip:
             raise HTTPException(status_code=400, detail="Invalid Sonos node URL")
-        desc = await _sonos_fetch_description(ip)
-        if desc:
-            if desc.get("friendly_name"):
-                node["name"] = desc["friendly_name"]
+        # Reuse the description we already fetched for fingerprinting when possible.
+        if desc is None:
+            desc = await _sonos_fetch_description(ip)
+
+        friendly_name = (desc.get("friendly_name") if isinstance(desc, dict) else None) or None
+        zone_name = await _sonos_get_zone_name(ip)
+        sonos_app_name = zone_name or friendly_name
+
+        if isinstance(desc, dict):
             node["sonos_udn"] = desc.get("udn")
             node["sonos_rincon"] = desc.get("rincon")
             node["fingerprint"] = node.get("fingerprint") or desc.get("udn")
+        node["sonos_friendly_name"] = friendly_name
+        node["sonos_zone_name"] = zone_name
+
+        # Prevent Sonos metadata refreshes from overwriting manual renames.
+        name_is_custom = node.get("name_is_custom")
+        if not isinstance(name_is_custom, bool):
+            current_name = (node.get("name") or "").strip()
+            # Heuristic for older nodes: if the current name doesn't match any Sonos-reported
+            # name, treat it as user-custom.
+            inferred_custom = False
+            if current_name:
+                if sonos_app_name and current_name != sonos_app_name:
+                    if friendly_name and current_name != friendly_name:
+                        inferred_custom = True
+            node["name_is_custom"] = inferred_custom
+            name_is_custom = inferred_custom
+
+        if not name_is_custom and sonos_app_name:
+            node["name"] = sonos_app_name
         node["audio_configured"] = True
         node["agent_secret"] = None
         save_nodes()
@@ -4956,6 +5008,7 @@ async def rename_node(node_id: str, payload: RenameNodePayload) -> dict:
     if not new_name:
         raise HTTPException(status_code=400, detail="Name must not be empty")
     node["name"] = new_name
+    node["name_is_custom"] = True
     save_nodes()
     await broadcast_nodes()
     return {"ok": True, "name": new_name}

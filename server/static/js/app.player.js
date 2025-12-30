@@ -914,6 +914,110 @@ let providersAvailableCache = [];
 let providersInstalledCache = [];
 let providerSettingsOpenId = null;
 
+let providerSettingsModal = null;
+let providerSettingsModalContent = null;
+let providerSettingsModalTitle = null;
+let providerSettingsModalProviderId = null;
+let providerSettingsModalParked = null;
+
+function handleProviderSettingsModalKey(evt) {
+  if (evt.key === 'Escape' && providerSettingsModal?.style?.display === 'flex') {
+    evt.preventDefault();
+    closeProviderSettingsModal();
+  }
+}
+
+function closeProviderSettingsModal() {
+  if (providerSettingsModalParked?.el && providerSettingsModalParked?.parent) {
+    const { el, parent, nextSibling } = providerSettingsModalParked;
+    try {
+      if (nextSibling && nextSibling.parentNode === parent) parent.insertBefore(el, nextSibling);
+      else parent.appendChild(el);
+    } catch (e) {
+      // If restore fails, fall back to leaving it in-place.
+    }
+  }
+  providerSettingsModalParked = null;
+  providerSettingsModalProviderId = null;
+  providerSettingsOpenId = null;
+  if (providerSettingsModal) {
+    providerSettingsModal.style.display = 'none';
+  }
+  document.removeEventListener('keydown', handleProviderSettingsModalKey, true);
+  syncProviderSettingsPanels();
+}
+
+function openProviderSettingsModal(providerId) {
+  const pid = (providerId || '').trim().toLowerCase();
+  if (!pid) return;
+  const installed = getInstalledProvider(pid);
+  if (!installed) {
+    showError('Provider is not installed.');
+    return;
+  }
+
+  let panelEl = null;
+  if (pid === 'spotify') panelEl = providerSettingsSpotify;
+  else if (pid === 'radio') panelEl = providerSettingsRadio;
+
+  if (!panelEl) {
+    showError('This provider has no settings UI.');
+    return;
+  }
+
+  if (providerSettingsModalProviderId === pid && providerSettingsModal?.style?.display === 'flex') {
+    closeProviderSettingsModal();
+    return;
+  }
+
+  // Close any existing modal first so we restore the previous panel.
+  closeProviderSettingsModal();
+  providerSettingsModalProviderId = pid;
+
+  if (!providerSettingsModal) {
+    providerSettingsModal = document.createElement('div');
+    providerSettingsModal.className = 'settings-overlay';
+    const card = document.createElement('div');
+    card.className = 'settings-card';
+    const header = document.createElement('div');
+    header.className = 'settings-header';
+    providerSettingsModalTitle = document.createElement('div');
+    providerSettingsModalTitle.className = 'section-title';
+    providerSettingsModalTitle.style.margin = '0';
+    header.appendChild(providerSettingsModalTitle);
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'icon-btn';
+    closeBtn.textContent = '✕';
+    closeBtn.addEventListener('click', closeProviderSettingsModal);
+    header.appendChild(closeBtn);
+    card.appendChild(header);
+    providerSettingsModalContent = document.createElement('div');
+    providerSettingsModalContent.className = 'node-settings-content';
+    card.appendChild(providerSettingsModalContent);
+    providerSettingsModal.appendChild(card);
+    providerSettingsModal.addEventListener('click', (evt) => {
+      if (evt.target === providerSettingsModal) closeProviderSettingsModal();
+    });
+    document.body.appendChild(providerSettingsModal);
+  }
+
+  providerSettingsModalTitle.textContent = `Provider settings – ${installed.name || installed.id || pid}`;
+  if (providerSettingsModalContent) providerSettingsModalContent.innerHTML = '';
+
+  // Move the existing settings panel into the modal so existing handlers/IDs keep working.
+  providerSettingsModalParked = {
+    el: panelEl,
+    parent: panelEl.parentNode,
+    nextSibling: panelEl.nextSibling,
+  };
+  if (providerSettingsModalContent) providerSettingsModalContent.appendChild(panelEl);
+  setProviderSettingsVisible(panelEl, true);
+
+  providerSettingsModal.style.display = 'flex';
+  document.addEventListener('keydown', handleProviderSettingsModalKey, true);
+  syncProviderSettingsPanels();
+}
+
 function getInstalledProvider(providerId) {
   const pid = (providerId || '').trim().toLowerCase();
   return (Array.isArray(providersInstalledCache) ? providersInstalledCache : []).find(p => (p?.id || '').toLowerCase() === pid) || null;
@@ -929,8 +1033,15 @@ function setProviderSettingsVisible(el, visible) {
 function syncProviderSettingsPanels() {
   const spotifyInstalled = !!getInstalledProvider('spotify');
   const radioInstalled = !!getInstalledProvider('radio');
-  setProviderSettingsVisible(providerSettingsSpotify, spotifyInstalled && providerSettingsOpenId === 'spotify');
-  setProviderSettingsVisible(providerSettingsRadio, radioInstalled && providerSettingsOpenId === 'radio');
+  const modalPid = providerSettingsModalProviderId;
+  setProviderSettingsVisible(
+    providerSettingsSpotify,
+    spotifyInstalled && (providerSettingsOpenId === 'spotify' || modalPid === 'spotify'),
+  );
+  setProviderSettingsVisible(
+    providerSettingsRadio,
+    radioInstalled && (providerSettingsOpenId === 'radio' || modalPid === 'radio'),
+  );
 
   const spotifyProvider = getInstalledProvider('spotify');
   const instances = spotifyProvider?.settings?.instances;
@@ -1013,8 +1124,7 @@ function renderInstalledProviders() {
       settingsBtn.textContent = 'Settings';
       settingsBtn.addEventListener('click', () => {
         const pid = provider.id.toLowerCase();
-        providerSettingsOpenId = providerSettingsOpenId === pid ? null : pid;
-        syncProviderSettingsPanels();
+        openProviderSettingsModal(pid);
       });
       right.appendChild(settingsBtn);
 
@@ -1046,6 +1156,16 @@ async function refreshProvidersState() {
   }
   renderProviderAddSelect();
   renderInstalledProviders();
+
+  // Channels source dropdown depends on providersInstalledCache.
+  // Keep it in sync whenever providers change.
+  if (typeof renderChannelsPanel === 'function') {
+    try {
+      renderChannelsPanel();
+    } catch (_) {
+      /* ignore UI sync failures */
+    }
+  }
 }
 
 async function installSelectedProvider() {
