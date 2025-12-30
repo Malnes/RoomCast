@@ -170,6 +170,11 @@ function handlePlayerSearchClick() {
 
 function reportSpotifyError(detail) {
   const reason = getErrorMessage(detail);
+  const normalized = (reason || '').toLowerCase();
+  // Fresh installs have no Spotify provider; don't show scary connection banners in that case.
+  if (normalized.includes('provider is not installed')) {
+    return;
+  }
   const message = reason
     ? `Spotify connection issue: ${reason}. ${SPOTIFY_ALERT_HELP}`
     : `Spotify connection issue. ${SPOTIFY_ALERT_HELP}`;

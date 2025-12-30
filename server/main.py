@@ -33,6 +33,12 @@ from local_agent import (
 )
 import bcrypt
 
+from providers.registry import AVAILABLE_PROVIDERS, get_provider_spec
+from providers.storage import ProviderState, infer_providers, load_providers as _load_providers_file, save_providers as _save_providers_file
+from providers.docker_runtime import DockerUnavailable, detect_docker_context, ensure_container_absent, ensure_container_running
+from providers import spotify as spotify_provider
+from providers import radio as radio_provider
+
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("roomcast")
@@ -117,6 +123,8 @@ CHANNELS_PATH = Path(os.getenv("CHANNELS_PATH", "/config/channels.json"))
 CHANNELS_PATH.parent.mkdir(parents=True, exist_ok=True)
 SOURCES_PATH = Path(os.getenv("SOURCES_PATH", "/config/sources.json"))
 SOURCES_PATH.parent.mkdir(parents=True, exist_ok=True)
+PROVIDERS_PATH = Path(os.getenv("PROVIDERS_PATH", "/config/providers.json"))
+PROVIDERS_PATH.parent.mkdir(parents=True, exist_ok=True)
 PRIMARY_CHANNEL_ID = os.getenv("PRIMARY_CHANNEL_ID", "ch1").strip() or "ch1"
 CHANNEL_ID_PREFIX = os.getenv("CHANNEL_ID_PREFIX", "ch").strip() or "ch"
 PLAYER_SNAPSHOT_PATH = Path(os.getenv("PLAYER_SNAPSHOT_PATH", "/config/player-snapshots.json"))
@@ -244,8 +252,187 @@ SONOS_SSDP_ADDR = ("239.255.255.250", 1900)
 channels_by_id: Dict[str, dict] = {}
 channel_order: list[str] = []
 sources_by_id: Dict[str, dict] = {}
+providers_by_id: Dict[str, ProviderState] = {}
 player_snapshots: Dict[str, dict] = {}
 player_snapshot_lock = threading.Lock()
+
+
+def load_providers_state() -> None:
+    """Load installed providers.
+
+    New installs start with none.
+    Existing installs infer providers if providers.json is absent.
+    """
+    global providers_by_id
+    if PROVIDERS_PATH.exists():
+        providers_by_id = _load_providers_file(PROVIDERS_PATH)
+        return
+    inferred = infer_providers(CHANNELS_PATH, SOURCES_PATH)
+    providers_by_id = inferred
+    if inferred:
+        _save_providers_file(PROVIDERS_PATH, inferred)
+
+
+def save_providers_state() -> None:
+    _save_providers_file(PROVIDERS_PATH, providers_by_id)
+
+
+def is_provider_enabled(provider_id: str) -> bool:
+    pid = (provider_id or "").strip().lower()
+    state = providers_by_id.get(pid)
+    return bool(state and state.enabled)
+
+
+def get_provider_settings(provider_id: str) -> dict:
+    pid = (provider_id or "").strip().lower()
+    state = providers_by_id.get(pid)
+    if not state or not isinstance(state.settings, dict):
+        return {}
+    return state.settings
+
+
+def spotify_instance_count() -> int:
+    raw = get_provider_settings("spotify").get("instances", 2)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        value = 2
+    return 2 if value >= 2 else 1
+
+
+def _controller_container_id() -> str:
+    # In Docker, HOSTNAME is set to the container id (short).
+    return (os.getenv("HOSTNAME", "") or "").strip()
+
+
+def require_spotify_provider() -> None:
+    if not is_provider_enabled("spotify"):
+        raise HTTPException(status_code=503, detail="Spotify provider is not installed")
+
+
+def require_radio_provider() -> None:
+    if not is_provider_enabled("radio"):
+        raise HTTPException(status_code=503, detail="Radio provider is not installed")
+
+
+def _reconcile_spotify_runtime(instances: int) -> None:
+    image = (os.getenv("ROOMCAST_LIBRESPOT_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-librespot:latest"
+    try:
+        spotify_provider.reconcile_runtime(
+            controller_container_id=_controller_container_id(),
+            instances=instances,
+            librespot_image=image,
+            fallback_name_a=LIBRESPOT_FALLBACK_NAME,
+            fallback_name_b=os.getenv("LIBRESPOT_NAME_CH2", "RoomCast CH2"),
+        )
+    except DockerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+def _reconcile_radio_runtime(enabled: bool) -> None:
+    image = (os.getenv("ROOMCAST_RADIO_WORKER_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-radio-worker:latest"
+    try:
+        radio_provider.reconcile_runtime(
+            controller_container_id=_controller_container_id(),
+            enabled=enabled,
+            radio_worker_image=image,
+            controller_base_url=os.getenv("CONTROLLER_BASE_URL", "http://controller:8000"),
+            radio_worker_token=RADIO_WORKER_TOKEN,
+            assignment_interval=int(os.getenv("RADIO_ASSIGNMENT_INTERVAL", "10")),
+        )
+    except DockerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
+
+
+def _ensure_channel_exists(channel_id: str, *, name: str, order: int, snap_stream: str, fifo_path: str) -> None:
+    cid = (channel_id or "").strip().lower()
+    if not cid:
+        return
+    if cid in channels_by_id:
+        return
+    entry = _normalize_channel_entry({
+        "id": cid,
+        "name": name,
+        "order": order,
+        "snap_stream": snap_stream,
+        "fifo_path": fifo_path,
+        "enabled": True,
+        "source": "none",
+    }, fallback_order=order)
+    channels_by_id[cid] = entry
+    channel_order.append(cid)
+
+
+def _apply_spotify_provider(instances: int) -> None:
+    instances = 2 if instances >= 2 else 1
+    sources_entries = spotify_provider.desired_source_entries(
+        instances=instances,
+        config_path_a=str(CONFIG_PATH),
+        token_path_a=str(SPOTIFY_TOKEN_PATH),
+        status_path_a=str(LIBRESPOT_STATUS_PATH),
+        config_path_b="/config/spotify-ch2.json",
+        token_path_b="/config/spotify-token-ch2.json",
+        status_path_b="/config/librespot-status-ch2.json",
+    )
+    _write_sources_file(sources_entries)
+    load_sources()
+    _reconcile_spotify_runtime(instances)
+
+
+def _disable_spotify_provider() -> None:
+    # Remove spotify sources and detach channels.
+    sources_by_id.pop("spotify:a", None)
+    sources_by_id.pop("spotify:b", None)
+    if SOURCES_PATH.exists():
+        save_sources()
+
+    for cid, channel in channels_by_id.items():
+        if (channel.get("source") or "").strip().lower() == "spotify":
+            channel["source"] = "none"
+            channel["source_ref"] = None
+            channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
+            channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
+    save_channels()
+    spotify_provider.stop_runtime()
+
+
+def _apply_radio_provider() -> None:
+    # Radio is a per-channel source; do not auto-create channels.
+    _reconcile_radio_runtime(True)
+
+
+def _disable_radio_provider() -> None:
+    # Detach radio channels.
+    for channel in channels_by_id.values():
+        if (channel.get("source") or "").strip().lower() == "radio":
+            channel["source"] = "none"
+            channel["source_ref"] = None
+            channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
+            channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
+            channel.pop("radio_state", None)
+    save_channels()
+    _reconcile_radio_runtime(False)
+
+
+class ProviderInstallPayload(BaseModel):
+    id: str = Field(..., min_length=1, max_length=40)
+
+
+class ProviderUpdatePayload(BaseModel):
+    enabled: Optional[bool] = None
+    settings: Dict[str, Any] = Field(default_factory=dict)
+
+
+def _public_provider_state(state: ProviderState) -> dict:
+    spec = get_provider_spec(state.id)
+    return {
+        "id": state.id,
+        "name": spec.name if spec else state.id,
+        "description": spec.description if spec else "",
+        "enabled": bool(state.enabled),
+        "settings": state.settings or {},
+        "has_settings": bool(spec.has_settings) if spec else True,
+    }
 
 
 def _sanitize_channel_color(value: Optional[str]) -> Optional[str]:
@@ -411,9 +598,9 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
         enabled = enabled_value.strip().lower() not in {"0", "false", "no"}
     else:
         enabled = bool(enabled_value)
-    source = (entry.get("source") or "spotify").strip().lower()
-    if source not in {"spotify", "radio"}:
-        source = "spotify"
+    source = (entry.get("source") or "none").strip().lower()
+    if source not in {"spotify", "radio", "none"}:
+        source = "none"
     source_ref_raw = (entry.get("source_ref") or "").strip().lower()
     source_ref: Optional[str] = None
     if source == "spotify":
@@ -486,38 +673,22 @@ def _normalize_radio_state(value: Optional[dict]) -> dict:
 
 
 def _default_channel_entries() -> list[dict]:
-    defaults = [
-        {
-            "id": f"{CHANNEL_ID_PREFIX}1",
-            "name": "Channel 1",
-            "order": 1,
-            "snap_stream": "Spotify_CH1",
-            "fifo_path": "/tmp/snapfifo-ch1",
-            "config_path": str(CONFIG_PATH),
-            "token_path": str(SPOTIFY_TOKEN_PATH),
-            "status_path": str(LIBRESPOT_STATUS_PATH),
-            "color": "#22c55e",
-            "enabled": True,
-            "source": "spotify",
-            "source_ref": "spotify:a",
-        },
-        {
-            "id": f"{CHANNEL_ID_PREFIX}2",
-            "name": "Channel 2",
-            "order": 2,
-            "snap_stream": "Spotify_CH2",
-            "fifo_path": "/tmp/snapfifo-ch2",
-            "config_path": "/config/spotify-ch2.json",
-            "token_path": "/config/spotify-token-ch2.json",
-            "status_path": "/config/librespot-status-ch2.json",
-            "color": "#0ea5e9",
-            "enabled": True,
-            "source": "spotify",
-            "source_ref": "spotify:b",
-        },
-    ]
-    defaults.extend(_radio_channel_templates())
-    return defaults
+    # New installs start with exactly one channel and no source selected.
+    # Source selection determines whether a channel is usable.
+    return [{
+        "id": f"{CHANNEL_ID_PREFIX}1",
+        "name": "Channel 1",
+        "order": 1,
+        "snap_stream": "Spotify_CH1",
+        "fifo_path": "/tmp/snapfifo-ch1",
+        "config_path": str(CONFIG_PATH),
+        "token_path": str(SPOTIFY_TOKEN_PATH),
+        "status_path": str(LIBRESPOT_STATUS_PATH),
+        "color": "#22c55e",
+        "enabled": True,
+        "source": "none",
+        "source_ref": None,
+    }]
 
 
 def _radio_channel_templates() -> list[dict]:
@@ -575,7 +746,7 @@ def _ensure_radio_channels(entries: list[dict]) -> None:
         existing_ids.add(channel_id)
 
 
-def _hydrate_channels(raw_entries: list[Any]) -> list[dict]:
+def _hydrate_channels(raw_entries: list[Any], *, ensure_radio: bool) -> list[dict]:
     normalized: list[dict] = []
     seen_ids: set[str] = set()
     entries = raw_entries or []
@@ -589,7 +760,8 @@ def _hydrate_channels(raw_entries: list[Any]) -> list[dict]:
         seen_ids.add(normalized_entry["id"])
     if not normalized:
         normalized = _default_channel_entries()
-    _ensure_radio_channels(normalized)
+    if ensure_radio:
+        _ensure_radio_channels(normalized)
     normalized.sort(key=lambda item: item.get("order", 0))
     return normalized
 
@@ -661,10 +833,10 @@ def _normalize_spotify_source_id(value: Optional[str]) -> Optional[str]:
     return raw
 
 
-def _default_source_entries() -> list[dict]:
+def _default_source_entries(*, instances: int) -> list[dict]:
     # Source instances are the stable units of authentication (e.g. Spotify login A/B).
     # They can be routed to any logical channel by updating channel.source_ref.
-    return [
+    entries = [
         {
             "id": "spotify:a",
             "kind": "spotify",
@@ -674,7 +846,9 @@ def _default_source_entries() -> list[dict]:
             "token_path": str(SPOTIFY_TOKEN_PATH),
             "status_path": str(LIBRESPOT_STATUS_PATH),
         },
-        {
+    ]
+    if instances >= 2:
+        entries.append({
             "id": "spotify:b",
             "kind": "spotify",
             "name": "Spotify B",
@@ -682,8 +856,8 @@ def _default_source_entries() -> list[dict]:
             "config_path": "/config/spotify-ch2.json",
             "token_path": "/config/spotify-token-ch2.json",
             "status_path": "/config/librespot-status-ch2.json",
-        },
-    ]
+        })
+    return entries
 
 
 def load_sources() -> None:
@@ -696,8 +870,12 @@ def load_sources() -> None:
             log.warning("sources.json is invalid; regenerating defaults")
             entries = []
     if not entries:
-        entries = _default_source_entries()
-        _write_sources_file(entries)
+        if is_provider_enabled("spotify"):
+            entries = _default_source_entries(instances=spotify_instance_count())
+            _write_sources_file(entries)
+        else:
+            sources_by_id = {}
+            return
     normalized: Dict[str, dict] = {}
     for raw in entries:
         if not isinstance(raw, dict):
@@ -730,11 +908,17 @@ def load_sources() -> None:
             "status_path": status_path,
         }
     # Ensure required defaults exist even if file is partially configured.
-    defaults = {item["id"]: item for item in _default_source_entries()}
+    desired_instances = spotify_instance_count() if is_provider_enabled("spotify") else 0
+    defaults = {item["id"]: item for item in _default_source_entries(instances=max(1, desired_instances))} if desired_instances else {}
     dirty = False
-    for sid, entry in defaults.items():
-        if sid not in normalized:
-            normalized[sid] = dict(entry)
+    if desired_instances:
+        for sid, entry in defaults.items():
+            if sid not in normalized:
+                normalized[sid] = dict(entry)
+                dirty = True
+        # Trim sources that exceed the configured instance count.
+        if desired_instances < 2 and "spotify:b" in normalized:
+            normalized.pop("spotify:b", None)
             dirty = True
     sources_by_id = normalized
     if dirty:
@@ -774,7 +958,8 @@ def load_channels() -> None:
             entries = json.loads(CHANNELS_PATH.read_text()) or []
         except json.JSONDecodeError:
             log.warning("channels.json is invalid; regenerating defaults")
-    normalized = _hydrate_channels(entries)
+    # Radio no longer creates dedicated channel entries; it is a per-channel source.
+    normalized = _hydrate_channels(entries, ensure_radio=False)
     channels_by_id = {entry["id"]: entry for entry in normalized}
     channel_order = [entry["id"] for entry in normalized]
     for entry in normalized:
@@ -834,13 +1019,14 @@ def channels_public() -> list[dict]:
             "fifo_path": entry["fifo_path"],
             "color": entry.get("color"),
             "enabled": entry.get("enabled", True),
-            "source": entry.get("source", "spotify"),
+            "source": entry.get("source", "none"),
             "source_ref": entry.get("source_ref"),
             "radio_state": entry.get("radio_state"),
         })
     return items
 
 
+load_providers_state()
 load_channels()
 load_sources()
 
@@ -858,7 +1044,7 @@ def channel_detail(channel_id: str) -> dict:
         "token_path": entry["token_path"],
         "status_path": entry["status_path"],
         "enabled": entry.get("enabled", True),
-        "source": entry.get("source", "spotify"),
+        "source": entry.get("source", "none"),
         "source_ref": entry.get("source_ref"),
         "radio_state": entry.get("radio_state"),
         "spotify": read_spotify_config(entry["id"]),
@@ -893,9 +1079,19 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
         channel["enabled"] = bool(updates.get("enabled"))
     if "source_ref" in updates:
         raw_ref = (updates.get("source_ref") or "").strip().lower()
-        requested_spotify = _normalize_spotify_source_id(raw_ref)
-        requested_radio = raw_ref.startswith("radio")
-        if requested_spotify:
+        if not raw_ref:
+            channel["source"] = "none"
+            channel["source_ref"] = None
+            channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
+            channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
+            channel.pop("radio_state", None)
+            routing_changed = routing_changed or (channel["snap_stream"] != previous_snap_stream)
+        else:
+            requested_spotify = _normalize_spotify_source_id(raw_ref)
+            requested_radio = raw_ref.startswith("radio")
+
+        if raw_ref and requested_spotify:
+            require_spotify_provider()
             source = get_spotify_source(requested_spotify)
             channel["source"] = "spotify"
             channel["source_ref"] = requested_spotify
@@ -905,7 +1101,8 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
                 # Radio FIFO mappings are not used for Spotify channels.
                 channel["fifo_path"] = channel.get("fifo_path") or f"/tmp/snapfifo-{channel['id']}"
             routing_changed = routing_changed or (channel["snap_stream"] != previous_snap_stream)
-        elif requested_radio:
+        elif raw_ref and requested_radio:
+            require_radio_provider()
             # Limited radio pipelines: allocate a snapserver/fifo slot.
             cid = channel.get("id")
 
@@ -965,7 +1162,7 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
             channel["fifo_path"] = chosen_slot["fifo_path"]
             _ensure_radio_state(channel)
             routing_changed = routing_changed or (channel["snap_stream"] != previous_snap_stream)
-        else:
+        elif raw_ref:
             raise HTTPException(status_code=400, detail="Invalid source_ref")
     if "order" in updates:
         try:
@@ -1131,7 +1328,7 @@ class ChannelUpdatePayload(BaseModel):
     order: Optional[int] = Field(default=None, ge=1, le=50)
     snap_stream: Optional[str] = Field(default=None, min_length=1, max_length=160)
     enabled: Optional[bool] = None
-    source_ref: Optional[str] = Field(default=None, min_length=1, max_length=60)
+    source_ref: Optional[str] = Field(default=None, max_length=60)
 
 
 class RadioStationSelectionPayload(BaseModel):
@@ -1945,6 +2142,95 @@ def require_admin(request: Request) -> dict:
     if user.get("role") != "admin":
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
+
+
+@app.get("/api/providers/available")
+async def list_available_providers_api() -> dict:
+    items = []
+    for pid, spec in sorted(AVAILABLE_PROVIDERS.items()):
+        installed = pid in providers_by_id
+        enabled = bool(providers_by_id.get(pid).enabled) if installed else False
+        items.append({
+            "id": spec.id,
+            "name": spec.name,
+            "description": spec.description,
+            "installed": installed,
+            "enabled": enabled,
+            "has_settings": spec.has_settings,
+        })
+    return {"providers": items}
+
+
+@app.get("/api/providers/installed")
+async def list_installed_providers_api() -> dict:
+    return {"providers": [_public_provider_state(state) for state in providers_by_id.values()]}
+
+
+@app.post("/api/providers/install")
+async def install_provider_api(payload: ProviderInstallPayload, _: dict = Depends(require_admin)) -> dict:
+    pid = (payload.id or "").strip().lower()
+    spec = get_provider_spec(pid)
+    if not spec:
+        raise HTTPException(status_code=404, detail="Unknown provider")
+    existing = providers_by_id.get(pid)
+    if existing:
+        existing.enabled = True
+        if existing.settings is None:
+            existing.settings = {}
+        state = existing
+    else:
+        defaults = {}
+        if pid == "spotify":
+            defaults = {"instances": 1}
+        state = ProviderState(id=pid, enabled=True, settings=defaults)
+        providers_by_id[pid] = state
+    save_providers_state()
+
+    if pid == "spotify":
+        instances = spotify_provider.normalize_instances((state.settings or {}).get("instances"), default=1)
+        state.settings = {**(state.settings or {}), "instances": instances}
+        save_providers_state()
+        _apply_spotify_provider(instances)
+    elif pid == "radio":
+        _apply_radio_provider()
+
+    return {"ok": True, "provider": _public_provider_state(state)}
+
+
+@app.patch("/api/providers/{provider_id}")
+async def update_provider_api(provider_id: str, payload: ProviderUpdatePayload, _: dict = Depends(require_admin)) -> dict:
+    pid = (provider_id or "").strip().lower()
+    spec = get_provider_spec(pid)
+    if not spec:
+        raise HTTPException(status_code=404, detail="Unknown provider")
+    state = providers_by_id.get(pid)
+    if not state:
+        raise HTTPException(status_code=404, detail="Provider not installed")
+
+    updates = payload.model_dump(exclude_unset=True)
+    if "enabled" in updates and updates["enabled"] is not None:
+        state.enabled = bool(updates["enabled"])
+    if "settings" in updates and isinstance(updates["settings"], dict):
+        merged = dict(state.settings or {})
+        merged.update(updates["settings"])
+        state.settings = merged
+    save_providers_state()
+
+    if pid == "spotify":
+        if state.enabled:
+            instances = spotify_provider.normalize_instances((state.settings or {}).get("instances"), default=1)
+            state.settings = {**(state.settings or {}), "instances": instances}
+            save_providers_state()
+            _apply_spotify_provider(instances)
+        else:
+            _disable_spotify_provider()
+    elif pid == "radio":
+        if state.enabled:
+            _apply_radio_provider()
+        else:
+            _disable_radio_provider()
+
+    return {"ok": True, "provider": _public_provider_state(state)}
 
 def _extract_node_host(node: dict) -> Optional[str]:
     override = (node.get("ssh_host") or "").strip()
@@ -3819,6 +4105,22 @@ async def _spotify_refresh_loop() -> None:
 @app.on_event("startup")
 async def _startup_events() -> None:
     global webrtc_relay, node_health_task, spotify_refresh_task, channel_idle_task, sonos_connection_task
+    # Providers are modular: by default no provider runtimes should run.
+    # If a provider is installed+enabled, reconcile its runtime containers here.
+    try:
+        if is_provider_enabled("spotify"):
+            _reconcile_spotify_runtime(spotify_instance_count())
+        else:
+            # Best-effort cleanup (do not mutate config/channels).
+            try:
+                spotify_provider.stop_runtime()
+            except DockerUnavailable:
+                pass
+        _reconcile_radio_runtime(is_provider_enabled("radio"))
+    except HTTPException as exc:
+        log.warning("Provider runtime reconcile skipped: %s", exc.detail)
+    except Exception:  # pragma: no cover - defensive
+        log.exception("Provider runtime reconcile crashed")
     if WEBRTC_ENABLED:
         webrtc_relay = WebAudioRelay(
             snap_host=SNAPSERVER_HOST,
@@ -6093,6 +6395,63 @@ async def list_channels_api() -> dict:
     return {"channels": all_channel_details()}
 
 
+class ChannelCountPayload(BaseModel):
+    count: int = Field(ge=1, le=10)
+
+
+@app.post("/api/channels/count")
+async def set_channels_count_api(payload: ChannelCountPayload, _: dict = Depends(require_admin)) -> dict:
+    desired = int(payload.count)
+    desired = max(1, min(10, desired))
+
+    keep_ids = [f"{CHANNEL_ID_PREFIX}{idx}" for idx in range(1, desired + 1)]
+    keep_set = set(keep_ids)
+    removed_ids = [cid for cid in list(channels_by_id.keys()) if cid not in keep_set]
+
+    # Ensure target channels exist, preserve existing entries when possible.
+    for idx, cid in enumerate(keep_ids, start=1):
+        existing = channels_by_id.get(cid)
+        if existing:
+            existing["order"] = idx
+            continue
+        defaults = {
+            "id": cid,
+            "name": f"Channel {idx}",
+            "order": idx,
+            "snap_stream": f"Spotify_CH{idx}",
+            "fifo_path": f"/tmp/snapfifo-{cid}",
+            "enabled": True,
+            "source": "none",
+            "source_ref": None,
+        }
+        channels_by_id[cid] = _normalize_channel_entry(defaults, fallback_order=idx)
+
+    # Remove channels outside the desired range.
+    for cid in removed_ids:
+        channels_by_id.pop(cid, None)
+
+    # Re-sequence and persist channels.
+    _resequence_channel_order()
+    save_channels()
+
+    # Reassign nodes that were pointing at removed channels.
+    primary = keep_ids[0] if keep_ids else _primary_channel_id()
+    moved = 0
+    for node in list(nodes.values()):
+        raw_channel = (node.get("channel_id") or "").strip().lower()
+        if raw_channel and raw_channel not in channels_by_id:
+            try:
+                await _set_node_channel(node, primary)
+                moved += 1
+            except Exception as exc:
+                log.warning("Failed to move node %s to %s after channel resize: %s", node.get("id"), primary, exc)
+    if moved:
+        save_nodes()
+        await broadcast_nodes()
+
+    return {"ok": True, "count": len(channel_order), "channels": all_channel_details()}
+
+
 @app.get("/api/sources")
 async def list_sources_api() -> dict:
     sources = []
@@ -6128,6 +6487,7 @@ async def update_channel_api(channel_id: str, payload: ChannelUpdatePayload) -> 
 async def get_spotify_config(
     channel_id: Optional[str] = Query(default=None),
     source_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     target = source_id if source_id else resolve_channel_id(channel_id)
     return read_spotify_config(target)
@@ -6138,6 +6498,7 @@ async def set_spotify_config(
     cfg: SpotifyConfig,
     channel_id: Optional[str] = Query(default=None),
     source_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     resolved_channel = resolve_channel_id(channel_id)
     target = source_id if source_id else resolved_channel
@@ -6175,7 +6536,7 @@ async def set_spotify_config(
 
 
 @app.get("/api/radio/genres")
-async def list_radio_genres(limit: int = Query(default=50, ge=1, le=400)) -> dict:
+async def list_radio_genres(limit: int = Query(default=50, ge=1, le=400), _: None = Depends(require_radio_provider)) -> dict:
     data = await _radio_browser_request("/tags", ttl=3600, cache_key="radio:tags")
     genres = []
     for entry in data:
@@ -6194,7 +6555,7 @@ async def list_radio_genres(limit: int = Query(default=50, ge=1, le=400)) -> dic
 
 
 @app.get("/api/radio/countries")
-async def list_radio_countries(limit: int = Query(default=250, ge=1, le=400)) -> dict:
+async def list_radio_countries(limit: int = Query(default=250, ge=1, le=400), _: None = Depends(require_radio_provider)) -> dict:
     data = await _radio_browser_request("/countries", ttl=3600, cache_key="radio:countries")
     countries = []
     for entry in data:
@@ -6217,7 +6578,7 @@ async def list_radio_countries(limit: int = Query(default=250, ge=1, le=400)) ->
 
 
 @app.get("/api/radio/top")
-async def list_radio_top(metric: str = Query(default="votes", pattern="^(votes|clicks)$"), limit: int = Query(default=40, ge=1, le=200)) -> dict:
+async def list_radio_top(metric: str = Query(default="votes", pattern="^(votes|clicks)$"), limit: int = Query(default=40, ge=1, le=200), _: None = Depends(require_radio_provider)) -> dict:
     normalized = "vote" if metric == "votes" else "click"
     path = f"/stations/top{normalized}/{limit}"
     cache_key = f"radio:top:{metric}:{limit}"
@@ -6233,6 +6594,7 @@ async def search_radio_stations(
     countrycode: Optional[str] = Query(default=None, max_length=4),
     tag: Optional[str] = Query(default=None, max_length=120),
     limit: int = Query(default=50, ge=1, le=200),
+    _: None = Depends(require_radio_provider),
 ) -> dict:
     params = {"limit": limit, "hidebroken": "true"}
     has_filter = False
@@ -6256,7 +6618,7 @@ async def search_radio_stations(
 
 
 @app.post("/api/radio/{channel_id}/station")
-async def assign_radio_station(channel_id: str, payload: RadioStationSelectionPayload, _: dict = Depends(require_admin)) -> dict:
+async def assign_radio_station(channel_id: str, payload: RadioStationSelectionPayload, _: dict = Depends(require_admin), __: None = Depends(require_radio_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     channel = _get_radio_channel_or_404(resolved)
     _apply_radio_station(channel, payload)
@@ -6267,7 +6629,7 @@ async def assign_radio_station(channel_id: str, payload: RadioStationSelectionPa
 
 
 @app.get("/api/radio/status/{channel_id}")
-async def get_radio_status(channel_id: str) -> dict:
+async def get_radio_status(channel_id: str, _: None = Depends(require_radio_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     channel = _get_radio_channel_or_404(resolved)
     state = _ensure_radio_state(channel)
@@ -6281,7 +6643,7 @@ async def get_radio_status(channel_id: str) -> dict:
 
 
 @app.post("/api/radio/{channel_id}/playback")
-async def control_radio_playback(channel_id: str, payload: RadioPlaybackPayload) -> dict:
+async def control_radio_playback(channel_id: str, payload: RadioPlaybackPayload, _: None = Depends(require_radio_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     channel = _get_radio_channel_or_404(resolved)
     state = _ensure_radio_state(channel)
@@ -6325,6 +6687,7 @@ async def stop_all_channel_playback() -> dict:
             continue
         source = (channel.get("source") or "spotify").lower()
         if source == "radio":
+            require_radio_provider()
             state = _ensure_radio_state(channel)
             if state.get("playback_enabled", True):
                 state["playback_enabled"] = False
@@ -6343,6 +6706,7 @@ async def stop_all_channel_playback() -> dict:
                 radio_stopped.append(cid)
                 radio_mutated = True
             continue
+        require_spotify_provider()
         try:
             await _spotify_control("/me/player/pause", "PUT", channel_id=cid)
             spotify_stopped.append(cid)
@@ -6376,6 +6740,7 @@ async def radio_worker_assignments(
     since: Optional[int] = Query(None),
     wait: Optional[float] = Query(None),
 ) -> dict:
+    require_radio_provider()
     _require_radio_worker_token(request)
     timeout = RADIO_ASSIGNMENT_DEFAULT_WAIT if wait is None else float(wait)
     timeout = max(1.0, min(timeout, RADIO_ASSIGNMENT_MAX_WAIT))
@@ -6403,6 +6768,7 @@ async def radio_worker_assignments(
 
 @app.post("/api/radio/worker/status/{channel_id}")
 async def radio_worker_status(channel_id: str, payload: RadioWorkerStatusPayload, request: Request) -> dict:
+    require_radio_provider()
     _require_radio_worker_token(request)
     resolved = resolve_channel_id(channel_id)
     channel = _get_radio_channel_or_404(resolved)
@@ -6443,6 +6809,7 @@ async def librespot_status(
     channel_id: Optional[str] = Query(default=None),
     source_id: Optional[str] = Query(default=None),
 ) -> dict:
+    require_spotify_provider()
     # Support querying by spotify source instance (spotify:a/b) to keep the UI
     # stable even when channels switch between Spotify and Radio.
     target = source_id if source_id else channel_id
@@ -6457,6 +6824,7 @@ async def spotify_auth_url(
     channel_id: Optional[str] = Query(default=None),
     source_id: Optional[str] = Query(default=None),
 ) -> dict:
+    require_spotify_provider()
     resolved_channel = resolve_channel_id(channel_id)
     target = source_id if source_id else resolved_channel
     spotify_source_id = _resolve_spotify_source_id(target)
@@ -6480,6 +6848,7 @@ async def spotify_auth_url(
 
 @app.get("/api/spotify/callback", include_in_schema=False)
 async def spotify_callback(code: str, state: str):
+    require_spotify_provider()
     try:
         payload = TOKEN_SIGNER.loads(state)
     except Exception:
@@ -6507,7 +6876,7 @@ async def spotify_callback(code: str, state: str):
 
 
 @app.get("/api/spotify/player/status")
-async def spotify_player_status(channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_player_status(channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
     try:
@@ -6550,7 +6919,7 @@ async def spotify_player_status(channel_id: Optional[str] = Query(default=None))
 
 
 @app.get("/api/spotify/player/queue")
-async def spotify_player_queue(channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_player_queue(channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
     resp = await spotify_request("GET", "/me/player/queue", token, resolved)
@@ -6626,6 +6995,7 @@ def _parse_spotify_error(detail: Any) -> dict:
 async def spotify_activate_roomcast(
     payload: ActivateRoomcastPayload = Body(default=ActivateRoomcastPayload()),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
@@ -6649,6 +7019,7 @@ async def spotify_search(
     q: str = Query(min_length=1, max_length=200),
     limit: int = Query(default=10, ge=1, le=20),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     query = (q or "").strip()
     if not query:
@@ -6680,6 +7051,7 @@ async def spotify_playlists(
     limit: int = Query(default=24, ge=1, le=50),
     offset: int = Query(default=0, ge=0),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
@@ -6704,7 +7076,7 @@ async def spotify_playlists(
 
 
 @app.get("/api/spotify/playlists/{playlist_id}")
-async def spotify_playlist_detail(playlist_id: str, channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_playlist_detail(playlist_id: str, channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
     resp = await spotify_request("GET", f"/playlists/{playlist_id}", token, resolved)
@@ -6723,6 +7095,7 @@ async def spotify_playlist_tracks(
     limit: int = Query(default=100, ge=1, le=100),
     offset: int = Query(default=0, ge=0),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
@@ -6749,7 +7122,7 @@ async def spotify_playlist_tracks(
 
 
 @app.get("/api/spotify/playlists/{playlist_id}/summary")
-async def spotify_playlist_summary(playlist_id: str, channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_playlist_summary(playlist_id: str, channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     token = _ensure_spotify_token(resolved)
     total_duration = 0
@@ -6800,6 +7173,7 @@ async def spotify_play(
     payload: Optional[dict] = Body(default=None),
     device_id: Optional[str] = Query(default=None),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     resolved = resolve_channel_id(channel_id)
     params = {"device_id": device_id} if device_id else None
@@ -6811,19 +7185,20 @@ async def spotify_play(
 async def spotify_pause(
     device_id: Optional[str] = Query(default=None),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     resolved = resolve_channel_id(channel_id)
     return await _spotify_control("/me/player/pause", "PUT", params={"device_id": device_id}, channel_id=resolved)
 
 
 @app.post("/api/spotify/player/next")
-async def spotify_next(device_id: Optional[str] = Query(default=None), channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_next(device_id: Optional[str] = Query(default=None), channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     return await _spotify_control("/me/player/next", "POST", params={"device_id": device_id}, channel_id=resolved)
 
 
 @app.post("/api/spotify/player/previous")
-async def spotify_prev(device_id: Optional[str] = Query(default=None), channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_prev(device_id: Optional[str] = Query(default=None), channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     resolved = resolve_channel_id(channel_id)
     return await _spotify_control("/me/player/previous", "POST", params={"device_id": device_id}, channel_id=resolved)
 
@@ -6833,6 +7208,7 @@ async def spotify_seek(
     payload: dict = Body(...),
     device_id: Optional[str] = Query(default=None),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     pos = payload.get("position_ms")
     if pos is None:
@@ -6847,6 +7223,7 @@ async def spotify_volume(
     payload: VolumePayload,
     device_id: Optional[str] = Query(default=None),
     channel_id: Optional[str] = Query(default=None),
+    _: None = Depends(require_spotify_provider),
 ) -> dict:
     params = {"volume_percent": payload.percent, "device_id": device_id}
     resolved = resolve_channel_id(channel_id)
@@ -6854,7 +7231,7 @@ async def spotify_volume(
 
 
 @app.post("/api/spotify/player/shuffle")
-async def spotify_shuffle(payload: ShufflePayload, channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_shuffle(payload: ShufflePayload, channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     state = "true" if payload.state else "false"
     params = {"state": state, "device_id": payload.device_id}
     resolved = resolve_channel_id(channel_id)
@@ -6862,7 +7239,7 @@ async def spotify_shuffle(payload: ShufflePayload, channel_id: Optional[str] = Q
 
 
 @app.post("/api/spotify/player/repeat")
-async def spotify_repeat(payload: RepeatPayload, channel_id: Optional[str] = Query(default=None)) -> dict:
+async def spotify_repeat(payload: RepeatPayload, channel_id: Optional[str] = Query(default=None), _: None = Depends(require_spotify_provider)) -> dict:
     mode = payload.mode.lower()
     params = {"state": mode, "device_id": payload.device_id}
     resolved = resolve_channel_id(channel_id)
@@ -6897,7 +7274,7 @@ async def serve_web_node():
 
 
 @app.api_route("/stream/spotify", methods=["GET"])
-async def proxy_spotify_stream(request: Request):
+async def proxy_spotify_stream(request: Request, _: None = Depends(require_spotify_provider)):
     stream_paths = [
         f"http://{SNAPSERVER_HOST}:{SNAPSERVER_PORT}/stream/Spotify",
         f"http://{SNAPSERVER_HOST}:{SNAPSERVER_PORT}/stream/default",

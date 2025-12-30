@@ -61,6 +61,11 @@ async function fetchPlayerStatus() {
     setPlayerIdleState('Select a channel to control playback', { forceClear: true });
     return;
   }
+  const source = (channel?.source || '').trim().toLowerCase();
+  if (!source || source === 'none') {
+    setPlayerIdleState('No music provider configured', { forceClear: true });
+    return;
+  }
   if (isRadioChannel(channel)) {
     await fetchRadioPlaybackStatus(channel);
     return;
@@ -897,6 +902,222 @@ async function pollLibrespotStatus(sourceId = getSettingsChannelId()) {
   }
 }
 
+const providerAddSelect = document.getElementById('provider-add-select');
+const providerAddButton = document.getElementById('provider-add-button');
+const providersInstalledList = document.getElementById('providers-installed-list');
+const providerSettingsSpotify = document.getElementById('provider-settings-spotify');
+const providerSettingsRadio = document.getElementById('provider-settings-radio');
+const spotifyProviderInstances = document.getElementById('spotify-provider-instances');
+const spotifyProviderSaveBtn = document.getElementById('spotify-provider-save');
+
+let providersAvailableCache = [];
+let providersInstalledCache = [];
+let providerSettingsOpenId = null;
+
+function getInstalledProvider(providerId) {
+  const pid = (providerId || '').trim().toLowerCase();
+  return (Array.isArray(providersInstalledCache) ? providersInstalledCache : []).find(p => (p?.id || '').toLowerCase() === pid) || null;
+}
+
+function setProviderSettingsVisible(el, visible) {
+  if (!el) return;
+  const next = !!visible;
+  el.hidden = !next;
+  el.setAttribute('aria-hidden', next ? 'false' : 'true');
+}
+
+function syncProviderSettingsPanels() {
+  const spotifyInstalled = !!getInstalledProvider('spotify');
+  const radioInstalled = !!getInstalledProvider('radio');
+  setProviderSettingsVisible(providerSettingsSpotify, spotifyInstalled && providerSettingsOpenId === 'spotify');
+  setProviderSettingsVisible(providerSettingsRadio, radioInstalled && providerSettingsOpenId === 'radio');
+
+  const spotifyProvider = getInstalledProvider('spotify');
+  const instances = spotifyProvider?.settings?.instances;
+  if (spotifyProviderInstances && instances) {
+    spotifyProviderInstances.value = String(instances);
+  }
+}
+
+function renderProviderAddSelect() {
+  if (!providerAddSelect) return;
+  const available = Array.isArray(providersAvailableCache) ? providersAvailableCache : [];
+  const candidates = available.filter(p => p && !p.installed);
+  providerAddSelect.innerHTML = '';
+
+  if (!candidates.length) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = 'No providers available';
+    providerAddSelect.appendChild(option);
+    providerAddSelect.disabled = true;
+    if (providerAddButton) providerAddButton.disabled = true;
+    return;
+  }
+
+  providerAddSelect.disabled = false;
+  if (providerAddButton) providerAddButton.disabled = false;
+  candidates.forEach(provider => {
+    const option = document.createElement('option');
+    option.value = provider.id;
+    option.textContent = provider.name || provider.id;
+    providerAddSelect.appendChild(option);
+  });
+}
+
+function renderInstalledProviders() {
+  if (!providersInstalledList) return;
+  const installed = Array.isArray(providersInstalledCache) ? providersInstalledCache : [];
+  providersInstalledList.innerHTML = '';
+
+  if (!installed.length) {
+    providersInstalledList.innerHTML = '<div class="muted" style="font-size:12px;">No providers installed.</div>';
+    providerSettingsOpenId = null;
+    syncProviderSettingsPanels();
+    return;
+  }
+
+  installed
+    .slice()
+    .sort((a, b) => (a?.name || a?.id || '').localeCompare(b?.name || b?.id || ''))
+    .forEach(provider => {
+      if (!provider?.id) return;
+      const row = document.createElement('div');
+      row.className = 'panel';
+      row.style.marginBottom = '10px';
+
+      const top = document.createElement('div');
+      top.style.display = 'flex';
+      top.style.justifyContent = 'space-between';
+      top.style.alignItems = 'flex-start';
+      top.style.gap = '10px';
+
+      const left = document.createElement('div');
+      const title = document.createElement('div');
+      const strong = document.createElement('strong');
+      strong.textContent = provider.name || provider.id;
+      title.appendChild(strong);
+      const desc = document.createElement('div');
+      desc.className = 'muted';
+      desc.style.fontSize = '12px';
+      desc.textContent = provider.description || '';
+      left.appendChild(title);
+      if (provider.description) left.appendChild(desc);
+
+      const right = document.createElement('div');
+      right.style.display = 'flex';
+      right.style.gap = '8px';
+      const settingsBtn = document.createElement('button');
+      settingsBtn.type = 'button';
+      settingsBtn.className = 'small-btn';
+      settingsBtn.textContent = 'Settings';
+      settingsBtn.addEventListener('click', () => {
+        const pid = provider.id.toLowerCase();
+        providerSettingsOpenId = providerSettingsOpenId === pid ? null : pid;
+        syncProviderSettingsPanels();
+      });
+      right.appendChild(settingsBtn);
+
+      top.appendChild(left);
+      top.appendChild(right);
+      row.appendChild(top);
+      providersInstalledList.appendChild(row);
+    });
+
+  syncProviderSettingsPanels();
+}
+
+async function refreshProvidersState() {
+  try {
+    const [availableRes, installedRes] = await Promise.all([
+      fetch('/api/providers/available'),
+      fetch('/api/providers/installed'),
+    ]);
+    await ensureOk(availableRes);
+    await ensureOk(installedRes);
+    const availableData = await availableRes.json();
+    const installedData = await installedRes.json();
+    providersAvailableCache = Array.isArray(availableData?.providers) ? availableData.providers : [];
+    providersInstalledCache = Array.isArray(installedData?.providers) ? installedData.providers : [];
+  } catch (err) {
+    providersAvailableCache = [];
+    providersInstalledCache = [];
+    showError(`Failed to load providers: ${err.message}`);
+  }
+  renderProviderAddSelect();
+  renderInstalledProviders();
+}
+
+async function installSelectedProvider() {
+  if (!providerAddSelect || !providerAddButton) return;
+  const providerId = (providerAddSelect.value || '').trim().toLowerCase();
+  if (!providerId) {
+    showError('Choose a provider to install.');
+    return;
+  }
+  if (!isAdminUser()) {
+    showError('Only admins can install providers.');
+    return;
+  }
+  try {
+    providerAddButton.disabled = true;
+    const res = await fetch('/api/providers/install', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: providerId }),
+    });
+    await ensureOk(res);
+    showSuccess('Provider installed.');
+    await refreshChannels({ force: true });
+    await refreshProvidersState();
+    await refreshSpotifySources();
+    populateSpotifyChannelSelect();
+    if (providerId === 'spotify') {
+      providerSettingsOpenId = 'spotify';
+      syncProviderSettingsPanels();
+      fetchSpotifyConfig();
+      fetchLibrespotStatus();
+    }
+  } catch (err) {
+    showError(`Failed to install provider: ${err.message}`);
+  } finally {
+    providerAddButton.disabled = false;
+  }
+}
+
+async function saveSpotifyProviderSettings() {
+  if (!spotifyProviderInstances || !spotifyProviderSaveBtn) return;
+  if (!isAdminUser()) {
+    showError('Only admins can update provider settings.');
+    return;
+  }
+  const instances = Number(spotifyProviderInstances.value);
+  if (![1, 2].includes(instances)) {
+    showError('Spotify instances must be 1 or 2.');
+    return;
+  }
+  try {
+    spotifyProviderSaveBtn.disabled = true;
+    const res = await fetch('/api/providers/spotify', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ settings: { instances } }),
+    });
+    await ensureOk(res);
+    showSuccess('Spotify provider updated.');
+    await refreshChannels({ force: true });
+    await refreshProvidersState();
+    await refreshSpotifySources();
+    populateSpotifyChannelSelect();
+    fetchSpotifyConfig();
+    fetchLibrespotStatus();
+  } catch (err) {
+    showError(`Failed to update Spotify provider: ${err.message}`);
+  } finally {
+    spotifyProviderSaveBtn.disabled = false;
+  }
+}
+
 async function openSettings() {
   settingsOverlay.style.display = 'flex';
   collapseAllPanels();
@@ -905,11 +1126,24 @@ async function openSettings() {
   } catch (_) {
     /* channel errors already surfaced via toast */
   }
-  spotifySettingsSourceId = 'spotify:a';
-  populateSpotifyChannelSelect();
   syncGeneralSettingsUI();
-  fetchSpotifyConfig();
-  fetchLibrespotStatus();
+  await refreshProvidersState();
+
+  const spotifyProvider = getInstalledProvider('spotify');
+  if (spotifyProvider && spotifyProvider.enabled) {
+    spotifySettingsSourceId = 'spotify:a';
+    await refreshSpotifySources();
+    populateSpotifyChannelSelect();
+    fetchSpotifyConfig();
+    fetchLibrespotStatus();
+  } else {
+    spotifySettingsSourceId = null;
+    if (librespotStatus) librespotStatus.innerText = 'Status: Spotify provider not installed';
+    if (spotifyLinkStatus) {
+      spotifyLinkStatus.textContent = 'Spotify provider not installed';
+      spotifyLinkStatus.className = 'status-pill warn';
+    }
+  }
   fetchStatus();
   fetchUsersList();
 }
@@ -1056,6 +1290,8 @@ function closeDiscover() {
 
 startDiscoverBtn.addEventListener('click', discoverNodes);
 saveSpotifyBtn.addEventListener('click', saveSpotify);
+if (providerAddButton) providerAddButton.addEventListener('click', installSelectedProvider);
+if (spotifyProviderSaveBtn) spotifyProviderSaveBtn.addEventListener('click', saveSpotifyProviderSettings);
 if (spInitVol) {
   spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
 }

@@ -4,8 +4,10 @@ services:
       uvicorn main:app --host 0.0.0.0 --port 8000 --reload --proxy-headers
     volumes:
       - ./server:/app
+      - ./server/static:/app/static:ro
       - config:/config
-    network_mode: host
+      - snapfifo:/tmp
+      - /var/run/docker.sock:/var/run/docker.sock
     environment:
       PYTHONDONTWRITEBYTECODE: "1"
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
@@ -13,3 +15,4 @@ services:
 
 volumes:
   config:
+

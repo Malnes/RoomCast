@@ -1,4 +1,5 @@
 x-librespot-base: &librespot-base
+  image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
   build: ./librespot
   entrypoint: []
   depends_on:
@@ -29,6 +30,8 @@ services:
       ROOMCAST_PUBLIC_HOST: ${ROOMCAST_PUBLIC_HOST:-192.168.68.139}
       # Sonos will be given absolute stream URLs using this host port.
       ROOMCAST_PUBLIC_PORT: ${ROOMCAST_SONOS_PORT:-18081}
+      ROOMCAST_LIBRESPOT_IMAGE: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
+      ROOMCAST_RADIO_WORKER_IMAGE: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
       CONFIG_PATH: /config/spotify.json
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
@@ -37,10 +40,11 @@ services:
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
     depends_on:
       - snapserver
-      - librespot_ch1
     volumes:
       - ./server/static:/app/static:ro
       - config:/config
+      - snapfifo:/tmp
+      - /var/run/docker.sock:/var/run/docker.sock
 
   snapserver:
     build:
@@ -67,6 +71,7 @@ services:
 
   librespot_ch1:
     <<: *librespot-base
+    profiles: ["providers"]
     environment:
       CONFIG_PATH: /config/spotify.json
       SPOTIFY_TOKEN_PATH: /config/spotify-token.json
@@ -76,6 +81,7 @@ services:
 
   librespot_ch2:
     <<: *librespot-base
+    profiles: ["providers"]
     environment:
       CONFIG_PATH: /config/spotify-ch2.json
       SPOTIFY_TOKEN_PATH: /config/spotify-token-ch2.json
@@ -84,7 +90,9 @@ services:
       LIBRESPOT_FALLBACK_NAME: ${LIBRESPOT_NAME_CH2:-RoomCast CH2}
 
   radio_worker:
+    image: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
     build: ./radio-worker
+    profiles: ["providers"]
     depends_on:
       - controller
       - snapserver

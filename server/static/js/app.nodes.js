@@ -40,6 +40,13 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
   }
   try {
     const res = await fetch(`/api/config/spotify?source_id=${encodeURIComponent(targetSourceId)}`);
+    if (res.status === 503) {
+      if (spotifyLinkStatus) {
+        spotifyLinkStatus.textContent = 'Spotify provider not installed';
+        spotifyLinkStatus.className = 'status-pill warn';
+      }
+      return;
+    }
     await ensureOk(res);
     const cfg = await res.json();
     spName.value = cfg.device_name || 'RoomCast';
@@ -72,6 +79,10 @@ async function fetchLibrespotStatus(targetSourceId = getSettingsChannelId()) {
   }
   try {
     const res = await fetch(`/api/librespot/status?source_id=${encodeURIComponent(targetSourceId)}`);
+    if (res.status === 503) {
+      if (librespotStatus) librespotStatus.innerText = 'Status: Spotify provider not installed';
+      return;
+    }
     await ensureOk(res);
     const data = await res.json();
     librespotStatus.innerText = `Status: ${data.state || 'unknown'}${data.message ? ' – ' + data.message : ''}`;

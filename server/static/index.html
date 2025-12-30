@@ -419,8 +419,16 @@
           <span class="collapsible-icon" aria-hidden="true">▾</span>
         </button>
         <div class="collapsible-content" aria-hidden="true">
+          <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px;">
+            <div style="min-width:220px;">
+              <label for="channels-count">Number of channels</label>
+              <select id="channels-count">
+                <option value="1">1</option>
+              </select>
+            </div>
+          </div>
           <div class="muted" style="margin-bottom:12px; font-size:13px;">
-            Enable or disable channels, and adjust their names and accent colours. Changes save per channel.
+            Set up channel names, accent colours, and sources.
           </div>
           <div id="channels-panel" class="channels-settings"></div>
         </div>
@@ -428,60 +436,95 @@
 
       <div class="panel collapsible-panel" data-collapsible>
         <button class="collapsible-header" type="button" aria-expanded="false">
-          <span class="section-title" style="margin:0;">Spotify setup</span>
+          <span class="section-title" style="margin:0;">Music providers</span>
           <span class="collapsible-icon" aria-hidden="true">▾</span>
         </button>
         <div class="collapsible-content" aria-hidden="true">
-          <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
-            <button class="small-btn" id="spotify-dashboard" type="button">Open Spotify developer dashboard</button>
+          <div class="muted" style="margin-bottom:12px; font-size:13px;">
+            Install and configure optional music providers. New installs start with no providers.
           </div>
-          <div class="spotify-channel-select">
-            <label for="spotify-channel-select">Configure source</label>
-            <select id="spotify-channel-select"></select>
+
+          <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px;">
+            <div style="flex:1; min-width:220px;">
+              <label for="provider-add-select">Add provider</label>
+              <select id="provider-add-select"></select>
+            </div>
+            <button id="provider-add-button" class="small-btn" type="button" style="min-width:90px;">Add</button>
           </div>
-          <div class="muted" id="librespot-status" style="margin-bottom:8px;">Status: unknown</div>
-          <div class="grid">
-            <div>
-              <label>Spotify client ID</label>
-              <input id="sp-client-id" placeholder="client id">
+
+          <div class="label" style="margin-bottom:6px;">Installed providers</div>
+          <div id="providers-installed-list"></div>
+
+          <div id="provider-settings-spotify" hidden aria-hidden="true" style="margin-top:14px;">
+            <div class="label" style="margin-bottom:6px;">Spotify settings</div>
+            <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px;">
+              <div style="min-width:220px;">
+                <label for="spotify-provider-instances">Spotify instances</label>
+                <select id="spotify-provider-instances">
+                  <option value="1">1 instance</option>
+                  <option value="2">2 instances</option>
+                </select>
+              </div>
+              <button id="spotify-provider-save" class="small-btn" type="button" style="min-width:90px;">Save</button>
             </div>
-            <div>
-              <label>Spotify client secret</label>
-              <input id="sp-client-secret" type="password" placeholder="client secret">
+            <div class="muted" style="font-size:12px; margin-bottom:12px;">Controls how many librespot devices RoomCast runs.</div>
+
+            <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
+              <button class="small-btn" id="spotify-dashboard" type="button">Open Spotify developer dashboard</button>
             </div>
-            <div>
-              <label>Redirect URI</label>
-              <input id="sp-redirect" placeholder="http://localhost:8000/api/spotify/callback">
+            <div class="spotify-channel-select">
+              <label for="spotify-channel-select">Configure source</label>
+              <select id="spotify-channel-select"></select>
             </div>
-            <div>
-              <label>Device name</label>
-              <input id="sp-name" placeholder="RoomCast">
+            <div class="muted" id="librespot-status" style="margin-bottom:8px;">Status: unknown</div>
+            <div class="grid">
+              <div>
+                <label>Spotify client ID</label>
+                <input id="sp-client-id" placeholder="client id">
+              </div>
+              <div>
+                <label>Spotify client secret</label>
+                <input id="sp-client-secret" type="password" placeholder="client secret">
+              </div>
+              <div>
+                <label>Redirect URI</label>
+                <input id="sp-redirect" placeholder="http://localhost:8000/api/spotify/callback">
+              </div>
+              <div>
+                <label>Device name</label>
+                <input id="sp-name" placeholder="RoomCast">
+              </div>
+              <div>
+                <label>Bitrate</label>
+                <select id="sp-bitrate">
+                  <option value="96">96 kbps</option>
+                  <option value="160">160 kbps</option>
+                  <option value="320" selected>320 kbps</option>
+                </select>
+              </div>
+              <div>
+                <label>Initial volume</label>
+                <input id="sp-initvol" type="range" min="0" max="100" value="75">
+              </div>
+              <div style="display:flex; align-items:center; gap:6px;">
+                <label style="margin:0;">Volume normalisation</label>
+                <input id="sp-normalise" type="checkbox" style="width:auto;">
+              </div>
             </div>
-            <div>
-              <label>Bitrate</label>
-              <select id="sp-bitrate">
-                <option value="96">96 kbps</option>
-                <option value="160">160 kbps</option>
-                <option value="320" selected>320 kbps</option>
-              </select>
+            <div style="margin-top:12px;">
+              <button id="save-spotify">Save Spotify config</button>
+              <div id="spotify-spinner" style="display:none; margin-top:8px;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
+              <div style="margin-top:8px;">
+                <button class="small-btn" id="spotify-auth">Link Spotify account</button>
+                <div id="spotify-link-status" class="status-pill warn" style="margin-top:6px;">Account link status: unknown</div>
+                <div class="muted" style="font-size:12px;">Create Client ID/Secret in the dashboard, save them here, then click “Link Spotify account”. Password sign-ins are no longer supported.</div>
+              </div>
             </div>
-            <div>
-              <label>Initial volume</label>
-              <input id="sp-initvol" type="range" min="0" max="100" value="75">
-            </div>
-            <div style="display:flex; align-items:center; gap:6px;">
-              <label style="margin:0;">Volume normalisation</label>
-              <input id="sp-normalise" type="checkbox" style="width:auto;">
-            </div>
-        </div>
-          <div style="margin-top:12px;">
-            <button id="save-spotify">Save Spotify config</button>
-            <div id="spotify-spinner" style="display:none; margin-top:8px;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
-            <div style="margin-top:8px;">
-            <button class="small-btn" id="spotify-auth">Link Spotify account</button>
-            <div id="spotify-link-status" class="status-pill warn" style="margin-top:6px;">Account link status: unknown</div>
-            <div class="muted" style="font-size:12px;">Create Client ID/Secret in the dashboard, save them here, then click “Link Spotify account”. Password sign-ins are no longer supported.</div>
-            </div>
+          </div>
+
+          <div id="provider-settings-radio" hidden aria-hidden="true" style="margin-top:14px;">
+            <div class="label" style="margin-bottom:6px;">Radio settings</div>
+            <div class="muted" style="font-size:12px;">No settings available for Radio yet.</div>
           </div>
         </div>
       </div>

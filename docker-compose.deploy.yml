@@ -10,6 +10,8 @@ services:
     environment:
       SNAPSERVER_HOST: ${SNAPSERVER_HOST:-snapserver}
       SNAPSERVER_PORT: ${SNAPSERVER_PORT:-1780}
+      ROOMCAST_LIBRESPOT_IMAGE: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
+      ROOMCAST_RADIO_WORKER_IMAGE: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
       CONFIG_PATH: ${CONFIG_PATH:-/config/spotify.json}
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
@@ -21,9 +23,10 @@ services:
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
     depends_on:
       - snapserver
-      - librespot_ch1
     volumes:
       - config:/config
+      - snapfifo:/tmp
+      - /var/run/docker.sock:/var/run/docker.sock
 
   server_node_agent:
     image: ${ROOMCAST_CONTROLLER_IMAGE:-ghcr.io/malnes/roomcast-controller:latest}
@@ -68,6 +71,7 @@ services:
 
   librespot_ch1:
     image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
+    profiles: ["providers"]
     depends_on:
       - snapserver
     volumes:
@@ -82,6 +86,7 @@ services:
 
   librespot_ch2:
     image: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
+    profiles: ["providers"]
     depends_on:
       - snapserver
     volumes:
@@ -96,6 +101,7 @@ services:
 
   radio_worker:
     image: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
+    profiles: ["providers"]
     depends_on:
       - controller
       - snapserver

@@ -162,6 +162,45 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 
 .node-section-body.is-empty { min-height: 0; }
 
+.nodes-empty-state {
+  min-height: 45vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nodes-empty-cta {
+  width: auto;
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  cursor: pointer;
+  font-weight: 900;
+  letter-spacing: -0.4px;
+  opacity: 0.7;
+  transition: opacity 0.12s ease, transform 0.08s ease;
+}
+
+.nodes-empty-cta:hover { opacity: 0.9; }
+
+.nodes-empty-cta:active { transform: translateY(1px); }
+
+.nodes-empty-cta-plus {
+  font-size: 56px;
+  line-height: 1;
+  font-weight: 900;
+}
+
+.nodes-empty-cta-label {
+  font-size: 34px;
+  line-height: 1.1;
+  font-weight: 900;
+}
+
 .node-sections-edit-bar {
   display: flex;
   justify-content: flex-end;

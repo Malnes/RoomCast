@@ -138,6 +138,7 @@ const confirmModalTitle = document.getElementById('confirm-modal-title');
 const confirmModalMessage = document.getElementById('confirm-modal-message');
 const confirmModalCancel = document.getElementById('confirm-modal-cancel');
 const confirmModalAccept = document.getElementById('confirm-modal-accept');
+const channelsCountSelect = document.getElementById('channels-count');
 const DEFAULT_CHANNEL_COLOR = '#22c55e';
 const WIFI_SIGNAL_THRESHOLDS = [
   { min: 75, bars: 4, label: 'Excellent signal' },
@@ -250,6 +251,7 @@ let channelFetchPromise = null;
 let spotifySettingsSourceId = null;
 let spotifySourcesCache = [];
 let spotifySourcesFetchPromise = null;
+let spotifySourcesLoaded = false;
 const channelPendingEdits = new Map();
 const channelFormRefs = new Map();
 let nodeSettingsModal = null;
@@ -590,7 +592,7 @@ let toastActive = false;
 let persistentAlertState = null;
 const persistentAlertSuppression = new Set();
 const SPOTIFY_ALERT_KEY = 'spotify';
-const SPOTIFY_ALERT_HELP = 'Open Settings > Spotify setup and tap "Save Spotify config" to reconnect.';
+const SPOTIFY_ALERT_HELP = 'Open Settings > Music providers > Spotify settings and tap "Save Spotify config" to reconnect.';
 const PWA_UPDATE_ALERT_KEY = 'pwa-update';
 const PWA_UPDATE_ACTION_LABEL = 'Update now';
 const WEB_NODE_ALERT_KEY = 'web-node-request';
@@ -1562,7 +1564,8 @@ function getChannelById(channelId) {
 }
 
 function isChannelEnabled(channel) {
-  return channel?.enabled !== false;
+  const source = (channel?.source || '').trim().toLowerCase();
+  return !!source && source !== 'none';
 }
 
 function isRadioChannel(channel) {
@@ -1599,7 +1602,7 @@ function resolveRadioPlaybackSnapshot(channel) {
     channelId: channel.id,
     playbackEnabled: state.playback_enabled !== false,
     hasStation: !!state.stream_url,
-    enabled: channel.enabled !== false,
+    enabled: isChannelEnabled(channel),
   };
 }
 
@@ -1924,7 +1927,7 @@ function renderPlayerCarousel() {
   const playableChannels = getPlayerChannels();
   if (!playableChannels.length) {
     if (playerCarouselTrack) {
-      playerCarouselTrack.innerHTML = '<div class="player-carousel-empty">Enable a channel in Settings to begin playback.</div>';
+      playerCarouselTrack.innerHTML = '<div class="player-carousel-empty">Select a source for a channel in Settings to begin playback.</div>';
     }
     playerCarouselCards.clear();
     updatePlayerCarouselIndicators();
@@ -2071,9 +2074,11 @@ async function refreshSpotifySources() {
       await ensureOk(res);
       const data = await res.json();
       spotifySourcesCache = Array.isArray(data?.sources) ? data.sources : [];
+      spotifySourcesLoaded = true;
       return spotifySourcesCache;
     } catch (_) {
       spotifySourcesCache = [];
+      spotifySourcesLoaded = false;
       return spotifySourcesCache;
     } finally {
       spotifySourcesFetchPromise = null;
@@ -2091,11 +2096,13 @@ function populateSpotifyChannelSelect() {
   if (!sources.length) {
     const option = document.createElement('option');
     option.value = '';
-    option.textContent = 'Loading sources…';
+    option.textContent = spotifySourcesLoaded ? 'No Spotify sources installed' : 'Loading sources…';
     spotifyChannelSelect.appendChild(option);
     spotifyChannelSelect.disabled = true;
-    // Fire and forget; caller may call populate again later.
-    refreshSpotifySources().then(() => populateSpotifyChannelSelect()).catch(() => {});
+    if (!spotifySourcesLoaded) {
+      // Fire and forget; caller may call populate again later.
+      refreshSpotifySources().then(() => populateSpotifyChannelSelect()).catch(() => {});
+    }
     return;
   }
 
@@ -2133,6 +2140,15 @@ function renderChannelsPanel() {
     channelsPanel.innerHTML = '<div class="muted">No channels configured yet.</div>';
     return;
   }
+
+  syncChannelsCountSelect();
+
+  const installedProviders = (typeof providersInstalledCache === 'undefined' || !Array.isArray(providersInstalledCache))
+    ? []
+    : providersInstalledCache;
+  const spotifyProviderEnabled = installedProviders.some(p => (p?.id || '').toLowerCase() === 'spotify' && p?.enabled);
+  const radioProviderEnabled = installedProviders.some(p => (p?.id || '').toLowerCase() === 'radio' && p?.enabled);
+
   channelsCache.forEach(channel => {
     const pending = channelPendingEdits.get(channel.id) || {};
     const nameValue = Object.prototype.hasOwnProperty.call(pending, 'name')
@@ -2185,61 +2201,56 @@ function renderChannelsPanel() {
     const sourceSelect = document.createElement('select');
     sourceSelect.setAttribute('aria-label', `Select source for ${nameValue || channel.id}`);
 
-    const optionRadio = document.createElement('option');
-    optionRadio.value = 'radio';
-    optionRadio.textContent = 'Radio';
-    const optionA = document.createElement('option');
-    optionA.value = 'spotify:a';
-    optionA.textContent = 'Spotify A';
-    const optionB = document.createElement('option');
-    optionB.value = 'spotify:b';
-    optionB.textContent = 'Spotify B';
-    sourceSelect.appendChild(optionRadio);
-    sourceSelect.appendChild(optionA);
-    sourceSelect.appendChild(optionB);
+    const optionNone = document.createElement('option');
+    optionNone.value = '';
+    optionNone.textContent = 'No source';
+    sourceSelect.appendChild(optionNone);
+
+    if (radioProviderEnabled) {
+      const optionRadio = document.createElement('option');
+      optionRadio.value = 'radio';
+      optionRadio.textContent = 'Radio';
+      sourceSelect.appendChild(optionRadio);
+    }
+
+    if (spotifyProviderEnabled) {
+      const sources = Array.isArray(spotifySourcesCache) ? spotifySourcesCache : [];
+      if (!sources.length) {
+        const optionLoading = document.createElement('option');
+        optionLoading.value = '__loading';
+        optionLoading.textContent = spotifySourcesLoaded ? 'No Spotify sources installed' : 'Loading Spotify sources…';
+        sourceSelect.appendChild(optionLoading);
+        optionLoading.disabled = true;
+        if (!spotifySourcesLoaded) {
+          refreshSpotifySources().then(() => renderChannelsPanel()).catch(() => {});
+        }
+      } else {
+        sources.forEach(source => {
+          if (!source?.id) return;
+          const option = document.createElement('option');
+          option.value = source.id;
+          option.textContent = source.name || source.id;
+          sourceSelect.appendChild(option);
+        });
+      }
+    }
 
     const baseSource = (channel.source || '').trim().toLowerCase();
     const baseRef = (sourceRefValue || '').trim().toLowerCase();
-    const resolvedSelection = (baseSource === 'radio' || baseRef.startsWith('radio'))
-      ? 'radio'
-      : (baseRef === 'spotify:b' ? 'spotify:b' : 'spotify:a');
-    sourceSelect.value = resolvedSelection;
+    let resolvedSelection = '';
+    if (baseSource === 'radio' || baseRef.startsWith('radio')) {
+      resolvedSelection = radioProviderEnabled ? 'radio' : '';
+    } else if (baseSource === 'spotify' || baseRef.startsWith('spotify:')) {
+      resolvedSelection = spotifyProviderEnabled ? (baseRef || 'spotify:a') : '';
+    }
+    const availableValues = Array.from(sourceSelect.options).map(opt => opt.value);
+    sourceSelect.value = availableValues.includes(resolvedSelection) ? resolvedSelection : '';
 
     sourceGroup.appendChild(sourceLabel);
     sourceGroup.appendChild(sourceSelect);
     header.appendChild(sourceGroup);
 
     card.appendChild(header);
-
-  const availability = document.createElement('div');
-  availability.className = 'channel-card-availability';
-
-  const availabilityMeta = document.createElement('div');
-  availabilityMeta.className = 'channel-availability-meta';
-  const availabilityLabel = document.createElement('div');
-  availabilityLabel.className = 'label';
-  availabilityLabel.textContent = 'Channel availability';
-  const availabilityHelp = document.createElement('div');
-  availabilityHelp.className = 'channel-availability-help';
-  availabilityHelp.textContent = 'Hidden from the player carousel when disabled.';
-  availabilityMeta.appendChild(availabilityLabel);
-  availabilityMeta.appendChild(availabilityHelp);
-
-  const availabilityControl = document.createElement('div');
-  availabilityControl.className = 'channel-availability-control';
-  const availabilityToggle = document.createElement('input');
-  availabilityToggle.type = 'checkbox';
-  availabilityToggle.checked = enabled;
-  availabilityToggle.setAttribute('aria-label', `Toggle ${nameValue || channel.id} availability`);
-  const availabilityState = document.createElement('span');
-  availabilityState.className = 'channel-availability-state';
-  availabilityState.textContent = enabled ? 'Enabled' : 'Disabled';
-  availabilityControl.appendChild(availabilityToggle);
-  availabilityControl.appendChild(availabilityState);
-
-  availability.appendChild(availabilityMeta);
-  availability.appendChild(availabilityControl);
-  card.appendChild(availability);
 
     const status = document.createElement('div');
     status.className = 'channel-card-status';
@@ -2266,8 +2277,6 @@ function renderChannelsPanel() {
       sourceSelect,
       saveButton: saveBtn,
       statusEl: status,
-      availabilityToggle,
-      availabilityState,
     };
     channelFormRefs.set(channel.id, refs);
 
@@ -2284,7 +2293,6 @@ function renderChannelsPanel() {
       updateChannelCardState(channel.id);
     });
     sourceSelect.addEventListener('change', () => updateChannelCardState(channel.id));
-    availabilityToggle.addEventListener('change', () => handleChannelAvailabilityChange(channel.id, availabilityToggle));
     saveBtn.addEventListener('click', () => saveChannelChanges(channel.id));
 
     updateChannelCardState(channel.id);
@@ -2328,14 +2336,15 @@ function updateChannelCardState(channelId) {
 
   if (refs.sourceSelect && !refs.sourceSelect.disabled) {
     const selected = (refs.sourceSelect.value || '').trim().toLowerCase();
-    const normalizedSelected = selected === 'radio'
-      ? 'radio'
-      : (selected === 'spotify:b' ? 'spotify:b' : 'spotify:a');
+    const normalizedSelected = selected === '__loading' ? '' : selected;
     const baseSource = (base.source || '').trim().toLowerCase();
     const baseRef = (base.source_ref || '').trim().toLowerCase();
-    const normalizedBase = (baseSource === 'radio' || baseRef.startsWith('radio'))
-      ? 'radio'
-      : (baseRef === 'spotify:b' ? 'spotify:b' : 'spotify:a');
+    let normalizedBase = '';
+    if (baseSource === 'radio' || baseRef.startsWith('radio')) {
+      normalizedBase = 'radio';
+    } else if (baseSource === 'spotify' || baseRef.startsWith('spotify:')) {
+      normalizedBase = baseRef || 'spotify:a';
+    }
     if (normalizedSelected !== normalizedBase) {
       pending.source_ref = normalizedSelected;
       hasDiff = true;
@@ -2349,7 +2358,7 @@ function updateChannelCardState(channelId) {
   } else {
     channelPendingEdits.delete(channelId);
     refs.card.dataset.dirty = 'false';
-    refs.statusEl.textContent = channelEnabled ? 'Channel enabled' : 'Channel disabled';
+    refs.statusEl.textContent = channelEnabled ? 'Source configured' : 'No source selected';
     refs.saveButton.disabled = true;
   }
 }
@@ -2393,65 +2402,51 @@ async function saveChannelChanges(channelId) {
   }
 }
 
-async function handleChannelAvailabilityChange(channelId, checkboxEl) {
-  const refs = channelFormRefs.get(channelId);
-  if (!checkboxEl) return;
-  const nextEnabled = checkboxEl.checked;
-  const previousActiveId = getActiveChannelId();
-  const canUpdateStatus = !channelPendingEdits.has(channelId);
-  checkboxEl.disabled = true;
-  if (refs?.availabilityState) {
-    refs.availabilityState.textContent = nextEnabled ? 'Enabling…' : 'Disabling…';
+function syncChannelsCountSelect() {
+  if (!channelsCountSelect) return;
+  if (!channelsCountSelect.dataset.initialized) {
+    channelsCountSelect.innerHTML = '';
+    for (let i = 1; i <= 10; i += 1) {
+      const option = document.createElement('option');
+      option.value = String(i);
+      option.textContent = String(i);
+      channelsCountSelect.appendChild(option);
+    }
+    channelsCountSelect.addEventListener('change', () => handleChannelsCountChange());
+    channelsCountSelect.dataset.initialized = 'true';
   }
-  if (canUpdateStatus && refs?.statusEl) {
-    refs.statusEl.textContent = nextEnabled ? 'Enabling…' : 'Disabling…';
+  channelsCountSelect.value = String(Math.max(1, Math.min(10, channelsCache.length || 1)));
+  channelsCountSelect.disabled = !isAdminUser();
+}
+
+async function handleChannelsCountChange() {
+  if (!channelsCountSelect) return;
+  if (!isAdminUser()) {
+    showError('Only admins can change the channel count.');
+    syncChannelsCountSelect();
+    return;
+  }
+  const nextCount = Number(channelsCountSelect.value);
+  if (!Number.isFinite(nextCount) || nextCount < 1 || nextCount > 10) {
+    showError('Channel count must be between 1 and 10.');
+    syncChannelsCountSelect();
+    return;
   }
   try {
-    const res = await fetch(`/api/channels/${encodeURIComponent(channelId)}`, {
-      method: 'PATCH',
+    channelsCountSelect.disabled = true;
+    const res = await fetch('/api/channels/count', {
+      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ enabled: nextEnabled }),
+      body: JSON.stringify({ count: nextCount }),
     });
     await ensureOk(res);
-    const data = await res.json();
-    let updatedChannel = data?.channel || null;
-    const idx = channelsCache.findIndex(ch => ch.id === channelId);
-    if (idx !== -1) {
-      updatedChannel = updatedChannel || { ...channelsCache[idx], enabled: nextEnabled };
-      channelsCache[idx] = updatedChannel;
-    }
-    if (refs) {
-      refs.card.dataset.channelEnabled = nextEnabled ? 'true' : 'false';
-      if (refs.availabilityState) {
-        refs.availabilityState.textContent = nextEnabled ? 'Enabled' : 'Disabled';
-      }
-      if (canUpdateStatus && refs.statusEl) {
-        refs.statusEl.textContent = nextEnabled ? 'Channel enabled' : 'Channel disabled';
-      }
-    }
-    const nextActiveId = getActiveChannelId();
-    renderPlayerCarousel();
-    populateSpotifyChannelSelect();
-    refreshNodeVolumeAccents();
-    applyChannelTheme(getActiveChannel());
-    if (!getPlayerChannels().length) {
-      setPlayerIdleState('Enable a channel to control playback', { forceClear: true });
-    }
-    if (previousActiveId !== nextActiveId) {
-      onActiveChannelChanged(previousActiveId, nextActiveId);
-    }
-    showSuccess(nextEnabled ? 'Channel enabled' : 'Channel disabled');
+    await refreshChannels({ force: true });
+    showSuccess('Channel count updated.');
   } catch (err) {
-    checkboxEl.checked = !nextEnabled;
-    if (refs?.availabilityState) {
-      refs.availabilityState.textContent = isChannelEnabled(getChannelById(channelId)) ? 'Enabled' : 'Disabled';
-    }
-    if (refs?.statusEl && canUpdateStatus) {
-      refs.statusEl.textContent = `Toggle failed: ${err.message}`;
-    }
-    showError(`Failed to ${nextEnabled ? 'enable' : 'disable'} channel: ${err.message}`);
+    showError(`Failed to update channel count: ${err.message}`);
+    syncChannelsCountSelect();
   } finally {
-    checkboxEl.disabled = false;
+    channelsCountSelect.disabled = !isAdminUser();
   }
 }
 

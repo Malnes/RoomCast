@@ -2535,7 +2535,41 @@ function commitRenderNodes(nodes) {
   nodesEl.innerHTML = '';
   nodeVolumeSliderRefs.clear();
   if (!nodes.length) {
-    nodesEl.innerHTML = '<div class="muted">No nodes registered yet.</div>';
+    const wrapper = document.createElement('div');
+    wrapper.className = 'nodes-empty-state';
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'nodes-empty-cta';
+
+    const plus = document.createElement('span');
+    plus.className = 'nodes-empty-cta-plus';
+    plus.textContent = '+';
+    plus.setAttribute('aria-hidden', 'true');
+
+    const label = document.createElement('span');
+    label.className = 'nodes-empty-cta-label';
+    label.textContent = 'Add node';
+
+    btn.appendChild(plus);
+    btn.appendChild(label);
+    btn.addEventListener('click', (event) => {
+      event.preventDefault();
+      if (typeof openAddNodeOverlay === 'function') {
+        openAddNodeOverlay('options');
+        return;
+      }
+      if (addMenuNodeBtn && typeof addMenuNodeBtn.click === 'function') {
+        addMenuNodeBtn.click();
+        return;
+      }
+      if (addNodeToggle && typeof addNodeToggle.click === 'function') {
+        addNodeToggle.click();
+      }
+    });
+
+    wrapper.appendChild(btn);
+    nodesEl.appendChild(wrapper);
     Object.keys(camillaPendingNodes).forEach(id => delete camillaPendingNodes[id]);
     refreshNodeSettingsModal();
     return;
