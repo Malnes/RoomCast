@@ -37,14 +37,14 @@ Quick start
 -----------
 Prereqs: Docker, Docker Compose, Spotify Premium (Librespot needs it), open TCP 1704/1780 to nodes.
 
-1) Local dev with auto-reload: `make dev` (uses `docker-compose.dev.yml` to mount code and reload FastAPI). Prod-ish run: `docker compose up -d`. The compose stack runs the controller, Snapserver, and Librespot in **host networking mode** so the controller automatically sees the same LAN interfaces as the host—no CIDR configuration, no hardcoded ranges, discovery “just works.” Run on a Linux host and make sure ports 8000/1704/1705/1780 are free.
+1) Local dev with auto-reload: `make dev` (uses `docker-compose.dev.yml` to mount code and reload FastAPI). Prod-ish run: `docker compose up -d`.
    - Snapshot config: copy the sanitized example before starting containers so Docker has a host file to mount: `cp snapserver.example.json snapserver.json`. The runtime file is `.gitignore`d so your environment-specific client list never leaves your machine.
-2) Open the web UI at `http://<controller-host>:8000`. The landing view lists nodes with per-node volume/mute/EQ; open the ⚙︎ settings menu to enter Spotify credentials + device name (Librespot reloads automatically), add nodes, and view Snapcast clients.  
+2) Open the web UI at `http://<controller-host>:18080` (override via `ROOMCAST_UI_PORT`). The landing view lists nodes with per-node volume/mute/EQ; open the ⚙︎ settings menu to enter Spotify credentials + device name (Librespot reloads automatically), add nodes, and view Snapcast clients.  
    - Want it on your home screen? The UI is now a Progressive Web App. Use your browser's **Install** (or **Add to Home Screen**) option and you'll get a standalone RoomCast window with cached assets for quick launch. New builds trigger an in-app "Update available" banner so you're always on the latest version.
 3) On each hardware node (e.g. Raspberry Pi Zero 2), install `snapclient` and run the `node-agent` service (see `node-agent/README.md`). Native install via systemd is recommended on Pi Zero 2 for the lightest footprint; Docker is optional and supported with the provided Dockerfile. Register nodes via the web UI (name + agent URL).
 4) To create an ad-hoc browser speaker, click **New web node** in the UI. A new tab will open, negotiate WebRTC against the controller, and the controller’s snapclient relay will keep that browser in lockstep with the rest of the Snapcast group.
 5) Use the UI to set per-node EQ (bands JSON) and volume; adjust Snapcast client volumes in the “Snapcast clients” section.
-Optional: if your host participates in multiple VLANs/subnets and you want to scan additional ranges beyond whatever interfaces the OS exposes, set `DISCOVERY_CIDR` to a comma/semicolon separated list (e.g. `192.168.1.0/24;10.10.0.0/24`). Those ranges will be scanned in addition to the interfaces that host networking already reveals.
+Optional: if device discovery (Sonos / node agents) returns nothing in Docker (multicast SSDP can be blocked in bridge mode), set `DISCOVERY_CIDR` to a comma/semicolon separated list (e.g. `192.168.1.0/24;10.10.0.0/24`). The controller will scan those ranges over HTTP as a fallback.
 
 Remote terminal troubleshooting
 -------------------------------

@@ -20,6 +20,10 @@ services:
       # Sonos will be given absolute stream URLs using this host + port.
       ROOMCAST_PUBLIC_HOST: ${ROOMCAST_PUBLIC_HOST:-127.0.0.1}
       ROOMCAST_PUBLIC_PORT: ${ROOMCAST_PUBLIC_PORT:-${ROOMCAST_SONOS_PORT:-18081}}
+      # When running in Docker bridge mode, multicast discovery may fail and
+      # the controller will fall back to scanning DISCOVERY_CIDR for devices (Sonos, node agents).
+      # Not hardcoded: set at runtime, e.g. `DISCOVERY_CIDR=192.168.68.0/24 docker compose -f docker-compose.deploy.yml up -d`.
+      DISCOVERY_CIDR: ${DISCOVERY_CIDR:-}
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
     depends_on:
       - snapserver
