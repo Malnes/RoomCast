@@ -1073,6 +1073,8 @@ const providerSettingsSpotify = document.getElementById('provider-settings-spoti
 const providerSettingsRadio = document.getElementById('provider-settings-radio');
 const providerSettingsAudiobookshelf = document.getElementById('provider-settings-audiobookshelf');
 const radioSlotCountEl = document.getElementById('radio-slot-count');
+const radioMaxSlotsInput = document.getElementById('radio-max-slots');
+const radioSlotsSaveBtn = document.getElementById('radio-slots-save');
 const spotifyProviderInstances = document.getElementById('spotify-provider-instances');
 const spotifyProviderSaveBtn = document.getElementById('spotify-provider-save');
 
@@ -1129,15 +1131,63 @@ async function fetchRadioSlots() {
     await ensureOk(res);
     const data = await res.json();
     const maxSlots = Number(data?.max_slots);
+    const supportedMaxSlots = Number(data?.supported_max_slots);
     if (Number.isFinite(maxSlots) && maxSlots > 0) {
       radioSlotsCache = { maxSlots };
       if (radioSlotCountEl) radioSlotCountEl.textContent = `Radio slots: ${maxSlots}`;
+      if (radioMaxSlotsInput) {
+        if (Number.isFinite(supportedMaxSlots) && supportedMaxSlots > 0) {
+          radioMaxSlotsInput.max = String(supportedMaxSlots);
+        }
+        radioMaxSlotsInput.value = String(maxSlots);
+      }
       return;
     }
   } catch (_) {
     // ignore
   }
   if (radioSlotCountEl) radioSlotCountEl.textContent = 'Radio slots: —';
+  if (radioMaxSlotsInput) radioMaxSlotsInput.value = '';
+}
+
+async function saveRadioSlots() {
+  if (!radioMaxSlotsInput) return;
+  const raw = String(radioMaxSlotsInput.value || '').trim();
+  const desired = Number(raw);
+  if (!Number.isFinite(desired) || desired < 1) {
+    showError('Max radio slots must be a positive number');
+    return;
+  }
+  try {
+    const res = await fetch('/api/radio/slots', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_slots: Math.floor(desired) }),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    const maxSlots = Number(data?.max_slots);
+    const supportedMaxSlots = Number(data?.supported_max_slots);
+    if (Number.isFinite(maxSlots) && maxSlots > 0) {
+      radioSlotsCache = { maxSlots };
+      if (radioSlotCountEl) radioSlotCountEl.textContent = `Radio slots: ${maxSlots}`;
+      if (radioMaxSlotsInput) {
+        if (Number.isFinite(supportedMaxSlots) && supportedMaxSlots > 0) {
+          radioMaxSlotsInput.max = String(supportedMaxSlots);
+        }
+        radioMaxSlotsInput.value = String(maxSlots);
+      }
+      showSuccess('Radio slots saved');
+    }
+  } catch (err) {
+    showError(`Failed to save radio slots: ${err.message}`);
+  }
+}
+
+if (radioSlotsSaveBtn) {
+  radioSlotsSaveBtn.addEventListener('click', () => {
+    saveRadioSlots();
+  });
 }
 
 function handleProviderSettingsModalKey(evt) {
@@ -1327,6 +1377,10 @@ function openProviderSettingsModal(providerId) {
   if (providerSettingsModalContent) providerSettingsModalContent.appendChild(panelEl);
   setProviderSettingsVisible(panelEl, true);
 
+  if (pid === 'radio') {
+    fetchRadioSlots();
+  }
+
   const footer = document.createElement('div');
   footer.style.marginTop = '14px';
   footer.style.display = 'flex';
@@ -1433,6 +1487,8 @@ function renderInstalledProviders() {
       const right = document.createElement('div');
       right.style.display = 'flex';
       right.style.gap = '8px';
+      right.style.alignItems = 'center';
+      right.style.alignSelf = 'center';
       const settingsBtn = document.createElement('button');
       settingsBtn.type = 'button';
       settingsBtn.className = 'provider-gear-btn';

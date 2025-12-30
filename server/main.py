@@ -146,6 +146,25 @@ RADIO_CHANNEL_SLOTS = [
         "color": "#a855f7",
     },
 ]
+
+
+def radio_max_slots_supported() -> int:
+    return len(RADIO_CHANNEL_SLOTS)
+
+
+def radio_max_slots_configured() -> int:
+    settings = get_provider_settings("radio")
+    raw = settings.get("max_slots")
+    try:
+        desired = int(raw)
+    except (TypeError, ValueError):
+        desired = radio_max_slots_supported()
+    desired = max(1, min(desired, radio_max_slots_supported()))
+    return desired
+
+
+def radio_channel_slots_active() -> list[dict]:
+    return RADIO_CHANNEL_SLOTS[: radio_max_slots_configured()]
 RADIO_BROWSER_BASE_URL = os.getenv("RADIO_BROWSER_BASE_URL", "https://de1.api.radio-browser.info/json").rstrip("/")
 RADIO_BROWSER_TIMEOUT = float(os.getenv("RADIO_BROWSER_TIMEOUT", "8"))
 RADIO_BROWSER_CACHE_TTL = int(os.getenv("RADIO_BROWSER_CACHE_TTL", "300"))
@@ -786,7 +805,7 @@ def _default_channel_entries() -> list[dict]:
 
 def _radio_channel_templates() -> list[dict]:
     templates: list[dict] = []
-    for idx, slot in enumerate(RADIO_CHANNEL_SLOTS, start=1):
+    for idx, slot in enumerate(radio_channel_slots_active(), start=1):
         templates.append({
             "id": f"{CHANNEL_ID_PREFIX}{slot['suffix']}",
             "name": slot["label"],
@@ -812,7 +831,7 @@ def _ensure_radio_channels(entries: list[dict]) -> None:
         entries.append(normalized_entry)
         existing_ids.add(channel_id)
         radio_entries.append(normalized_entry)
-    desired_radio_count = len(RADIO_CHANNEL_SLOTS)
+    desired_radio_count = len(radio_channel_slots_active())
     next_suffix = max((slot["suffix"] for slot in RADIO_CHANNEL_SLOTS), default=2)
     next_order = max((entry.get("order", 0) for entry in entries), default=0)
     while len(radio_entries) < desired_radio_count:
@@ -1235,7 +1254,7 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
 
             current_stream = (channel.get("snap_stream") or "").strip()
             current_slot = None
-            for slot in RADIO_CHANNEL_SLOTS:
+            for slot in radio_channel_slots_active():
                 if slot.get("snap_stream") == current_stream:
                     current_slot = slot
                     break
@@ -1244,7 +1263,7 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
             if current_slot and current_stream and current_stream not in used_streams:
                 chosen_slot = current_slot
             else:
-                for slot in RADIO_CHANNEL_SLOTS:
+                for slot in radio_channel_slots_active():
                     stream = (slot.get("snap_stream") or "").strip()
                     if not stream:
                         continue
@@ -1256,7 +1275,7 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
             if not chosen_slot:
                 raise HTTPException(
                     status_code=409,
-                    detail=f"No radio slots available (max {len(RADIO_CHANNEL_SLOTS)}). Switch another channel away from Radio first.",
+                    detail=f"No radio slots available (max {len(radio_channel_slots_active())}). Switch another channel away from Radio first.",
                 )
 
             channel["source"] = "radio"
@@ -7477,7 +7496,56 @@ async def assign_radio_station(channel_id: str, payload: RadioStationSelectionPa
 
 @app.get("/api/radio/slots")
 async def get_radio_slots(_: None = Depends(require_radio_provider)) -> dict:
-    return {"max_slots": len(RADIO_CHANNEL_SLOTS)}
+    return {
+        "max_slots": radio_max_slots_configured(),
+        "supported_max_slots": radio_max_slots_supported(),
+    }
+
+
+class RadioSlotsUpdatePayload(BaseModel):
+    max_slots: int = Field(ge=1)
+
+
+@app.put("/api/radio/slots")
+async def set_radio_slots(
+    payload: RadioSlotsUpdatePayload,
+    _: dict = Depends(require_admin),
+    __: None = Depends(require_radio_provider),
+) -> dict:
+    supported = radio_max_slots_supported()
+    desired = int(payload.max_slots)
+    if desired < 1 or desired > supported:
+        raise HTTPException(status_code=400, detail=f"max_slots must be between 1 and {supported}")
+
+    state = providers_by_id.get("radio")
+    if not state:
+        raise HTTPException(status_code=503, detail="Radio provider is not installed")
+    if not isinstance(state.settings, dict):
+        state.settings = {}
+    state.settings["max_slots"] = desired
+    save_providers_state()
+
+    # If slots are reduced, disable any radio channels currently mapped to
+    # streams outside the active set.
+    active_streams = {(slot.get("snap_stream") or "").strip() for slot in radio_channel_slots_active()}
+    for channel in channels_by_id.values():
+        if (channel.get("source") or "").strip().lower() != "radio":
+            continue
+        stream = (channel.get("snap_stream") or "").strip()
+        if not stream or stream in active_streams:
+            continue
+        channel["source"] = "none"
+        channel["source_ref"] = None
+        channel["enabled"] = False
+        channel.pop("radio_state", None)
+    save_channels()
+    _mark_radio_assignments_dirty()
+
+    return {
+        "ok": True,
+        "max_slots": radio_max_slots_configured(),
+        "supported_max_slots": radio_max_slots_supported(),
+    }
 
 
 @app.get("/api/radio/status/{channel_id}")

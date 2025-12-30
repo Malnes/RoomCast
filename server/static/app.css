@@ -81,16 +81,17 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 .danger-btn:disabled { opacity: 0.55; cursor: not-allowed; }
 .icon-only-btn { width: 42px; height: 42px; border-radius: 999px; padding: 0; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(255,255,255,0.14); background: rgba(255,255,255,0.08); color: #f8fafc; }
 .provider-gear-btn {
-  width: auto;
-  height: auto;
-  padding: 6px;
-  border-radius: 12px;
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border-radius: 999px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   border: none;
   background: transparent;
   color: #e2e8f0;
+  font-size: 22px;
   line-height: 1;
 }
 .provider-gear-btn:hover { background: transparent; opacity: 0.85; }
