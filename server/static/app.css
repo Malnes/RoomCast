@@ -319,6 +319,12 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 .node-icon-btn:disabled { opacity: 0.35; cursor: default; }
 .node-actions { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 
+.clients-tools {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: 10px;
+}
+
 .panel.node-compact { padding-top: 12px; padding-bottom: 12px; }
 .node-compact-row {
   --compact-gap: 12px;

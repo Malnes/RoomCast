@@ -1435,6 +1435,10 @@ class SnapcastClient:
         params = {"id": group_id, "stream_id": stream_id}
         return await self._rpc("Group.SetStream", params)
 
+    async def delete_client(self, client_id: str) -> dict:
+        params = {"id": client_id}
+        return await self._rpc("Server.DeleteClient", params)
+
 
 snapcast = SnapcastClient(SNAPSERVER_HOST, SNAPSERVER_PORT)
 app = FastAPI(title="RoomCast Controller", version="0.1.0")
@@ -4464,6 +4468,43 @@ async def snapcast_status() -> dict:
     except Exception as exc:  # pragma: no cover - network paths
         log.exception("Failed to fetch snapcast status")
         raise HTTPException(status_code=502, detail=str(exc))
+
+
+@app.post("/api/snapcast/clients/forget-disconnected")
+async def snapcast_forget_disconnected(_: dict = Depends(require_admin)) -> dict:
+    try:
+        status = await snapcast.status()
+    except Exception as exc:  # pragma: no cover - network paths
+        log.exception("Failed to fetch snapcast status")
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    groups = (status.get("server") or {}).get("groups") or []
+    disconnected_ids: list[str] = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        for client in group.get("clients", []) or []:
+            if not isinstance(client, dict):
+                continue
+            if client.get("connected") is False and client.get("id"):
+                disconnected_ids.append(str(client.get("id")))
+
+    removed: list[str] = []
+    failed: list[dict] = []
+    for client_id in disconnected_ids:
+        try:
+            await snapcast.delete_client(client_id)
+            removed.append(client_id)
+        except Exception as exc:  # pragma: no cover - network paths
+            log.warning("Failed to delete snapcast client %s: %s", client_id, exc)
+            failed.append({"id": client_id, "error": str(exc)})
+
+    return {
+        "ok": True,
+        "found": len(disconnected_ids),
+        "removed": removed,
+        "failed": failed,
+    }
 
 
 @app.post("/api/snapcast/clients/{client_id}/volume")

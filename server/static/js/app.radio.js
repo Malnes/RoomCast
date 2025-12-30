@@ -3057,6 +3057,44 @@ function refreshNodeVolumeAccents() {
 
 function renderClients(groups, target) {
   target.innerHTML = '';
+
+  const allClients = [];
+  (groups || []).forEach(group => {
+    (group?.clients || []).forEach(c => {
+      allClients.push({ group, client: c });
+    });
+  });
+  const disconnectedCount = allClients.filter(entry => entry?.client?.connected === false).length;
+
+  if (typeof isAdminUser === 'function' && isAdminUser()) {
+    const tools = document.createElement('div');
+    tools.className = 'clients-tools';
+    const forgetBtn = document.createElement('button');
+    forgetBtn.type = 'button';
+    forgetBtn.className = 'small-btn ghost-btn';
+    forgetBtn.textContent = disconnectedCount ? `Forget disconnected (${disconnectedCount})` : 'Forget disconnected';
+    forgetBtn.disabled = disconnectedCount === 0;
+    forgetBtn.addEventListener('click', async () => {
+      if (forgetBtn.disabled) return;
+      forgetBtn.disabled = true;
+      const prev = forgetBtn.textContent;
+      forgetBtn.textContent = 'Forgetting…';
+      try {
+        const res = await fetch('/api/snapcast/clients/forget-disconnected', { method: 'POST' });
+        await ensureOk(res);
+        const data = await res.json();
+        showSuccess(`Forgot ${data.removed?.length ?? 0} client${(data.removed?.length ?? 0) === 1 ? '' : 's'}.`);
+        await fetchStatus();
+      } catch (err) {
+        showError(`Failed to forget clients: ${err.message}`);
+      } finally {
+        forgetBtn.textContent = prev;
+      }
+    });
+    tools.appendChild(forgetBtn);
+    target.appendChild(tools);
+  }
+
   groups.forEach(group => {
     group.clients.forEach(c => {
       const panel = document.createElement('div');
