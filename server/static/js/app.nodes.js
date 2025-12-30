@@ -598,6 +598,29 @@ async function setSonosEq(nodeId, patch, sourceEl) {
   }
 }
 
+async function retrySonosReconnect(nodeId, btn) {
+  const originalLabel = btn ? btn.textContent : '';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Retrying…';
+  }
+  try {
+    const res = await fetch(`/api/sonos/nodes/${nodeId}/retry`, { method: 'POST' });
+    await ensureOk(res);
+    showSuccess('Retry triggered. Waiting for Sonos to reconnect…');
+    await fetchNodes({ force: true });
+    setTimeout(() => fetchNodes({ force: true }), 3500);
+    setTimeout(() => fetchNodes({ force: true }), 9000);
+  } catch (err) {
+    showError(`Failed to retry Sonos reconnect: ${err.message}`);
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = originalLabel || 'Retry';
+    }
+  }
+}
+
 async function checkNodeUpdates(nodeId, btn) {
   const originalLabel = btn ? btn.textContent : '';
   if (btn) {
@@ -831,6 +854,19 @@ function renderNodeSettingsContent() {
     errorBody.style.wordBreak = 'break-word';
     errorBody.textContent = nodeError;
     errorPanel.appendChild(errorBody);
+
+    if (isSonos) {
+      const actions = document.createElement('div');
+      actions.style.marginTop = '10px';
+      const retryBtn = document.createElement('button');
+      retryBtn.type = 'button';
+      retryBtn.className = 'small-btn';
+      retryBtn.textContent = 'Retry';
+      retryBtn.disabled = !online || restarting || updating;
+      retryBtn.addEventListener('click', () => retrySonosReconnect(node.id, retryBtn));
+      actions.appendChild(retryBtn);
+      errorPanel.appendChild(actions);
+    }
 
     nodeSettingsContent.appendChild(errorPanel);
   }

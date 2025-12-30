@@ -1,4 +1,4 @@
-const CACHE_VERSION = 'v20251230b';
+const CACHE_VERSION = 'v20251230c';
 const CACHE_NAME = `roomcast-shell-${CACHE_VERSION}`;
 const CACHE_ASSETS = [
   '/',

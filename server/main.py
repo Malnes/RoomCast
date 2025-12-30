@@ -3572,7 +3572,6 @@ async def _sonos_attempt_reconnect(channel_id: str, members: list[dict]) -> bool
             n["connection_state"] = "error"
             n["connection_error"] = err
             n["sonos_connecting_since"] = None
-            n["channel_id"] = None
             ip = _sonos_ip_from_url(n.get("url"))
             if ip:
                 try:
@@ -3586,6 +3585,30 @@ async def _sonos_attempt_reconnect(channel_id: str, members: list[dict]) -> bool
         save_nodes()
         await broadcast_nodes()
         return False
+
+
+@app.post("/api/sonos/nodes/{node_id}/retry")
+async def sonos_retry_node(node_id: str, _: dict = Depends(get_current_user)) -> dict:
+    node = nodes.get(node_id)
+    if not node or node.get("type") != "sonos":
+        raise HTTPException(status_code=404, detail="Unknown Sonos node")
+
+    channel_id = resolve_node_channel_id(node)
+    if not channel_id:
+        raise HTTPException(status_code=409, detail="Sonos node is unassigned")
+
+    members: list[dict] = []
+    for n in nodes.values():
+        if n.get("type") != "sonos":
+            continue
+        if n.get("online") is False:
+            continue
+        if resolve_node_channel_id(n) != channel_id:
+            continue
+        members.append(n)
+
+    ok = await _sonos_attempt_reconnect(channel_id, members)
+    return {"ok": bool(ok), "channel_id": channel_id, "members": [m.get("id") for m in members]}
 
 
 async def _sonos_connection_loop() -> None:
@@ -5512,10 +5535,28 @@ async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingRe
     if not stream_id:
         raise HTTPException(status_code=400, detail="Channel is missing snap_stream")
 
-    client_id = f"roomcast-sonos-{uuid.uuid4()}"
+    sonos_node = _sonos_find_node_by_ip(client_host)
+
+    def _sanitize_snapcast_host_id(value: str) -> str:
+        # snapclient --hostID becomes the Snapcast client id; keep it stable and URL/CLI safe.
+        cleaned = re.sub(r"[^a-zA-Z0-9_.-]+", "-", (value or "").strip())
+        cleaned = cleaned.strip("-._")
+        return cleaned or "unknown"
+
+    # IMPORTANT: snapclient's --hostID becomes the Snapcast client id.
+    # Using a fresh UUID here causes snapserver to accumulate a new disconnected
+    # client entry on every reconnect/stream retry. Use a stable id per Sonos
+    # node (fallback to IP) instead.
+    stable_suffix = None
+    if isinstance(sonos_node, dict) and sonos_node.get("id"):
+        stable_suffix = str(sonos_node.get("id"))
+    elif client_host:
+        stable_suffix = str(client_host)
+    else:
+        stable_suffix = "unknown"
+    client_id = f"roomcast-sonos-{_sanitize_snapcast_host_id(stable_suffix)}"
     latency_ms = max(100, min(1200, int(WEBRTC_LATENCY_MS)))
     sample_rate = int(WEBRTC_SAMPLE_RATE)
-    sonos_node = _sonos_find_node_by_ip(client_host)
     stereo_mode = _normalize_stereo_mode((sonos_node or {}).get("stereo_mode"))
     pan_filter = _ffmpeg_pan_filter_for_stereo_mode(stereo_mode)
 
@@ -5678,6 +5719,13 @@ async def sonos_channel_stream(channel_id: str, request: Request) -> StreamingRe
                     await asyncio.wait_for(snap_proc.wait(), timeout=3)
                 except asyncio.TimeoutError:
                     snap_proc.kill()
+
+            # Best-effort cleanup: remove disconnected Snapcast client entries
+            # so the UI doesn't grow indefinitely.
+            try:
+                await snapcast.delete_client(client_id)
+            except Exception:
+                pass
 
     headers = {
         "Cache-Control": "no-store",
