@@ -2815,8 +2815,21 @@ function commitRenderNodes(nodes) {
       nodeVolumeSliderRefs.set(n.id, volInput);
       sliderCell.appendChild(volInput);
 
+      const muteCell = document.createElement('div');
+      muteCell.className = 'node-compact-mute';
+      const muteBtn = document.createElement('button');
+      muteBtn.className = 'node-mute-btn';
+      muteBtn.disabled = disableNodeControls;
+      muteBtn.addEventListener('click', (event) => {
+        event.stopPropagation();
+        toggleMute(n.id, muteBtn);
+      });
+      applyMuteButtonState(muteBtn, n.muted === true);
+      muteCell.appendChild(muteBtn);
+
       row.appendChild(nameCell);
       row.appendChild(sliderCell);
+      row.appendChild(muteCell);
       wrapper.appendChild(row);
       body.appendChild(wrapper);
       scheduleNodeTitleMarquee(title);
