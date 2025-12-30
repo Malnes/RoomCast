@@ -1067,12 +1067,12 @@ async function pollLibrespotStatus(sourceId = getSettingsChannelId()) {
   }
 }
 
-const providerAddSelect = document.getElementById('provider-add-select');
-const providerAddButton = document.getElementById('provider-add-button');
+const providerAddOpenBtn = document.getElementById('provider-add-open');
 const providersInstalledList = document.getElementById('providers-installed-list');
 const providerSettingsSpotify = document.getElementById('provider-settings-spotify');
 const providerSettingsRadio = document.getElementById('provider-settings-radio');
 const providerSettingsAudiobookshelf = document.getElementById('provider-settings-audiobookshelf');
+const radioSlotCountEl = document.getElementById('radio-slot-count');
 const spotifyProviderInstances = document.getElementById('spotify-provider-instances');
 const spotifyProviderSaveBtn = document.getElementById('spotify-provider-save');
 
@@ -1090,6 +1090,34 @@ let providerSettingsModalContent = null;
 let providerSettingsModalTitle = null;
 let providerSettingsModalProviderId = null;
 let providerSettingsModalParked = null;
+
+let providerAddModal = null;
+let providerAddModalList = null;
+
+let radioSlotsCache = null;
+
+function providerBadgeText(provider) {
+  const name = (provider?.name || provider?.id || '').trim();
+  if (!name) return '?';
+  return name.slice(0, 1).toUpperCase();
+}
+
+async function fetchRadioSlots() {
+  try {
+    const res = await fetch('/api/radio/slots');
+    await ensureOk(res);
+    const data = await res.json();
+    const maxSlots = Number(data?.max_slots);
+    if (Number.isFinite(maxSlots) && maxSlots > 0) {
+      radioSlotsCache = { maxSlots };
+      if (radioSlotCountEl) radioSlotCountEl.textContent = `Radio slots: ${maxSlots}`;
+      return;
+    }
+  } catch (_) {
+    // ignore
+  }
+  if (radioSlotCountEl) radioSlotCountEl.textContent = 'Radio slots: —';
+}
 
 function handleProviderSettingsModalKey(evt) {
   if (evt.key === 'Escape' && providerSettingsModal?.style?.display === 'flex') {
@@ -1116,6 +1144,102 @@ function closeProviderSettingsModal() {
   }
   document.removeEventListener('keydown', handleProviderSettingsModalKey, true);
   syncProviderSettingsPanels();
+}
+
+function closeProviderAddModal() {
+  if (providerAddModal) providerAddModal.style.display = 'none';
+  document.removeEventListener('keydown', handleProviderAddModalKey, true);
+}
+
+function handleProviderAddModalKey(evt) {
+  if (evt.key === 'Escape' && providerAddModal?.style?.display === 'flex') {
+    evt.preventDefault();
+    closeProviderAddModal();
+  }
+}
+
+function openProviderAddModal() {
+  if (!providerAddModal) {
+    providerAddModal = document.createElement('div');
+    providerAddModal.className = 'settings-overlay';
+    const card = document.createElement('div');
+    card.className = 'settings-card';
+    const header = document.createElement('div');
+    header.className = 'settings-header';
+    const title = document.createElement('div');
+    title.className = 'section-title';
+    title.style.margin = '0';
+    title.textContent = 'Add provider';
+    header.appendChild(title);
+    const closeBtn = document.createElement('button');
+    closeBtn.className = 'icon-btn';
+    closeBtn.textContent = '✕';
+    closeBtn.addEventListener('click', closeProviderAddModal);
+    header.appendChild(closeBtn);
+    card.appendChild(header);
+    const content = document.createElement('div');
+    content.className = 'node-settings-content';
+    providerAddModalList = document.createElement('div');
+    providerAddModalList.style.display = 'grid';
+    providerAddModalList.style.gap = '10px';
+    content.appendChild(providerAddModalList);
+    card.appendChild(content);
+    providerAddModal.appendChild(card);
+    providerAddModal.addEventListener('click', (evt) => {
+      if (evt.target === providerAddModal) closeProviderAddModal();
+    });
+    document.body.appendChild(providerAddModal);
+  }
+
+  renderProviderAddModal();
+  providerAddModal.style.display = 'flex';
+  document.addEventListener('keydown', handleProviderAddModalKey, true);
+}
+
+function renderProviderAddModal() {
+  if (!providerAddModalList) return;
+  providerAddModalList.innerHTML = '';
+  const available = Array.isArray(providersAvailableCache) ? providersAvailableCache : [];
+  if (!available.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted';
+    empty.style.fontSize = '12px';
+    empty.textContent = 'No providers available.';
+    providerAddModalList.appendChild(empty);
+    return;
+  }
+
+  available
+    .slice()
+    .sort((a, b) => (a?.name || a?.id || '').localeCompare(b?.name || b?.id || ''))
+    .forEach(provider => {
+      if (!provider?.id) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'provider-option-btn';
+      const badge = document.createElement('span');
+      badge.className = 'provider-badge';
+      badge.textContent = providerBadgeText(provider);
+      btn.appendChild(badge);
+
+      const name = document.createElement('div');
+      name.style.fontWeight = '900';
+      name.textContent = provider.name || provider.id;
+      btn.appendChild(name);
+
+      const meta = document.createElement('span');
+      meta.className = 'provider-option-meta';
+      const installed = !!provider.installed;
+      meta.textContent = installed ? 'Installed' : '';
+      if (installed) btn.disabled = true;
+      btn.appendChild(meta);
+
+      btn.addEventListener('click', async () => {
+        await installProviderById(provider.id);
+      });
+
+      providerAddModalList.appendChild(btn);
+    });
 }
 
 function openProviderSettingsModal(providerId) {
@@ -1185,6 +1309,20 @@ function openProviderSettingsModal(providerId) {
   if (providerSettingsModalContent) providerSettingsModalContent.appendChild(panelEl);
   setProviderSettingsVisible(panelEl, true);
 
+  const footer = document.createElement('div');
+  footer.style.marginTop = '14px';
+  footer.style.display = 'flex';
+  footer.style.justifyContent = 'flex-end';
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'small-btn danger-btn';
+  removeBtn.textContent = 'Remove provider';
+  removeBtn.addEventListener('click', async () => {
+    await removeProviderById(pid, removeBtn);
+  });
+  footer.appendChild(removeBtn);
+  if (providerSettingsModalContent) providerSettingsModalContent.appendChild(footer);
+
   providerSettingsModal.style.display = 'flex';
   document.addEventListener('keydown', handleProviderSettingsModalKey, true);
   syncProviderSettingsPanels();
@@ -1233,32 +1371,6 @@ function syncProviderSettingsPanels() {
   if (absLibraryIdInput) absLibraryIdInput.value = absSettings?.library_id || '';
 }
 
-function renderProviderAddSelect() {
-  if (!providerAddSelect) return;
-  const available = Array.isArray(providersAvailableCache) ? providersAvailableCache : [];
-  const candidates = available.filter(p => p && !p.installed);
-  providerAddSelect.innerHTML = '';
-
-  if (!candidates.length) {
-    const option = document.createElement('option');
-    option.value = '';
-    option.textContent = 'No providers available';
-    providerAddSelect.appendChild(option);
-    providerAddSelect.disabled = true;
-    if (providerAddButton) providerAddButton.disabled = true;
-    return;
-  }
-
-  providerAddSelect.disabled = false;
-  if (providerAddButton) providerAddButton.disabled = false;
-  candidates.forEach(provider => {
-    const option = document.createElement('option');
-    option.value = provider.id;
-    option.textContent = provider.name || provider.id;
-    providerAddSelect.appendChild(option);
-  });
-}
-
 function renderInstalledProviders() {
   if (!providersInstalledList) return;
   const installed = Array.isArray(providersInstalledCache) ? providersInstalledCache : [];
@@ -1281,30 +1393,36 @@ function renderInstalledProviders() {
       row.style.marginBottom = '10px';
 
       const top = document.createElement('div');
-      top.style.display = 'flex';
-      top.style.justifyContent = 'space-between';
-      top.style.alignItems = 'flex-start';
-      top.style.gap = '10px';
+      top.className = 'provider-row';
 
       const left = document.createElement('div');
-      const title = document.createElement('div');
+      left.className = 'provider-row-left';
+
+      const badge = document.createElement('span');
+      badge.className = 'provider-badge';
+      badge.textContent = providerBadgeText(provider);
+      left.appendChild(badge);
+
+      const titleWrap = document.createElement('div');
+      titleWrap.className = 'provider-row-title';
       const strong = document.createElement('strong');
       strong.textContent = provider.name || provider.id;
-      title.appendChild(strong);
+      titleWrap.appendChild(strong);
       const desc = document.createElement('div');
       desc.className = 'muted';
       desc.style.fontSize = '12px';
       desc.textContent = provider.description || '';
-      left.appendChild(title);
-      if (provider.description) left.appendChild(desc);
+      if (provider.description) titleWrap.appendChild(desc);
+      left.appendChild(titleWrap);
 
       const right = document.createElement('div');
       right.style.display = 'flex';
       right.style.gap = '8px';
       const settingsBtn = document.createElement('button');
       settingsBtn.type = 'button';
-      settingsBtn.className = 'small-btn';
-      settingsBtn.textContent = 'Settings';
+      settingsBtn.className = 'icon-only-btn';
+      settingsBtn.setAttribute('aria-label', 'Provider settings');
+      settingsBtn.textContent = '⚙︎';
       settingsBtn.addEventListener('click', () => {
         const pid = provider.id.toLowerCase();
         openProviderSettingsModal(pid);
@@ -1337,8 +1455,11 @@ async function refreshProvidersState() {
     providersInstalledCache = [];
     showError(`Failed to load providers: ${err.message}`);
   }
-  renderProviderAddSelect();
   renderInstalledProviders();
+  if (radioSlotCountEl) {
+    if (radioSlotsCache?.maxSlots) radioSlotCountEl.textContent = `Radio slots: ${radioSlotsCache.maxSlots}`;
+    else fetchRadioSlots();
+  }
 
   // Channels source dropdown depends on providersInstalledCache.
   // Keep it in sync whenever providers change.
@@ -1351,9 +1472,8 @@ async function refreshProvidersState() {
   }
 }
 
-async function installSelectedProvider() {
-  if (!providerAddSelect || !providerAddButton) return;
-  const providerId = (providerAddSelect.value || '').trim().toLowerCase();
+async function installProviderById(providerIdRaw) {
+  const providerId = (providerIdRaw || '').trim().toLowerCase();
   if (!providerId) {
     showError('Choose a provider to install.');
     return;
@@ -1363,7 +1483,7 @@ async function installSelectedProvider() {
     return;
   }
   try {
-    providerAddButton.disabled = true;
+    if (providerAddOpenBtn) providerAddOpenBtn.disabled = true;
     const res = await fetch('/api/providers/install', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -1371,6 +1491,7 @@ async function installSelectedProvider() {
     });
     await ensureOk(res);
     showSuccess('Provider installed.');
+    closeProviderAddModal();
     await refreshChannels({ force: true });
     await refreshProvidersState();
     await refreshSpotifySources();
@@ -1384,7 +1505,34 @@ async function installSelectedProvider() {
   } catch (err) {
     showError(`Failed to install provider: ${err.message}`);
   } finally {
-    providerAddButton.disabled = false;
+    if (providerAddOpenBtn) providerAddOpenBtn.disabled = false;
+  }
+}
+
+async function removeProviderById(providerIdRaw, btn) {
+  const providerId = (providerIdRaw || '').trim().toLowerCase();
+  if (!providerId) return;
+  if (!isAdminUser()) {
+    showError('Only admins can remove providers.');
+    return;
+  }
+  const targetBtn = btn;
+  try {
+    if (targetBtn) targetBtn.disabled = true;
+    const res = await fetch(`/api/providers/${encodeURIComponent(providerId)}`, {
+      method: 'DELETE',
+    });
+    await ensureOk(res);
+    showSuccess('Provider removed.');
+    closeProviderSettingsModal();
+    await refreshChannels({ force: true });
+    await refreshProvidersState();
+    await refreshSpotifySources();
+    populateSpotifyChannelSelect();
+  } catch (err) {
+    showError(`Failed to remove provider: ${err.message}`);
+  } finally {
+    if (targetBtn) targetBtn.disabled = false;
   }
 }
 
@@ -1627,7 +1775,12 @@ function closeDiscover() {
 
 startDiscoverBtn.addEventListener('click', discoverNodes);
 saveSpotifyBtn.addEventListener('click', saveSpotify);
-if (providerAddButton) providerAddButton.addEventListener('click', installSelectedProvider);
+if (providerAddOpenBtn) providerAddOpenBtn.addEventListener('click', async () => {
+  if (!providersAvailableCache?.length) {
+    await refreshProvidersState();
+  }
+  openProviderAddModal();
+});
 if (spotifyProviderSaveBtn) spotifyProviderSaveBtn.addEventListener('click', saveSpotifyProviderSettings);
 if (absProviderSaveBtn) absProviderSaveBtn.addEventListener('click', saveAudiobookshelfProviderSettings);
 if (spInitVol) {

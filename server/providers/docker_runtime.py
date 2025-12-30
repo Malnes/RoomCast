@@ -129,7 +129,10 @@ def ensure_container_running(
     if command:
         kwargs["command"] = command
 
-    container = client.containers.run(**kwargs)
+    try:
+        container = client.containers.run(**kwargs)
+    except Exception as exc:
+        raise DockerUnavailable(f"Failed to start Docker container '{name}' (image '{image}'): {exc}") from exc
     try:
         # Attach to the same network as the controller.
         net = client.networks.get(network)

@@ -1210,10 +1210,16 @@ def update_channel_metadata(channel_id: str, updates: dict) -> dict:
                 return False
 
             def _is_radio_active(entry: dict) -> bool:
-                if (entry.get("enabled") is None) or bool(entry.get("enabled")):
-                    return True
-                entry_id = entry.get("id")
-                return bool(entry_id and _channel_has_assigned_nodes(entry_id))
+                # Only reserve a radio slot if the other channel is actually
+                # configured (tuned). This avoids
+                # "stale" radio channels permanently blocking all slots.
+                state = entry.get("radio_state")
+                normalized = _normalize_radio_state(state) if isinstance(state, dict) else _default_radio_state()
+                if not normalized.get("stream_url"):
+                    return False
+                # Even if paused, keep the slot reserved so channels don't
+                # end up sharing a fifo/snap stream.
+                return True
 
             used_streams: set[str] = set()
             for other_id, other in channels_by_id.items():
@@ -2459,6 +2465,29 @@ async def update_provider_api(provider_id: str, payload: ProviderUpdatePayload, 
             _disable_audiobookshelf_provider()
 
     return {"ok": True, "provider": _public_provider_state(state)}
+
+
+@app.delete("/api/providers/{provider_id}")
+async def remove_provider_api(provider_id: str, _: dict = Depends(require_admin)) -> dict:
+    pid = (provider_id or "").strip().lower()
+    spec = get_provider_spec(pid)
+    if not spec:
+        raise HTTPException(status_code=404, detail="Unknown provider")
+    state = providers_by_id.get(pid)
+    if not state:
+        raise HTTPException(status_code=404, detail="Provider not installed")
+
+    # Disable runtime and detach channels/sources as needed.
+    if pid == "spotify":
+        _disable_spotify_provider()
+    elif pid == "radio":
+        _disable_radio_provider()
+    elif pid == "audiobookshelf":
+        _disable_audiobookshelf_provider()
+
+    providers_by_id.pop(pid, None)
+    save_providers_state()
+    return {"ok": True}
 
 def _extract_node_host(node: dict) -> Optional[str]:
     override = (node.get("ssh_host") or "").strip()
@@ -7444,6 +7473,11 @@ async def assign_radio_station(channel_id: str, payload: RadioStationSelectionPa
     _mark_radio_assignments_dirty()
     radio_runtime_status.pop(resolved, None)
     return {"ok": True, "channel": channel_detail(resolved)}
+
+
+@app.get("/api/radio/slots")
+async def get_radio_slots(_: None = Depends(require_radio_provider)) -> dict:
+    return {"max_slots": len(RADIO_CHANNEL_SLOTS)}
 
 
 @app.get("/api/radio/status/{channel_id}")

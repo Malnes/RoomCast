@@ -440,17 +440,7 @@
           <span class="collapsible-icon" aria-hidden="true">▾</span>
         </button>
         <div class="collapsible-content" aria-hidden="true">
-          <div class="muted" style="margin-bottom:12px; font-size:13px;">
-            Install and configure optional music providers. New installs start with no providers.
-          </div>
-
-          <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px;">
-            <div style="flex:1; min-width:220px;">
-              <label for="provider-add-select">Add provider</label>
-              <select id="provider-add-select"></select>
-            </div>
-            <button id="provider-add-button" class="small-btn" type="button" style="min-width:90px;">Add</button>
-          </div>
+          <button id="provider-add-open" type="button">Add provider</button>
 
           <div class="label" style="margin-bottom:6px;">Installed providers</div>
           <div id="providers-installed-list"></div>
@@ -524,7 +514,7 @@
 
           <div id="provider-settings-radio" hidden aria-hidden="true" style="margin-top:14px;">
             <div class="label" style="margin-bottom:6px;">Radio settings</div>
-            <div class="muted" style="font-size:12px;">No settings available for Radio yet.</div>
+            <div class="muted" id="radio-slot-count" style="font-size:12px;">Radio slots: —</div>
           </div>
 
           <div id="provider-settings-audiobookshelf" hidden aria-hidden="true" style="margin-top:14px;">
