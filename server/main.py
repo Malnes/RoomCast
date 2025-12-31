@@ -60,6 +60,7 @@ from services.agent_metadata import AgentMetadataService
 from services.channels import ChannelsService
 from services.nodes_store import NodesStore
 from services.node_registration import NodeRegistrationService
+from services.node_terminal import NodeTerminalService
 from services.sonos import SonosService
 from services.spotify_config import SpotifyConfigService
 
@@ -1405,7 +1406,6 @@ agent_refresh_tasks: Dict[str, asyncio.Task] = {}
 node_health_task: Optional[asyncio.Task] = None
 spotify_refresh_task: Optional[asyncio.Task] = None
 node_rediscovery_tasks: Dict[str, asyncio.Task] = {}
-terminal_sessions: Dict[str, dict] = {}
 auth_state: dict = {"server_name": SERVER_DEFAULT_NAME, "users": []}
 users_by_id: Dict[str, dict] = {}
 users_by_username: Dict[str, dict] = {}
@@ -1428,6 +1428,13 @@ pending_web_node_requests: Dict[str, dict] = {}
 
 sonos_connection_task: Optional[asyncio.Task] = None
 sonos_reconcile_lock = asyncio.Lock()
+
+node_terminal_service = NodeTerminalService(
+    ssh_user_default=NODE_TERMINAL_SSH_USER,
+    ssh_password_default=NODE_TERMINAL_SSH_PASSWORD,
+    ssh_key_path_default=NODE_TERMINAL_SSH_KEY_PATH,
+    ssh_port_default=NODE_TERMINAL_SSH_PORT,
+)
 
 
 sonos_service = SonosService(
@@ -2005,10 +2012,6 @@ def _node_watchers() -> set:
     return node_watchers
 
 
-def _terminal_sessions() -> Dict[str, dict]:
-    return terminal_sessions
-
-
 def _pending_web_node_requests() -> Dict[str, dict]:
     return pending_web_node_requests
 
@@ -2058,9 +2061,9 @@ app.include_router(
         schedule_agent_refresh=lambda *args, **kwargs: schedule_agent_refresh(*args, **kwargs),
         schedule_restart_watch=lambda node_id: schedule_restart_watch(node_id),
         node_restart_timeout=NODE_RESTART_TIMEOUT,
-        resolve_terminal_target=lambda node: _resolve_terminal_target(node),
-        cleanup_terminal_sessions=lambda: _cleanup_terminal_sessions(),
-        terminal_sessions=_terminal_sessions,
+        resolve_terminal_target=lambda node: node_terminal_service.resolve_terminal_target(node),
+        cleanup_terminal_sessions=lambda: node_terminal_service.cleanup_terminal_sessions(),
+        terminal_sessions=node_terminal_service.terminal_sessions,
         node_terminal_enabled=NODE_TERMINAL_ENABLED,
         node_terminal_token_ttl=NODE_TERMINAL_TOKEN_TTL,
         node_terminal_max_duration=NODE_TERMINAL_MAX_DURATION,
@@ -2305,53 +2308,6 @@ app.include_router(
         server_default_name=SERVER_DEFAULT_NAME,
     )
 )
-
-def _extract_node_host(node: dict) -> Optional[str]:
-    override = (node.get("ssh_host") or "").strip()
-    if override:
-        return override
-    url = node.get("url")
-    if not url:
-        return None
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return None
-    return parsed.hostname
-
-
-def _resolve_terminal_target(node: dict) -> Optional[dict]:
-    host = _extract_node_host(node)
-    if not host:
-        return None
-    port_raw = node.get("ssh_port") or NODE_TERMINAL_SSH_PORT
-    try:
-        port = int(port_raw)
-    except (TypeError, ValueError):
-        port = NODE_TERMINAL_SSH_PORT
-    user = (node.get("ssh_user") or NODE_TERMINAL_SSH_USER).strip()
-    password = (node.get("ssh_password") or NODE_TERMINAL_SSH_PASSWORD).strip()
-    key_path = (node.get("ssh_key_path") or NODE_TERMINAL_SSH_KEY_PATH).strip()
-    if not user:
-        return None
-    if not password and not key_path:
-        return None
-    return {
-        "host": host,
-        "port": port if port and port > 0 else 22,
-        "user": user,
-        "password": password,
-        "key_path": key_path,
-    }
-
-
-def _cleanup_terminal_sessions() -> None:
-    if not terminal_sessions:
-        return
-    now = time.time()
-    expired = [token for token, session in terminal_sessions.items() if session.get("expires_at", 0) <= now]
-    for token in expired:
-        terminal_sessions.pop(token, None)
 
 
 async def _send_browser_volume(node: dict, requested_percent: int) -> None:
