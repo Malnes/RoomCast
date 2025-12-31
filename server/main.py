@@ -50,6 +50,14 @@ from api.snapcast import create_snapcast_router
 from api.sonos import create_sonos_router
 from api.streams import create_streams_router
 from api.audiobookshelf import create_audiobookshelf_router
+from api.health import create_health_router
+from api.playback import create_playback_router
+from api.ui import create_ui_router
+from services.snapcast_client import SnapcastClient, is_rpc_method_not_found_error
+from services import spotify_api
+from services.agent_client import AgentClient
+from services.sonos import SonosService
+from services.spotify_config import SpotifyConfigService
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -1150,8 +1158,8 @@ def channel_detail(channel_id: str) -> dict:
         "source": entry.get("source", "none"),
         "source_ref": entry.get("source_ref"),
         "radio_state": entry.get("radio_state"),
-        "spotify": read_spotify_config(entry["id"]),
-        "librespot_status": read_librespot_status(entry["id"]),
+        "spotify": spotify_config.read_spotify_config(entry["id"]),
+        "librespot_status": spotify_config.read_librespot_status(entry["id"]),
     }
     return data
 
@@ -1384,99 +1392,15 @@ async def _apply_channel_routing(channel_id: str) -> None:
 
     # Sonos uses HTTP pull; force coordinator refresh by reconciling.
     try:
-        await _reconcile_sonos_groups()
+        await sonos_service.reconcile_groups()
     except Exception as exc:
         log.warning("Channel routing: Sonos reconcile failed: %s", exc)
 
     save_nodes()
 
 
-class SnapcastClient:
-    def __init__(self, host: str, port: int = 1780) -> None:
-        self.url = f"ws://{host}:{port}/jsonrpc"
-        self._supports_client_setstream: Optional[bool] = None
-
-    async def _rpc(self, method: str, params: Optional[dict] = None) -> dict:
-        payload = {"id": 1, "jsonrpc": "2.0", "method": method}
-        if params:
-            payload["params"] = params
-
-        async with websockets.connect(self.url) as ws:
-            await ws.send(json.dumps(payload))
-            raw = await ws.recv()
-        resp = json.loads(raw)
-        if "error" in resp:
-            raise RuntimeError(resp["error"])
-        return resp.get("result", {})
-
-    async def status(self) -> dict:
-        return await self._rpc("Server.GetStatus")
-
-    async def set_client_volume(self, client_id: str, percent: int) -> dict:
-        params = {"id": client_id, "volume": {"percent": percent}}
-        return await self._rpc("Client.SetVolume", params)
-
-    async def list_clients(self) -> list:
-        status = await self.status()
-        clients = []
-        for group in status.get("server", {}).get("groups", []):
-            group_id = group.get("id")
-            stream_id = group.get("stream_id")
-            for client in group.get("clients", []):
-                enriched = dict(client)
-                enriched["_group_id"] = group_id
-                enriched["_stream_id"] = stream_id
-                clients.append(enriched)
-        return clients
-
-    async def set_client_stream(self, client_id: str, stream_id: str) -> dict:
-        """Assign a client to a stream.
-
-        Snapserver JSON-RPC differs by version:
-        - Some versions support `Client.SetStream`.
-        - Some only support `Group.SetStream`.
-
-        We probe once and then fall back to group switching when needed.
-        """
-        params = {"id": client_id, "stream_id": stream_id}
-
-        if self._supports_client_setstream is not False:
-            try:
-                result = await self._rpc("Client.SetStream", params)
-            except Exception as exc:
-                if _is_rpc_method_not_found_error(exc):
-                    self._supports_client_setstream = False
-                else:
-                    raise
-            else:
-                self._supports_client_setstream = True
-                return result
-
-        status = await self.status()
-        group_id: Optional[str] = None
-        for group in status.get("server", {}).get("groups", []) or []:
-            if not isinstance(group, dict):
-                continue
-            for client in group.get("clients", []) or []:
-                if isinstance(client, dict) and client.get("id") == client_id:
-                    group_id = group.get("id")
-                    break
-            if group_id:
-                break
-        if not group_id:
-            raise RuntimeError(f"Snapclient {client_id} is not registered with snapserver yet")
-        return await self.set_group_stream(group_id, stream_id)
-
-    async def set_group_stream(self, group_id: str, stream_id: str) -> dict:
-        params = {"id": group_id, "stream_id": stream_id}
-        return await self._rpc("Group.SetStream", params)
-
-    async def delete_client(self, client_id: str) -> dict:
-        params = {"id": client_id}
-        return await self._rpc("Server.DeleteClient", params)
-
-
 snapcast = SnapcastClient(SNAPSERVER_HOST, SNAPSERVER_PORT)
+agent_client = AgentClient(timeout_seconds=5)
 app = FastAPI(title="RoomCast Controller", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -1624,18 +1548,7 @@ async def _collect_channel_listener_counts() -> tuple[dict[str, int], bool]:
     return counts, data_sources > 0
 
 
-def _is_rpc_method_not_found_error(exc: Exception) -> bool:
-    if isinstance(exc, RuntimeError):
-        payload = exc.args[0] if exc.args else None
-        if isinstance(payload, dict):
-            message = str(payload.get("message") or "").lower()
-            code = payload.get("code")
-            if code == -32601 or "method not found" in message:
-                return True
-        text = str(payload).lower() if payload is not None else ""
-        if "method not found" in text:
-            return True
-    return "method not found" in str(exc).lower()
+
 
 PUBLIC_API_PATHS = {
     "/api/auth/status",
@@ -1669,12 +1582,7 @@ async def session_middleware(request: Request, call_next):
     return response
 
 
-@app.get("/sw.js", include_in_schema=False)
-async def service_worker() -> FileResponse:
-    """Serve the service worker from the app root for maximum scope."""
-    response = FileResponse(STATIC_DIR / "sw.js", media_type="application/javascript")
-    response.headers["Cache-Control"] = "no-cache"
-    return response
+
 
 nodes: Dict[str, dict] = {}
 sections: list[dict] = []
@@ -1710,6 +1618,35 @@ pending_web_node_requests: Dict[str, dict] = {}
 
 sonos_connection_task: Optional[asyncio.Task] = None
 sonos_reconcile_lock = asyncio.Lock()
+
+
+sonos_service = SonosService(
+    nodes=nodes,
+    get_channels_by_id=lambda: channels_by_id,
+    resolve_channel_id=resolve_channel_id,
+    resolve_node_channel_id=lambda node: resolve_node_channel_id(node),
+    broadcast_nodes=lambda: broadcast_nodes(),
+    save_nodes=lambda: save_nodes(),
+    detect_primary_ipv4_host=lambda: _detect_primary_ipv4_host(),
+    public_host=ROOMCAST_PUBLIC_HOST,
+    public_port=ROOMCAST_PUBLIC_PORT,
+    http_user_agent=SONOS_HTTP_USER_AGENT,
+    control_timeout=SONOS_CONTROL_TIMEOUT,
+    device_type=SONOS_DEVICE_TYPE,
+    ssdp_addr=SONOS_SSDP_ADDR,
+    reconcile_lock=sonos_reconcile_lock,
+    connect_grace_seconds=SONOS_CONNECT_GRACE_SECONDS,
+    stream_stale_seconds=SONOS_STREAM_STALE_SECONDS,
+    reconnect_attempts=SONOS_RECONNECT_ATTEMPTS,
+    reconnect_wait_for_stream_seconds=SONOS_RECONNECT_WAIT_FOR_STREAM_SECONDS,
+    connection_poll_interval=SONOS_CONNECTION_POLL_INTERVAL,
+    discovery_timeout=SONOS_DISCOVERY_TIMEOUT,
+    scan_max_hosts=SONOS_SCAN_MAX_HOSTS,
+    scan_concurrency=SONOS_SCAN_CONCURRENCY,
+    scan_http_timeout=SONOS_SCAN_HTTP_TIMEOUT,
+    detect_discovery_networks=lambda: _detect_discovery_networks(),
+    hosts_for_networks=lambda networks, limit: _hosts_for_networks(networks, limit=limit),
+)
 
 
 def public_sections() -> list[dict]:
@@ -2164,6 +2101,9 @@ def _auth_list_users() -> list[dict]:
     return list(users_by_id.values())
 
 
+app.include_router(create_health_router())
+
+
 app.include_router(
     create_auth_router(
         is_initialized=_is_initialized,
@@ -2265,7 +2205,7 @@ app.include_router(
         controller_node=lambda: _controller_node(),
         refresh_agent_metadata=lambda node, persist=True: refresh_agent_metadata(node, persist=persist),
         register_node_payload=lambda reg, mark_controller=False: _register_node_payload(reg, mark_controller=mark_controller),
-        call_agent=lambda node, path, payload: _call_agent(node, path, payload),
+        call_agent=lambda node, path, payload: agent_client.post(node, path, payload),
         sync_node_max_volume=lambda node, percent=None: _sync_node_max_volume(node, percent=percent),
         get_node_max_volume=lambda node: _get_node_max_volume(node),
         send_browser_volume=lambda node, percent: _send_browser_volume(node, percent),
@@ -2274,11 +2214,11 @@ app.include_router(
         normalize_percent=lambda value, default=75: _normalize_percent(value, default=default),
         normalize_stereo_mode=lambda mode: _normalize_stereo_mode(mode),
         apply_volume_limit=lambda node, percent: _apply_volume_limit(node, percent),
-        sonos_ip_from_url=lambda url: _sonos_ip_from_url(url),
-        sonos_set_volume=lambda ip, percent: _sonos_set_volume(ip, percent),
-        sonos_set_mute=lambda ip, muted: _sonos_set_mute(ip, muted),
-        sonos_set_eq=lambda ip, eq_type, value: _sonos_set_eq(ip, eq_type=eq_type, value=value),
-        normalize_sonos_eq=lambda value: _normalize_sonos_eq(value),
+        sonos_ip_from_url=lambda url: sonos_service.ip_from_url(url),
+        sonos_set_volume=lambda ip, percent: sonos_service.set_volume(ip, percent),
+        sonos_set_mute=lambda ip, muted: sonos_service.set_mute(ip, muted),
+        sonos_set_eq=lambda ip, eq_type, value: sonos_service.set_eq(ip, eq_type=eq_type, value=value),
+        normalize_sonos_eq=lambda value: sonos_service.normalize_eq(value),
         request_agent_secret=lambda node, force=False, recovery_code=None: request_agent_secret(node, force=force, recovery_code=recovery_code),
         configure_agent_audio=lambda node: configure_agent_audio(node),
         set_node_channel=lambda node, channel_id: _set_node_channel(node, channel_id),
@@ -2309,7 +2249,7 @@ app.include_router(
         detect_discovery_networks=lambda: _detect_discovery_networks(),
         hosts_for_networks=lambda networks, limit=DISCOVERY_MAX_HOSTS: _hosts_for_networks(networks, limit=limit),
         stream_host_probes=lambda hosts: _stream_host_probes(hosts),
-        sonos_ssdp_discover=lambda: _sonos_ssdp_discover(),
+        sonos_ssdp_discover=lambda: sonos_service.ssdp_discover(),
         discovery_max_hosts=DISCOVERY_MAX_HOSTS,
         sonos_discovery_timeout=SONOS_DISCOVERY_TIMEOUT,
     )
@@ -2322,7 +2262,7 @@ app.include_router(
         get_channel_order=lambda: channel_order,
         get_nodes=lambda: nodes,
         get_sources_by_id=lambda: sources_by_id,
-        load_token=lambda source_id: load_token(source_id),
+        load_token=lambda source_id: spotify_config.load_token(source_id),
         require_admin=require_admin,
         resolve_channel_id=lambda channel_id: resolve_channel_id(channel_id),
         channel_detail=lambda channel_id: channel_detail(channel_id),
@@ -2351,8 +2291,8 @@ app.include_router(
         summarize_snapserver_status=lambda status: _summarize_snapserver_status(status),
         public_snap_client=lambda client, snapclient_nodes: _public_snap_client(client, snapclient_nodes),
         get_webrtc_relay=lambda: webrtc_relay,
-        read_spotify_config=lambda identifier: read_spotify_config(identifier),
-        read_librespot_status=lambda identifier: read_librespot_status(identifier),
+        read_spotify_config=lambda identifier: spotify_config.read_spotify_config(identifier),
+        read_librespot_status=lambda identifier: spotify_config.read_librespot_status(identifier),
         snapserver_host=SNAPSERVER_HOST,
         snapserver_port=SNAPSERVER_PORT,
     )
@@ -2381,21 +2321,68 @@ app.include_router(
     )
 )
 
+app.include_router(
+    create_playback_router(
+        channel_order=channel_order,
+        channels_by_id=channels_by_id,
+        require_radio_provider=lambda: require_radio_provider(),
+        ensure_radio_state=lambda channel: _ensure_radio_state(channel),
+        radio_runtime_status=radio_runtime_status,
+        save_channels=lambda: save_channels(),
+        mark_radio_assignments_dirty=lambda: _mark_radio_assignments_dirty(),
+        require_spotify_provider=lambda: require_spotify_provider(),
+        spotify_control=lambda path, method="PUT", channel_id=None: spotify_api.spotify_control(
+            path,
+            method,
+            channel_id=channel_id,
+            ensure_spotify_token=lambda identifier=None: _ensure_spotify_token(identifier),
+            spotify_request_func=lambda method, path, token, identifier=None, **kwargs: spotify_api.spotify_request(
+                method,
+                path,
+                token,
+                identifier,
+                spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
+                    token,
+                    identifier,
+                    current_spotify_creds=current_spotify_creds,
+                    save_token=spotify_config.save_token,
+                ),
+                **kwargs,
+            ),
+        ),
+        parse_spotify_error=lambda detail: spotify_api.parse_spotify_error(detail),
+    )
+)
+
+app.include_router(create_ui_router(STATIC_DIR))
+
 
 app.include_router(
     create_spotify_router(
         require_spotify_provider_dep=lambda: require_spotify_provider(),
         resolve_channel_id=lambda channel_id: resolve_channel_id(channel_id),
         resolve_spotify_source_id=lambda identifier: _resolve_spotify_source_id(identifier),
-        read_spotify_config=lambda identifier: read_spotify_config(identifier),
+        read_spotify_config=lambda identifier: spotify_config.read_spotify_config(identifier),
         get_spotify_source=lambda source_id: get_spotify_source(source_id),
         spotify_redirect_uri=SPOTIFY_REDIRECT_URI,
         current_spotify_creds=lambda source_id: current_spotify_creds(source_id),
         token_signer=TOKEN_SIGNER,
-        save_token=lambda token, source_id: save_token(token, source_id),
+        save_token=lambda token, source_id: spotify_config.save_token(token, source_id),
         ensure_spotify_token=lambda identifier=None: _ensure_spotify_token(identifier),
-        load_token=lambda channel_id=None: load_token(channel_id),
-        spotify_request=lambda *args, **kwargs: spotify_request(*args, **kwargs),
+        load_token=lambda channel_id=None: spotify_config.load_token(channel_id),
+        spotify_request=lambda method, path, token, identifier=None, **kwargs: spotify_api.spotify_request(
+            method,
+            path,
+            token,
+            identifier,
+            spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
+                token,
+                identifier,
+                current_spotify_creds=current_spotify_creds,
+                save_token=spotify_config.save_token,
+            ),
+            **kwargs,
+        ),
         find_roomcast_device=lambda token, channel_id=None: _find_roomcast_device(token, channel_id),
         preferred_roomcast_device_names=lambda channel_id=None: _preferred_roomcast_device_names(channel_id),
         get_player_snapshot=lambda channel_id=None: _get_player_snapshot(channel_id),
@@ -2410,7 +2397,7 @@ app.include_router(
         spotify_search_types=SPOTIFY_SEARCH_TYPES,
         snapserver_host=SNAPSERVER_HOST,
         snapserver_port=SNAPSERVER_PORT,
-        read_librespot_status=lambda source_id: read_librespot_status(source_id),
+        read_librespot_status=lambda source_id: spotify_config.read_librespot_status(source_id),
     )
 )
 
@@ -2461,19 +2448,19 @@ app.include_router(
         get_channels_by_id=lambda: channels_by_id,
         get_nodes=_nodes,
         resolve_node_channel_id=resolve_node_channel_id,
-        sonos_attempt_reconnect=lambda channel_id, members: _sonos_attempt_reconnect(channel_id, members),
-        sonos_discover=lambda: _sonos_discover(),
-        sonos_client_allows_stream=lambda resolved_channel_id, client_ip: _sonos_client_allows_stream(
-            resolved_channel_id=resolved_channel_id,
-            client_ip=client_ip,
+        sonos_attempt_reconnect=lambda channel_id, members: sonos_service.attempt_reconnect(channel_id, members),
+        sonos_discover=lambda: sonos_service.discover(),
+        sonos_client_allows_stream=lambda resolved_channel_id, client_ip: sonos_service.client_allows_stream(
+            resolved_channel_id,
+            client_ip,
         ),
-        sonos_mark_stream_activity=lambda channel_id, client_ip, kind: _sonos_mark_stream_activity(
-            channel_id=channel_id,
-            client_ip=client_ip,
-            kind=kind,
+        sonos_mark_stream_activity=lambda channel_id, client_ip, kind: sonos_service.mark_stream_activity(
+            channel_id,
+            client_ip,
+            kind,
         ),
-        sonos_mark_stream_end=lambda client_ip: _sonos_mark_stream_end(client_ip=client_ip),
-        sonos_find_node_by_ip=lambda ip: _sonos_find_node_by_ip(ip),
+        sonos_mark_stream_end=lambda client_ip: sonos_service.mark_stream_end(client_ip),
+        sonos_find_node_by_ip=lambda ip: sonos_service.find_node_by_ip(ip),
         normalize_stereo_mode=lambda mode: _normalize_stereo_mode(mode),
         ffmpeg_pan_filter_for_stereo_mode=lambda mode: _ffmpeg_pan_filter_for_stereo_mode(mode),
         snapcast_client=snapcast,
@@ -2547,7 +2534,7 @@ async def _sync_node_max_volume(node: dict, *, percent: Optional[int] = None) ->
         return
     value = _get_node_max_volume(node) if percent is None else _normalize_percent(percent, default=_get_node_max_volume(node))
     payload = {"percent": value}
-    await _call_agent(node, "/config/max-volume", payload)
+    await agent_client.post(node, "/config/max-volume", payload)
 
 
 def _resolve_spotify_source_id(identifier: Optional[str]) -> Optional[str]:
@@ -2558,15 +2545,26 @@ def _resolve_spotify_source_id(identifier: Optional[str]) -> Optional[str]:
     return resolve_channel_spotify_source_id(identifier)
 
 
+spotify_config = SpotifyConfigService(
+    resolve_spotify_source_id=_resolve_spotify_source_id,
+    normalize_spotify_source_id=_normalize_spotify_source_id,
+    resolve_channel_id=resolve_channel_id,
+    get_spotify_source=get_spotify_source,
+    spotify_client_id_default=SPOTIFY_CLIENT_ID,
+    spotify_client_secret_default=SPOTIFY_CLIENT_SECRET,
+    spotify_redirect_uri_default=SPOTIFY_REDIRECT_URI,
+)
+
+
 def _ensure_spotify_token(identifier: Optional[str] = None) -> dict:
-    token = load_token(identifier)
+    token = spotify_config.load_token(identifier)
     if not token or not token.get("access_token"):
         raise HTTPException(status_code=401, detail="Spotify not authorized")
     return token
 
 
 def _preferred_roomcast_device_names(channel_id: Optional[str] = None) -> List[str]:
-    cfg = read_spotify_config(channel_id)
+    cfg = spotify_config.read_spotify_config(channel_id)
     candidates = [
         (cfg.get("device_name") or "").strip(),
         LIBRESPOT_FALLBACK_NAME.strip(),
@@ -2586,7 +2584,18 @@ def _preferred_roomcast_device_names(channel_id: Optional[str] = None) -> List[s
 
 
 async def _find_roomcast_device(token: dict, channel_id: Optional[str] = None) -> Optional[dict]:
-    resp = await spotify_request("GET", "/me/player/devices", token, channel_id)
+    resp = await spotify_api.spotify_request(
+        "GET",
+        "/me/player/devices",
+        token,
+        channel_id,
+        spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
+            token,
+            identifier,
+            current_spotify_creds=current_spotify_creds,
+            save_token=spotify_config.save_token,
+        ),
+    )
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text)
     data = resp.json()
@@ -2836,14 +2845,6 @@ def _normalize_node_url(raw: str) -> str:
     return value.rstrip("/")
 
 
-def _sonos_ip_from_url(url: Optional[str]) -> Optional[str]:
-    if not url:
-        return None
-    if url.startswith("sonos://"):
-        return url[len("sonos://"):].strip("/") or None
-    return None
-
-
 def _normalize_stereo_mode(value: object) -> str:
     mode = (str(value) if value is not None else "both").strip().lower()
     return mode if mode in {"both", "left", "right"} else "both"
@@ -2856,871 +2857,6 @@ def _ffmpeg_pan_filter_for_stereo_mode(mode: str) -> Optional[str]:
     if normalized == "right":
         return "pan=stereo|c0=c1|c1=c1"
     return None
-
-
-def _sonos_stream_url(channel_id: str) -> str:
-    return f"{_roomcast_public_base_url()}/api/sonos/stream/{channel_id}"
-
-
-def _roomcast_public_base_url() -> str:
-    host = (ROOMCAST_PUBLIC_HOST or "").strip() or "127.0.0.1"
-    # Sonos must be able to reach the controller over the LAN; never hand out loopback.
-    if host in {"127.0.0.1", "localhost"}:
-        detected = _detect_primary_ipv4_host()
-        if detected:
-            host = detected
-    return f"http://{host}:{ROOMCAST_PUBLIC_PORT}"
-
-
-def _sonos_stream_uri(channel_id: str) -> str:
-    """Return a Sonos-compatible URI for an HTTP live MP3 stream."""
-
-    # Sonos expects the mp3radio scheme wrapper for many live streams.
-    http_url = _sonos_stream_url(channel_id)
-    parsed = urlparse(http_url)
-    # Sonos typically expects: x-rincon-mp3radio://host:port/path (no nested http://)
-    suffix = f"{parsed.netloc}{parsed.path}" if parsed.netloc else http_url
-    if parsed.query:
-        suffix = f"{suffix}?{parsed.query}"
-    return f"x-rincon-mp3radio://{suffix}"
-
-
-def _sonos_stream_metadata(channel_id: str) -> str:
-    """Return DIDL-Lite metadata for the Sonos mp3radio stream."""
-
-    resolved = resolve_channel_id(channel_id)
-    channel = channels_by_id.get(resolved) if resolved else None
-    channel_name = (channel.get("name") if isinstance(channel, dict) else None) or channel_id
-    title = f"RoomCast - {channel_name}"
-    http_url = _sonos_stream_url(channel_id)
-
-    host = (ROOMCAST_PUBLIC_HOST or "").strip() or "127.0.0.1"
-    if host in {"127.0.0.1", "localhost"}:
-        detected = _detect_primary_ipv4_host()
-        if detected:
-            host = detected
-    artwork_url = f"http://{host}:{ROOMCAST_PUBLIC_PORT}/static/icons/icon-192.png"
-    image_url = f"{_roomcast_public_base_url()}/static/icons/icon-512.png"
-
-    # This XML is embedded as text inside SOAP, so it must be escaped when inserted.
-    # We generate the inner XML here and let _sonos_soap_action escape it.
-    return (
-        '<DIDL-Lite xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
-        'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
-        'xmlns:r="urn:schemas-rinconnetworks-com:metadata-1-0/" '
-        'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">'
-        '<item id="flowmode" parentID="0" restricted="1">'
-        f"<dc:title>{xml_escape(title)}</dc:title>"
-        f"<upnp:albumArtURI>{xml_escape(image_url)}</upnp:albumArtURI>"
-        "<dc:description>RoomCast</dc:description>"
-        '<upnp:class>object.item.audioItem.audioBroadcast</upnp:class>'
-        f"<res protocolInfo=\"http-get:*:audio/mpeg:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\">{xml_escape(http_url)}</res>"
-        '<desc id="cdudn" nameSpace="urn:schemas-rinconnetworks-com:metadata-1-0/">'
-        'RINCON_AssociatedZPUDN'
-        '</desc>'
-        '</item>'
-        '</DIDL-Lite>'
-    )
-
-
-def _sonos_extract_rincon(udn: str | None) -> Optional[str]:
-    if not udn:
-        return None
-    raw = udn.strip()
-    if raw.lower().startswith("uuid:"):
-        raw = raw[5:]
-    return raw if raw.startswith("RINCON_") else None
-
-
-async def _sonos_fetch_description(ip: str, *, timeout: float = SONOS_CONTROL_TIMEOUT) -> Optional[dict]:
-    url = f"http://{ip}:1400/xml/device_description.xml"
-    headers = {"User-Agent": SONOS_HTTP_USER_AGENT}
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.get(url, headers=headers)
-        if resp.status_code != 200:
-            return None
-        root = ElementTree.fromstring(resp.text)
-    except Exception:
-        return None
-
-    def _find_text(path: str) -> Optional[str]:
-        el = root.find(path)
-        if el is None or el.text is None:
-            return None
-        value = el.text.strip()
-        return value or None
-
-    # UPnP device description uses namespaces sometimes; handle both.
-    friendly = _find_text(".//friendlyName") or _find_text(".//{*}friendlyName")
-    udn = _find_text(".//UDN") or _find_text(".//{*}UDN")
-    dtype = _find_text(".//deviceType") or _find_text(".//{*}deviceType")
-    if dtype and dtype.strip() != SONOS_DEVICE_TYPE:
-        return None
-    rincon = _sonos_extract_rincon(udn)
-    return {
-        "friendly_name": friendly,
-        "udn": udn,
-        "rincon": rincon,
-        "device_type": dtype,
-        "description_url": url,
-    }
-
-
-async def _sonos_soap_action(
-    ip: str,
-    *,
-    service: str,
-    action: str,
-    control_path: str,
-    arguments: dict[str, str],
-    timeout: Optional[float] = None,
-) -> None:
-    await _sonos_soap_action_text(
-        ip,
-        service=service,
-        action=action,
-        control_path=control_path,
-        arguments=arguments,
-        timeout=timeout,
-    )
-    return
-
-async def _sonos_soap_action_text(
-    ip: str,
-    *,
-    service: str,
-    action: str,
-    control_path: str,
-    arguments: dict[str, str],
-    timeout: Optional[float] = None,
-) -> str:
-    """Execute a Sonos SOAP action and return the response body."""
-
-    target = f"http://{ip}:1400{control_path}"
-    ns = f"urn:schemas-upnp-org:service:{service}:1"
-    body_parts = [f"<{k}>{xml_escape(v)}</{k}>" for k, v in arguments.items()]
-    envelope = (
-        "<?xml version=\"1.0\" encoding=\"utf-8\"?>"
-        "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" "
-        "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">"
-        "<s:Body>"
-        f"<u:{action} xmlns:u=\"{ns}\">"
-        + "".join(body_parts)
-        + f"</u:{action}>"
-        "</s:Body>"
-        "</s:Envelope>"
-    )
-    headers = {
-        "Content-Type": "text/xml; charset=\"utf-8\"",
-        "SOAPACTION": f'\"{ns}#{action}\"',
-        "User-Agent": SONOS_HTTP_USER_AGENT,
-        "Connection": "close",
-    }
-    effective_timeout = SONOS_CONTROL_TIMEOUT if timeout is None else float(timeout)
-    async with httpx.AsyncClient(timeout=effective_timeout) as client:
-        resp = await client.post(target, content=envelope.encode("utf-8"), headers=headers)
-
-    def _parse_upnp_fault(xml_text: str) -> Optional[str]:
-        try:
-            root = ElementTree.fromstring(xml_text)
-        except Exception:
-            return None
-        fault = root.find(".//{*}Fault")
-        if fault is None:
-            return None
-        error_code = root.findtext(".//{*}errorCode")
-        error_desc = root.findtext(".//{*}errorDescription")
-        if error_code or error_desc:
-            code = (error_code or "").strip()
-            desc = (error_desc or "").strip()
-            if code and desc:
-                return f"UPnPError {code}: {desc}"
-            return f"UPnPError {code or desc}".strip()
-        fault_string = root.findtext(".//{*}faultstring")
-        if fault_string:
-            return fault_string.strip()
-        return "UPnPError (unknown SOAP fault)"
-
-    fault_msg = _parse_upnp_fault(resp.text or "")
-    if resp.status_code >= 400 or fault_msg:
-        detail = fault_msg or (resp.text or "").strip() or f"HTTP {resp.status_code}"
-        raise HTTPException(status_code=502, detail=f"Sonos SOAP {service}.{action} failed: {detail}")
-    return resp.text
-
-
-async def _sonos_get_transport_state(ip: str) -> Optional[str]:
-    xml_text = await _sonos_soap_action_text(
-        ip,
-        service="AVTransport",
-        action="GetTransportInfo",
-        control_path="/MediaRenderer/AVTransport/Control",
-        arguments={"InstanceID": "0"},
-    )
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except Exception as exc:
-        log.warning("Sonos GetTransportInfo parse failed (ip=%s): %s", ip, exc)
-        return None
-    state = root.findtext(".//{*}CurrentTransportState")
-    return state.strip() if state else None
-
-
-async def _sonos_get_current_uri(ip: str) -> Optional[str]:
-    xml_text = await _sonos_soap_action_text(
-        ip,
-        service="AVTransport",
-        action="GetMediaInfo",
-        control_path="/MediaRenderer/AVTransport/Control",
-        arguments={"InstanceID": "0"},
-    )
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except Exception as exc:
-        log.warning("Sonos GetMediaInfo parse failed (ip=%s): %s", ip, exc)
-        return None
-    uri = root.findtext(".//{*}CurrentURI")
-    return uri.strip() if uri else None
-
-
-async def _sonos_get_zone_name(ip: str) -> Optional[str]:
-    """Return the Sonos app 'room' / zone name for this device."""
-
-    try:
-        xml_text = await _sonos_soap_action_text(
-            ip,
-            service="DeviceProperties",
-            action="GetZoneAttributes",
-            control_path="/DeviceProperties/Control",
-            arguments={},
-        )
-    except Exception as exc:
-        log.warning("Sonos GetZoneAttributes failed (ip=%s): %s", ip, exc)
-        return None
-
-    try:
-        root = ElementTree.fromstring(xml_text)
-    except Exception as exc:
-        log.warning("Sonos GetZoneAttributes parse failed (ip=%s): %s", ip, exc)
-        return None
-    name = root.findtext(".//{*}CurrentZoneName")
-    if not name:
-        return None
-    resolved = name.strip()
-    return resolved or None
-
-
-async def _sonos_set_volume(ip: str, percent: int) -> None:
-    await _sonos_soap_action(
-        ip,
-        service="RenderingControl",
-        action="SetVolume",
-        control_path="/MediaRenderer/RenderingControl/Control",
-        arguments={
-            "InstanceID": "0",
-            "Channel": "Master",
-            "DesiredVolume": str(max(0, min(100, int(percent)))),
-        },
-    )
-
-
-async def _sonos_set_mute(ip: str, muted: bool) -> None:
-    await _sonos_soap_action(
-        ip,
-        service="RenderingControl",
-        action="SetMute",
-        control_path="/MediaRenderer/RenderingControl/Control",
-        arguments={
-            "InstanceID": "0",
-            "Channel": "Master",
-            "DesiredMute": "1" if muted else "0",
-        },
-    )
-
-
-def _normalize_sonos_eq(value: object) -> dict:
-    data = value if isinstance(value, dict) else {}
-    bass = data.get("bass")
-    treble = data.get("treble")
-    loudness = data.get("loudness")
-    try:
-        bass_i = int(bass)
-    except (TypeError, ValueError):
-        bass_i = 0
-    try:
-        treble_i = int(treble)
-    except (TypeError, ValueError):
-        treble_i = 0
-    return {
-        "bass": max(-10, min(10, bass_i)),
-        "treble": max(-10, min(10, treble_i)),
-        "loudness": bool(loudness) if loudness is not None else False,
-    }
-
-
-async def _sonos_set_eq(ip: str, *, eq_type: str, value: int) -> None:
-    await _sonos_soap_action(
-        ip,
-        service="RenderingControl",
-        action="SetEQ",
-        control_path="/MediaRenderer/RenderingControl/Control",
-        arguments={
-            "InstanceID": "0",
-            "EQType": str(eq_type),
-            "DesiredValue": str(int(value)),
-        },
-    )
-
-
-async def _sonos_become_standalone(ip: str) -> None:
-    await _sonos_soap_action(
-        ip,
-        service="AVTransport",
-        action="BecomeCoordinatorOfStandaloneGroup",
-        control_path="/MediaRenderer/AVTransport/Control",
-        arguments={"InstanceID": "0"},
-    )
-
-
-async def _sonos_join(ip: str, coordinator_rincon: str) -> None:
-    uri = f"x-rincon:{coordinator_rincon}"
-    await _sonos_soap_action(
-        ip,
-        service="AVTransport",
-        action="SetAVTransportURI",
-        control_path="/MediaRenderer/AVTransport/Control",
-        arguments={
-            "InstanceID": "0",
-            "CurrentURI": uri,
-            "CurrentURIMetaData": "",
-        },
-    )
-
-
-async def _sonos_set_uri_and_play(ip: str, uri: str, metadata: str = "") -> None:
-    # Some Sonos devices can be slow to respond during regrouping or when swapping streams.
-    # Apply a slightly longer timeout and a short retry on timeouts.
-    timeout_s = max(SONOS_CONTROL_TIMEOUT, 12.0)
-    retries = 2
-    for attempt in range(1, retries + 1):
-        try:
-            await _sonos_soap_action(
-                ip,
-                service="AVTransport",
-                action="SetAVTransportURI",
-                control_path="/MediaRenderer/AVTransport/Control",
-                arguments={
-                    "InstanceID": "0",
-                    "CurrentURI": uri,
-                    "CurrentURIMetaData": metadata or "",
-                },
-                timeout=timeout_s,
-            )
-            break
-        except httpx.TimeoutException as exc:
-            if attempt >= retries:
-                raise HTTPException(status_code=502, detail=f"Sonos SetAVTransportURI timed out: {exc}") from exc
-            await asyncio.sleep(0.25 * attempt)
-        except httpx.RequestError as exc:
-            if attempt >= retries:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Sonos SetAVTransportURI failed: {exc}",
-                ) from exc
-            await asyncio.sleep(0.25 * attempt)
-
-    for attempt in range(1, retries + 1):
-        try:
-            await _sonos_soap_action(
-                ip,
-                service="AVTransport",
-                action="Play",
-                control_path="/MediaRenderer/AVTransport/Control",
-                arguments={
-                    "InstanceID": "0",
-                    "Speed": "1",
-                },
-                timeout=timeout_s,
-            )
-            return
-        except httpx.TimeoutException as exc:
-            if attempt >= retries:
-                raise HTTPException(status_code=502, detail=f"Sonos Play timed out: {exc}") from exc
-            await asyncio.sleep(0.25 * attempt)
-        except httpx.RequestError as exc:
-            if attempt >= retries:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Sonos Play failed: {exc}",
-                ) from exc
-            await asyncio.sleep(0.25 * attempt)
-
-
-async def _sonos_set_uri_and_play_with_fallback(channel_id: str, coordinator_ip: str) -> None:
-    """Start playback on a coordinator, retrying with alternate URI formats.
-
-    Some Sonos firmwares accept `x-rincon-mp3radio://http://...`, others are picky.
-    We try mp3radio first, and if the transport state doesn't become PLAYING,
-    we retry with a plain HTTP URI.
-    """
-
-    mp3radio_uri = _sonos_stream_uri(channel_id)
-    http_uri = _sonos_stream_url(channel_id)
-    # Metadata handling matters: mp3radio commonly works best with empty metadata,
-    # while plain HTTP benefits from DIDL-Lite.
-    metadata_mp3radio = ""
-    metadata_http = _sonos_stream_metadata(channel_id)
-
-    log.info(
-        "Sonos start stream (ip=%s, channel=%s, mp3radio_uri=%s, http_uri=%s)",
-        coordinator_ip,
-        channel_id,
-        mp3radio_uri,
-        http_uri,
-    )
-
-    await _sonos_set_uri_and_play(coordinator_ip, mp3radio_uri, metadata_mp3radio)
-    state = None
-    for _ in range(3):
-        await asyncio.sleep(0.5)
-        try:
-            state = await _sonos_get_transport_state(coordinator_ip)
-        except Exception:
-            state = None
-        if state and state.upper() == "PLAYING":
-            return
-
-    log.warning(
-        "Sonos coordinator transport not PLAYING after mp3radio start (ip=%s, state=%s); retrying with plain HTTP URI",
-        coordinator_ip,
-        state,
-    )
-    await _sonos_set_uri_and_play(coordinator_ip, http_uri, metadata_http)
-    state2 = None
-    for _ in range(3):
-        await asyncio.sleep(0.5)
-        try:
-            state2 = await _sonos_get_transport_state(coordinator_ip)
-        except Exception:
-            state2 = None
-        if state2 and state2.upper() == "PLAYING":
-            return
-    try:
-        current_uri = await _sonos_get_current_uri(coordinator_ip)
-    except Exception:
-        current_uri = None
-    log.warning(
-        "Sonos coordinator still not PLAYING after HTTP retry (ip=%s, state=%s, current_uri=%s)",
-        coordinator_ip,
-        state2,
-        current_uri,
-    )
-
-
-async def _sonos_stop(ip: str) -> None:
-    await _sonos_soap_action(
-        ip,
-        service="AVTransport",
-        action="Stop",
-        control_path="/MediaRenderer/AVTransport/Control",
-        arguments={"InstanceID": "0"},
-    )
-
-
-async def _sonos_ping(ip: str) -> bool:
-    headers = {"User-Agent": SONOS_HTTP_USER_AGENT}
-    try:
-        async with httpx.AsyncClient(timeout=SONOS_CONTROL_TIMEOUT) as client:
-            resp = await client.get(f"http://{ip}:1400/xml/device_description.xml", headers=headers)
-        return resp.status_code == 200
-    except Exception:
-        return False
-
-
-def _parse_sonos_network_from_review(text: str) -> Optional[dict]:
-    """Best-effort parse of Sonos /support/review for network type.
-
-    Sonos does not reliably expose RSSI via supported UPnP APIs.
-    Some firmwares expose useful (but undocumented) diagnostics via
-    /support/review; we only use it to determine the transport type.
-    """
-
-    if not text:
-        return None
-
-    normalized = text.strip()
-    if not normalized:
-        return None
-
-    link_match = re.search(r"<Link>(\d+)</Link>", normalized)
-    speed_match = re.search(r"<Speed>(\d+)</Speed>", normalized)
-    try:
-        link = int(link_match.group(1)) if link_match else 0
-    except (TypeError, ValueError):
-        link = 0
-    try:
-        speed = int(speed_match.group(1)) if speed_match else 0
-    except (TypeError, ValueError):
-        speed = 0
-
-    wifi_mode_match = re.search(r"<WifiModeString>([^<]+)</WifiModeString>", normalized)
-    wifi_mode_string = (wifi_mode_match.group(1).strip() if wifi_mode_match else "")
-
-    if link == 1 and speed > 0:
-        transport = "ethernet"
-    elif wifi_mode_string:
-        upper = wifi_mode_string.upper()
-        if "SONOSNET" in upper:
-            transport = "sonosnet"
-        elif "STATION" in upper:
-            transport = "wifi"
-        else:
-            transport = "wireless"
-    else:
-        transport = "unknown"
-
-    return {
-        "transport": transport,
-        "wifi_mode_string": wifi_mode_string or None,
-        "ethernet_link": bool(link == 1),
-        "ethernet_speed": speed if speed > 0 else None,
-    }
-
-
-def _sonos_find_node_by_ip(ip: Optional[str]) -> Optional[dict]:
-    if not ip:
-        return None
-    needle = ip.strip().lower()
-    if not needle:
-        return None
-    for node in nodes.values():
-        if node.get("type") != "sonos":
-            continue
-        node_ip = _sonos_ip_from_url(node.get("url"))
-        if node_ip and node_ip.strip().lower() == needle:
-            return node
-    return None
-
-
-def _sonos_client_allows_stream(*, resolved_channel_id: str, client_ip: Optional[str]) -> bool:
-    """If the client is a known Sonos node, only allow pulling its assigned channel.
-
-    This prevents a Sonos device that was previously assigned from continuing to
-    play RoomCast after being unassigned (or after a controller restart).
-    """
-
-    node = _sonos_find_node_by_ip(client_ip)
-    if not node:
-        return True
-    desired = resolve_node_channel_id(node)
-    return bool(desired and desired == resolved_channel_id)
-
-
-def _sonos_mark_stream_activity(*, channel_id: str, client_ip: Optional[str], kind: str) -> None:
-    node = _sonos_find_node_by_ip(client_ip)
-    if not node:
-        return
-    now = time.time()
-    node["sonos_stream_last_client"] = client_ip
-    if kind == "head":
-        node["sonos_last_stream_head_ts"] = now
-        return
-    if kind == "get":
-        node["sonos_last_stream_get_ts"] = now
-        node["sonos_stream_active"] = True
-        node["connection_state"] = "playing"
-        node["connection_error"] = None
-        node["sonos_connecting_since"] = None
-        return
-    if kind == "bytes":
-        node["sonos_last_stream_byte_ts"] = now
-
-
-def _sonos_mark_stream_end(*, client_ip: Optional[str]) -> None:
-    node = _sonos_find_node_by_ip(client_ip)
-    if not node:
-        return
-    node["sonos_stream_active"] = False
-
-
-def _sonos_stream_is_stale(node: dict, *, now: float) -> bool:
-    if not node or node.get("type") != "sonos":
-        return False
-    channel_id = resolve_node_channel_id(node)
-    if not channel_id:
-        return False
-    if node.get("online") is False:
-        return False
-
-    connecting_since = node.get("sonos_connecting_since")
-    if isinstance(connecting_since, (int, float)) and float(connecting_since) > 0:
-        # Give Sonos a grace window after a (re)connect attempt before we declare it broken.
-        if now - float(connecting_since) <= SONOS_CONNECT_GRACE_SECONDS:
-            return False
-        last_get = node.get("sonos_last_stream_get_ts")
-        if not isinstance(last_get, (int, float)):
-            last_head = node.get("sonos_last_stream_head_ts")
-            if isinstance(last_head, (int, float)):
-                return (now - float(last_head)) > SONOS_STREAM_STALE_SECONDS
-            return True
-        return (now - float(last_get)) > SONOS_STREAM_STALE_SECONDS
-
-    last_byte = node.get("sonos_last_stream_byte_ts")
-    if isinstance(last_byte, (int, float)):
-        return (now - float(last_byte)) > SONOS_STREAM_STALE_SECONDS
-    last_get = node.get("sonos_last_stream_get_ts")
-    if isinstance(last_get, (int, float)):
-        return (now - float(last_get)) > SONOS_STREAM_STALE_SECONDS
-    last_head = node.get("sonos_last_stream_head_ts")
-    if isinstance(last_head, (int, float)):
-        return (now - float(last_head)) > SONOS_STREAM_STALE_SECONDS
-    # Assigned but never seen any stream pull: treat as stale.
-    return True
-
-
-async def _sonos_attempt_reconnect(channel_id: str, members: list[dict]) -> bool:
-    async with sonos_reconcile_lock:
-        if not members:
-            return True
-        members_sorted = sorted(members, key=lambda item: (item.get("name") or "", item.get("id") or ""))
-        coordinator = members_sorted[0]
-        coordinator_ip = _sonos_ip_from_url(coordinator.get("url"))
-        coordinator_rincon = coordinator.get("sonos_rincon")
-        if not coordinator_ip or not coordinator_rincon:
-            return False
-
-        connect_ts = time.time()
-        for n in members_sorted:
-            n["connection_state"] = "connecting"
-            n["connection_error"] = None
-            n["sonos_connecting_since"] = connect_ts
-        await broadcast_nodes()
-
-        for attempt in range(1, max(1, SONOS_RECONNECT_ATTEMPTS) + 1):
-            attempt_start = time.time()
-            try:
-                try:
-                    await _sonos_become_standalone(coordinator_ip)
-                except Exception:
-                    pass
-
-                await _sonos_set_uri_and_play_with_fallback(channel_id, coordinator_ip)
-
-                for member in members_sorted[1:]:
-                    member_ip = _sonos_ip_from_url(member.get("url"))
-                    if not member_ip:
-                        continue
-                    try:
-                        await _sonos_join(member_ip, coordinator_rincon)
-                    except Exception as exc:
-                        member["connection_state"] = "error"
-                        member["connection_error"] = f"Failed to join Sonos group: {exc}"
-
-                # Wait until Sonos actually pulls and receives bytes from our stream.
-                deadline = attempt_start + max(1.0, SONOS_RECONNECT_WAIT_FOR_STREAM_SECONDS)
-                while time.time() < deadline:
-                    coord_node = _sonos_find_node_by_ip(coordinator_ip)
-                    last_get = coord_node.get("sonos_last_stream_get_ts") if coord_node else None
-                    last_byte = coord_node.get("sonos_last_stream_byte_ts") if coord_node else None
-                    if isinstance(last_get, (int, float)) and float(last_get) >= attempt_start:
-                        if isinstance(last_byte, (int, float)) and float(last_byte) >= attempt_start:
-                            for n in members_sorted:
-                                if n.get("connection_state") != "error":
-                                    n["connection_state"] = "playing"
-                                    n["connection_error"] = None
-                                n["sonos_connecting_since"] = None
-                            await broadcast_nodes()
-                            return True
-                    await asyncio.sleep(0.35)
-            except Exception as exc:
-                log.warning(
-                    "Sonos reconnect attempt %s/%s failed (channel=%s, coordinator=%s): %r",
-                    attempt,
-                    SONOS_RECONNECT_ATTEMPTS,
-                    channel_id,
-                    coordinator_ip,
-                    exc,
-                )
-                await asyncio.sleep(min(1.5, 0.35 * attempt))
-
-        # Failed to reconnect: unassign and surface error.
-        err = f"Lost connection to Sonos stream; reconnect failed ({SONOS_RECONNECT_ATTEMPTS} attempts)."
-        for n in members_sorted:
-            n["connection_state"] = "error"
-            n["connection_error"] = err
-            n["sonos_connecting_since"] = None
-            ip = _sonos_ip_from_url(n.get("url"))
-            if ip:
-                try:
-                    await _sonos_become_standalone(ip)
-                except Exception:
-                    pass
-                try:
-                    await _sonos_stop(ip)
-                except Exception:
-                    pass
-        save_nodes()
-        await broadcast_nodes()
-        return False
-
-
-async def _sonos_connection_loop() -> None:
-    try:
-        while True:
-            try:
-                await asyncio.sleep(max(1.0, SONOS_CONNECTION_POLL_INTERVAL))
-                now = time.time()
-                by_channel: dict[str, list[dict]] = {}
-                for node in nodes.values():
-                    if node.get("type") != "sonos":
-                        continue
-                    if node.get("online") is False:
-                        continue
-                    cid = resolve_node_channel_id(node)
-                    if not cid:
-                        continue
-                    by_channel.setdefault(cid, []).append(node)
-
-                for channel_id, members in by_channel.items():
-                    if not members:
-                        continue
-                    members_sorted = sorted(members, key=lambda item: (item.get("name") or "", item.get("id") or ""))
-                    coordinator = members_sorted[0]
-                    if not _sonos_stream_is_stale(coordinator, now=now):
-                        continue
-                    log.warning(
-                        "Sonos stream appears stale; attempting reconnect (channel=%s, coordinator=%s)",
-                        channel_id,
-                        _sonos_ip_from_url(coordinator.get("url")),
-                    )
-                    await _sonos_attempt_reconnect(channel_id, members_sorted)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                log.exception("Sonos connection monitor iteration failed")
-                await asyncio.sleep(1.0)
-    except asyncio.CancelledError:
-        pass
-
-
-async def _reconcile_sonos_groups() -> None:
-    """Ensure Sonos speakers with the same channel_id are grouped together.
-
-    - Each Sonos device is still represented as a separate RoomCast node.
-    - If multiple Sonos nodes share the same channel, they are grouped for sync.
-    - If a Sonos node is unassigned, it becomes standalone and we stop playback.
-    """
-
-    async with sonos_reconcile_lock:
-        by_channel: dict[str, list[dict]] = {}
-        standalone: list[dict] = []
-        for node in nodes.values():
-            if node.get("type") != "sonos":
-                continue
-            if node.get("online") is False:
-                continue
-            cid = resolve_node_channel_id(node)
-            if not cid:
-                standalone.append(node)
-                continue
-            by_channel.setdefault(cid, []).append(node)
-
-        # Standalone nodes: ensure they're standalone; stop if unassigned.
-        for node in standalone:
-            node["connection_state"] = None
-            node["connection_error"] = None
-            node["sonos_connecting_since"] = None
-            ip = _sonos_ip_from_url(node.get("url"))
-            if not ip:
-                continue
-            try:
-                await _sonos_become_standalone(ip)
-                await _sonos_stop(ip)
-            except Exception:
-                # Sonos may already be standalone or playing something else; do not crash reconciliation.
-                pass
-
-        for channel_id, members in by_channel.items():
-            if not members:
-                continue
-
-            connect_ts = time.time()
-            for n in members:
-                n["connection_state"] = "connecting"
-                n["connection_error"] = None
-                n["sonos_connecting_since"] = connect_ts
-            await broadcast_nodes()
-
-            # Choose deterministic coordinator.
-            members_sorted = sorted(members, key=lambda item: (item.get("name") or "", item.get("id") or ""))
-            coordinator = members_sorted[0]
-            coordinator_ip = _sonos_ip_from_url(coordinator.get("url"))
-            coordinator_rincon = coordinator.get("sonos_rincon")
-            if not coordinator_ip or not coordinator_rincon:
-                for n in members_sorted:
-                    n["connection_state"] = "error"
-                    n["connection_error"] = "Invalid Sonos coordinator configuration"
-                    n["sonos_connecting_since"] = None
-                continue
-
-            # Ensure coordinator is standalone and playing the correct RoomCast channel stream.
-            try:
-                await _sonos_become_standalone(coordinator_ip)
-            except Exception:
-                pass
-            try:
-                await _sonos_set_uri_and_play_with_fallback(channel_id, coordinator_ip)
-            except HTTPException as exc:
-                detail = getattr(exc, "detail", None)
-                msg = detail or str(exc) or repr(exc)
-                log.warning(
-                    "Sonos coordinator %s failed to start stream (ip=%s, channel=%s): %s",
-                    coordinator.get("id"),
-                    coordinator_ip,
-                    channel_id,
-                    msg,
-                )
-                for n in members_sorted:
-                    n["connection_state"] = "error"
-                    n["connection_error"] = f"Sonos failed to start stream: {msg}"
-                    n["sonos_connecting_since"] = None
-                continue
-            except Exception as exc:
-                log.warning(
-                    "Sonos coordinator %s failed to start stream (ip=%s, channel=%s): %r",
-                    coordinator.get("id"),
-                    coordinator_ip,
-                    channel_id,
-                    exc,
-                )
-                for n in members_sorted:
-                    n["connection_state"] = "error"
-                    n["connection_error"] = f"Sonos failed to start stream: {exc}"
-                    n["sonos_connecting_since"] = None
-                continue
-
-            # Join remaining members to coordinator.
-            for member in members_sorted[1:]:
-                member_ip = _sonos_ip_from_url(member.get("url"))
-                if not member_ip:
-                    member["connection_state"] = "error"
-                    member["connection_error"] = "Invalid Sonos member configuration"
-                    member["sonos_connecting_since"] = None
-                    continue
-                try:
-                    await _sonos_join(member_ip, coordinator_rincon)
-                except Exception as exc:
-                    member["connection_state"] = "error"
-                    member["connection_error"] = f"Failed to join Sonos group: {exc}"
-                    member["sonos_connecting_since"] = None
-                    log.warning("Sonos member %s failed to join group: %s", member.get("id"), exc)
-
-            # Do not mark as playing until we actually observe the Sonos device
-            # pulling bytes from our HTTP stream. That observation happens in
-            # _sonos_mark_stream_activity() when the stream endpoint receives GET/bytes.
-
-
 
 def _node_host_from_url(url: Optional[str]) -> Optional[str]:
     if not url or url.startswith("browser:"):
@@ -3969,7 +3105,7 @@ async def configure_agent_audio(node: dict) -> dict:
         "snapserver_host": SNAPSERVER_AGENT_HOST,
         "snapserver_port": SNAPCLIENT_PORT,
     }
-    result = await _call_agent(node, "/config/snapclient", payload)
+    result = await agent_client.post(node, "/config/snapclient", payload)
     node["audio_configured"] = bool(result.get("configured", True))
     await refresh_agent_metadata(node, persist=False)
     save_nodes()
@@ -4362,16 +3498,21 @@ async def _spotify_refresh_loop() -> None:
             for source_id, source in list(sources_by_id.items()):
                 if not source or source.get("kind") != "spotify":
                     continue
-                token = load_token(source_id)
+                token = spotify_config.load_token(source_id)
                 if not token or "refresh_token" not in token:
                     continue
-                seconds_left = _token_seconds_until_expiry(token)
+                seconds_left = spotify_config.token_seconds_until_expiry(token)
                 if seconds_left is None:
                     seconds_left = -1
                 if seconds_left > SPOTIFY_REFRESH_LEEWAY:
                     continue
                 try:
-                    await spotify_refresh(token, source_id)
+                    await spotify_api.spotify_refresh(
+                        token,
+                        source_id,
+                        current_spotify_creds=current_spotify_creds,
+                        save_token=spotify_config.save_token,
+                    )
                 except HTTPException as exc:
                     log.warning("Background Spotify refresh failed for %s: %s", source_id, exc.detail)
                     await asyncio.sleep(SPOTIFY_REFRESH_FAILURE_BACKOFF)
@@ -4424,7 +3565,7 @@ async def _startup_events() -> None:
         channel_idle_task = asyncio.create_task(_channel_idle_loop())
 
     if sonos_connection_task is None:
-        sonos_connection_task = asyncio.create_task(_sonos_connection_loop())
+        sonos_connection_task = asyncio.create_task(sonos_service.connection_loop())
 
 
 @app.on_event("shutdown")
@@ -4464,219 +3605,11 @@ async def _shutdown_events() -> None:
 
 
 def current_spotify_creds(identifier: Optional[str] = None) -> Tuple[str, str, str]:
-    cfg = read_spotify_config(identifier, include_secret=True)
+    cfg = spotify_config.read_spotify_config(identifier, include_secret=True)
     cid = (cfg.get("client_id") or os.getenv("SPOTIFY_CLIENT_ID") or "").strip()
     secret = cfg.get("client_secret") or os.getenv("SPOTIFY_CLIENT_SECRET") or ""
     redirect = cfg.get("redirect_uri") or os.getenv("SPOTIFY_REDIRECT_URI") or SPOTIFY_REDIRECT_URI
     return cid, secret, redirect
-
-
-def read_spotify_config(identifier: Optional[str] = None, include_secret: bool = False) -> dict:
-    resolved_channel_id = None
-    spotify_source_id = _resolve_spotify_source_id(identifier)
-    if spotify_source_id is None:
-        # Keep a stable shape for UI code even when channel is not Spotify.
-        resolved_channel_id = resolve_channel_id(identifier)
-        cfg = {
-            "channel_id": resolved_channel_id,
-            "source_id": None,
-            "username": "",
-            "device_name": "RoomCast",
-            "bitrate": 320,
-            "initial_volume": 75,
-            "normalisation": True,
-            "has_password": False,
-            "client_id": (os.getenv("SPOTIFY_CLIENT_ID") or SPOTIFY_CLIENT_ID or "").strip(),
-            "has_client_secret": bool(os.getenv("SPOTIFY_CLIENT_SECRET") or SPOTIFY_CLIENT_SECRET),
-            "redirect_uri": os.getenv("SPOTIFY_REDIRECT_URI") or SPOTIFY_REDIRECT_URI,
-            "has_oauth_token": False,
-        }
-        if include_secret:
-            cfg["client_secret"] = (os.getenv("SPOTIFY_CLIENT_SECRET") or SPOTIFY_CLIENT_SECRET or "")
-        return cfg
-
-    # If identifier was a channel id, expose it for UI convenience.
-    if not _normalize_spotify_source_id(identifier):
-        resolved_channel_id = resolve_channel_id(identifier)
-    source = get_spotify_source(spotify_source_id)
-    cfg_path = Path(source["config_path"])
-    token = load_token(spotify_source_id)
-    has_token = bool(token and token.get("access_token"))
-    config_exists = cfg_path.exists()
-    try:
-        data = json.loads(cfg_path.read_text()) if config_exists else {}
-    except json.JSONDecodeError:
-        data = {}
-
-    stored_client_id = (data.get("client_id")
-                        or os.getenv("SPOTIFY_CLIENT_ID")
-                        or SPOTIFY_CLIENT_ID
-                        or "").strip()
-    stored_client_secret = (data.get("client_secret")
-                            or os.getenv("SPOTIFY_CLIENT_SECRET")
-                            or SPOTIFY_CLIENT_SECRET
-                            or "")
-    stored_redirect = (data.get("redirect_uri")
-                       or os.getenv("SPOTIFY_REDIRECT_URI")
-                       or SPOTIFY_REDIRECT_URI)
-
-    cfg = {
-        "channel_id": resolved_channel_id,
-        "source_id": spotify_source_id,
-        "username": data.get("username", ""),
-        "device_name": data.get("device_name", "RoomCast"),
-        "bitrate": data.get("bitrate", 320),
-        "initial_volume": data.get("initial_volume", 75),
-        "normalisation": data.get("normalisation", True),
-        "has_password": bool(data.get("password")),
-        "client_id": stored_client_id,
-        "has_client_secret": bool(stored_client_secret),
-        "redirect_uri": stored_redirect,
-        "has_oauth_token": has_token,
-    }
-    if include_secret:
-        cfg["client_secret"] = stored_client_secret
-    elif not config_exists:
-        cfg["client_secret"] = "***" if stored_client_secret else ""
-    return cfg
-
-
-def read_librespot_status(identifier: Optional[str] = None) -> dict:
-    spotify_source_id = _resolve_spotify_source_id(identifier)
-    if spotify_source_id is None:
-        return {"state": "unknown", "message": "Not a Spotify channel"}
-    source = get_spotify_source(spotify_source_id)
-    status_path = Path(source["status_path"])
-    if not status_path.exists():
-        return {"state": "unknown", "message": "No status yet"}
-    try:
-        return json.loads(status_path.read_text())
-    except json.JSONDecodeError:
-        return {"state": "unknown", "message": "Invalid status file"}
-
-
-def load_token(identifier: Optional[str] = None) -> Optional[dict]:
-    spotify_source_id = _resolve_spotify_source_id(identifier)
-    if spotify_source_id is None:
-        return None
-    source = get_spotify_source(spotify_source_id)
-    token_path = Path(source["token_path"])
-    if not token_path.exists():
-        return None
-    try:
-        return json.loads(token_path.read_text())
-    except json.JSONDecodeError:
-        return None
-
-
-def save_token(data: dict, identifier: Optional[str] = None) -> None:
-    if not data:
-        return
-    spotify_source_id = _resolve_spotify_source_id(identifier)
-    if spotify_source_id is None:
-        raise HTTPException(status_code=400, detail="Spotify source not configured")
-    source = get_spotify_source(spotify_source_id)
-    token_path = Path(source["token_path"])
-    expires_at: Optional[float] = None
-    expires_in = data.get("expires_in")
-    if expires_in is not None:
-        try:
-            expires_at = time.time() + max(int(expires_in), 60)
-        except (TypeError, ValueError):
-            expires_at = None
-    if expires_at is not None:
-        data["expires_at"] = expires_at
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(json.dumps(data, indent=2))
-
-
-def _token_seconds_until_expiry(token: Optional[dict]) -> Optional[float]:
-    if not token:
-        return None
-    expires_at = token.get("expires_at")
-    if expires_at is not None:
-        try:
-            return float(expires_at) - time.time()
-        except (TypeError, ValueError):
-            return None
-    expires_in = token.get("expires_in")
-    if expires_in is not None:
-        try:
-            return float(expires_in)
-        except (TypeError, ValueError):  # pragma: no cover - defensive
-            return None
-    return None
-
-
-async def spotify_refresh(token: dict, identifier: Optional[str] = None) -> dict:
-    if not token or "refresh_token" not in token:
-        raise HTTPException(status_code=401, detail="Spotify not authorized")
-    cid, secret, _ = current_spotify_creds(identifier)
-    payload = {
-        "grant_type": "refresh_token",
-        "refresh_token": token["refresh_token"],
-        "client_id": cid,
-        "client_secret": secret,
-    }
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post("https://accounts.spotify.com/api/token", data=payload)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=401, detail="Failed to refresh Spotify token")
-    data = resp.json()
-    token["access_token"] = data["access_token"]
-    token["expires_in"] = data.get("expires_in")
-    save_token(token, identifier)
-    return token
-
-
-async def spotify_request(method: str, path: str, token: dict, identifier: Optional[str] = None, **kwargs) -> httpx.Response:
-    headers = kwargs.pop("headers", {})
-    headers["Authorization"] = f"Bearer {token['access_token']}"
-    url = f"https://api.spotify.com/v1{path}"
-    async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.request(method, url, headers=headers, **kwargs)
-    if resp.status_code == 401:
-        token = await spotify_refresh(token, identifier)
-        headers["Authorization"] = f"Bearer {token['access_token']}"
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.request(method, url, headers=headers, **kwargs)
-    return resp
-
-
-def _parse_spotify_error(detail: Any) -> dict:
-    payload: Any = detail
-    if isinstance(detail, str):
-        try:
-            payload = json.loads(detail)
-        except Exception:
-            payload = {"error": {"message": detail}}
-    if not isinstance(payload, dict):
-        return {"message": str(detail)}
-    error = payload.get("error")
-    if isinstance(error, dict):
-        return {
-            "status": error.get("status"),
-            "message": error.get("message"),
-            "reason": error.get("reason"),
-        }
-    return {"message": payload.get("message") or str(detail)}
-
-
-async def _spotify_control(path: str, method: str = "PUT", *, channel_id: Optional[str] = None) -> None:
-    token = _ensure_spotify_token(channel_id)
-    resp = await spotify_request(method, path, token, identifier=channel_id)
-    if resp.status_code < 400:
-        return
-    try:
-        detail = resp.json()
-    except Exception:
-        detail = resp.text
-    raise HTTPException(status_code=resp.status_code, detail=detail)
-
-
-@app.get("/api/health")
-async def health() -> dict:
-    return {"status": "ok"}
 
 
 async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool = False) -> dict:
@@ -4685,10 +3618,10 @@ async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool
     fingerprint = reg.fingerprint
     desc: Optional[dict] = None
     if normalized_url.startswith("sonos://"):
-        ip = _sonos_ip_from_url(normalized_url)
+        ip = sonos_service.ip_from_url(normalized_url)
         if not ip:
             raise HTTPException(status_code=400, detail="Invalid Sonos URL")
-        desc = await _sonos_fetch_description(ip)
+        desc = await sonos_service.fetch_description(ip)
         if not desc:
             raise HTTPException(status_code=502, detail="Failed to read Sonos device description")
         fingerprint = fingerprint or desc.get("udn")
@@ -4699,15 +3632,15 @@ async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool
         node["is_controller"] = True
         save_nodes()
     if node.get("type") == "sonos":
-        ip = _sonos_ip_from_url(node.get("url"))
+        ip = sonos_service.ip_from_url(node.get("url"))
         if not ip:
             raise HTTPException(status_code=400, detail="Invalid Sonos node URL")
         # Reuse the description we already fetched for fingerprinting when possible.
         if desc is None:
-            desc = await _sonos_fetch_description(ip)
+            desc = await sonos_service.fetch_description(ip)
 
         friendly_name = (desc.get("friendly_name") if isinstance(desc, dict) else None) or None
-        zone_name = await _sonos_get_zone_name(ip)
+        zone_name = await sonos_service.get_zone_name(ip)
         sonos_app_name = zone_name or friendly_name
 
         if isinstance(desc, dict):
@@ -4764,31 +3697,6 @@ async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool
     await broadcast_nodes()
     return public_node(node)
 
-async def _call_agent(node: dict, path: str, payload: dict) -> dict:
-    url = f"{node['url']}{path}"
-    secret = node.get("agent_secret")
-    if not secret:
-        raise HTTPException(status_code=409, detail="Node is not paired. Re-register or pair it first.")
-    headers = {"X-Agent-Secret": secret}
-    async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
-
-async def _get_agent(node: dict, path: str) -> dict:
-    url = f"{node['url']}{path}"
-    secret = node.get("agent_secret")
-    if not secret:
-        raise HTTPException(status_code=409, detail="Node is not paired. Re-register or pair it first.")
-    headers = {"X-Agent-Secret": secret}
-    async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.get(url, headers=headers)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text)
-    return resp.json()
-
 
 async def _assign_webrtc_stream(client_id: str, stream_id: str) -> None:
     if not client_id or not stream_id:
@@ -4797,7 +3705,7 @@ async def _assign_webrtc_stream(client_id: str, stream_id: str) -> None:
         await snapcast.set_client_stream(client_id, stream_id)
         return
     except Exception as exc:  # pragma: no cover - network dependency
-        if not _is_rpc_method_not_found_error(exc):
+        if not is_rpc_method_not_found_error(exc):
             log.warning("Failed to assign web relay client %s to %s: %s", client_id, stream_id, exc)
             raise
         group_id = await _snapcast_group_id_for_client(client_id)
@@ -4833,7 +3741,7 @@ async def _ensure_snapclient_stream(node: dict, channel: dict) -> str:
         try:
             await snapcast.set_client_stream(client["id"], stream_id)
         except RuntimeError as exc:  # pragma: no cover - network dependency
-            if _is_rpc_method_not_found_error(exc):
+            if is_rpc_method_not_found_error(exc):
                 group_id = client.get("_group_id")
                 if not group_id:
                     log.error("Snapclient %s missing group id; cannot switch stream", client.get("id"))
@@ -4864,15 +3772,15 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
         if node.get("type") == "browser" and webrtc_relay:
             await webrtc_relay.update_session_channel(node["id"], None, None)
         if node.get("type") == "sonos":
-            ip = _sonos_ip_from_url(node.get("url"))
+            ip = sonos_service.ip_from_url(node.get("url"))
             if ip:
                 async with sonos_reconcile_lock:
                     try:
-                        await _sonos_become_standalone(ip)
+                        await sonos_service.become_standalone(ip)
                     except Exception:
                         pass
                     try:
-                        await _sonos_stop(ip)
+                        await sonos_service.stop(ip)
                     except Exception:
                         pass
             node["connection_state"] = None
@@ -4885,7 +3793,7 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
     if not stream_id:
         raise HTTPException(status_code=400, detail="Channel is missing snap_stream mapping")
     if node.get("type") == "sonos":
-        ip = _sonos_ip_from_url(node.get("url"))
+        ip = sonos_service.ip_from_url(node.get("url"))
         if not ip:
             raise HTTPException(status_code=400, detail="Invalid Sonos node")
         node["connection_state"] = "connecting"
@@ -4893,7 +3801,7 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
         node["sonos_connecting_since"] = time.time()
         node["channel_id"] = resolved
         # Reconcile grouping based on updated desired assignments.
-        await _reconcile_sonos_groups()
+        await sonos_service.reconcile_groups()
         return
     if node.get("type") == "agent":
         client_id = await _ensure_snapclient_stream(node, channel)
@@ -4910,11 +3818,11 @@ async def _refresh_all_agent_nodes() -> None:
             if changed:
                 dirty = True
         elif node.get("type") == "sonos":
-            ip = _sonos_ip_from_url(node.get("url"))
+            ip = sonos_service.ip_from_url(node.get("url"))
             if not ip:
                 continue
             now = time.time()
-            reachable = await _sonos_ping(ip)
+            reachable = await sonos_service.ping(ip)
             prev_online = node.get("online") is not False
             node["online"] = bool(reachable)
             if reachable:
@@ -4931,7 +3839,7 @@ async def _refresh_all_agent_nodes() -> None:
                         async with httpx.AsyncClient(timeout=SONOS_CONTROL_TIMEOUT) as client:
                             resp = await client.get(f"http://{ip}:1400/support/review", headers=headers)
                         if resp.status_code == 200:
-                            parsed = _parse_sonos_network_from_review(resp.text)
+                            parsed = sonos_service.parse_network_from_review(resp.text)
                             if parsed and parsed != node.get("sonos_network"):
                                 node["sonos_network"] = parsed
                             node["sonos_network_last_refresh"] = now
@@ -4945,121 +3853,6 @@ async def _refresh_all_agent_nodes() -> None:
     if dirty:
         save_nodes()
         await broadcast_nodes()
-
-
-async def _sonos_discover() -> list[dict]:
-    """Discover Sonos speakers, preferring SSDP and falling back to HTTP scan."""
-    items = await _sonos_ssdp_discover()
-    if items:
-        return items
-    networks = _detect_discovery_networks()
-    if not networks:
-        return []
-    log.info("Sonos SSDP returned no devices; falling back to HTTP scan")
-    return await _sonos_http_scan(networks)
-
-
-async def _sonos_http_scan(networks: list[str]) -> list[dict]:
-    hosts = _hosts_for_networks(networks, limit=max(1, SONOS_SCAN_MAX_HOSTS))
-    if not hosts:
-        return []
-    sem = asyncio.Semaphore(max(4, SONOS_SCAN_CONCURRENCY))
-    found: dict[str, dict] = {}
-
-    async def _probe(ip: str) -> None:
-        async with sem:
-            desc = await _sonos_fetch_description(ip, timeout=SONOS_SCAN_HTTP_TIMEOUT)
-        if not desc:
-            return
-        udn = desc.get("udn")
-        if not desc.get("rincon") and not (isinstance(udn, str) and "RINCON_" in udn):
-            return
-        found[ip] = desc
-
-    await asyncio.gather(*(_probe(ip) for ip in hosts))
-    results: list[dict] = []
-    for ip, desc in found.items():
-        results.append(
-            {
-                "kind": "sonos",
-                "host": desc.get("friendly_name") or ip,
-                "url": f"sonos://{ip}",
-                "fingerprint": desc.get("udn"),
-                "version": "Sonos",
-            }
-        )
-    results.sort(key=lambda x: (x.get("host") or "", x.get("url") or ""))
-    return results
-
-
-async def _sonos_ssdp_discover() -> list[dict]:
-    """Discover Sonos devices using SSDP M-SEARCH."""
-    message = (
-        "M-SEARCH * HTTP/1.1\r\n"
-        f"HOST: {SONOS_SSDP_ADDR[0]}:{SONOS_SSDP_ADDR[1]}\r\n"
-        "MAN: \"ssdp:discover\"\r\n"
-        "MX: 1\r\n"
-        f"ST: {SONOS_DEVICE_TYPE}\r\n"
-        "\r\n"
-    ).encode("utf-8")
-    loop = asyncio.get_running_loop()
-    found: dict[str, dict] = {}
-
-    class _Proto(asyncio.DatagramProtocol):
-        def connection_made(self, transport):
-            self.transport = transport
-            try:
-                self.transport.sendto(message, SONOS_SSDP_ADDR)
-            except Exception:
-                pass
-
-        def datagram_received(self, data, addr):
-            try:
-                text = data.decode("utf-8", errors="ignore")
-            except Exception:
-                return
-            lines = [line.strip() for line in text.split("\r\n") if line.strip()]
-            headers = {}
-            for line in lines[1:]:
-                if ":" not in line:
-                    continue
-                k, v = line.split(":", 1)
-                headers[k.strip().lower()] = v.strip()
-            location = headers.get("location")
-            if not location:
-                return
-            host = addr[0]
-            found[host] = {"ip": host, "location": location}
-
-    transport = None
-    try:
-        transport, _ = await loop.create_datagram_endpoint(
-            lambda: _Proto(),
-            local_addr=("0.0.0.0", 0),
-        )
-        await asyncio.sleep(max(0.2, SONOS_DISCOVERY_TIMEOUT))
-    finally:
-        if transport:
-            transport.close()
-
-    results: list[dict] = []
-    for item in found.values():
-        ip = item.get("ip")
-        if not ip:
-            continue
-        desc = await _sonos_fetch_description(ip)
-        if not desc:
-            continue
-        results.append(
-            {
-                "kind": "sonos",
-                "host": desc.get("friendly_name") or ip,
-                "url": f"sonos://{ip}",
-                "fingerprint": desc.get("udn"),
-                "version": "Sonos",
-            }
-        )
-    return results
 
 
 async def _node_health_loop() -> None:
@@ -5123,11 +3916,29 @@ async def _stop_channel_due_to_idle(channel: dict) -> bool:
         log.info("Auto-stopped radio channel %s after %.0f seconds without listeners", cid, CHANNEL_IDLE_TIMEOUT)
         return True
     try:
-        await _spotify_control("/me/player/pause", "PUT", channel_id=cid)
+        await spotify_api.spotify_control(
+            "/me/player/pause",
+            "PUT",
+            channel_id=cid,
+            ensure_spotify_token=lambda identifier=None: _ensure_spotify_token(identifier),
+            spotify_request_func=lambda method, path, token, identifier=None, **kwargs: spotify_api.spotify_request(
+                method,
+                path,
+                token,
+                identifier,
+                spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
+                    token,
+                    identifier,
+                    current_spotify_creds=current_spotify_creds,
+                    save_token=spotify_config.save_token,
+                ),
+                **kwargs,
+            ),
+        )
         log.info("Auto-paused Spotify channel %s after %.0f seconds without listeners", cid, CHANNEL_IDLE_TIMEOUT)
         return True
     except HTTPException as exc:
-        parsed = _parse_spotify_error(exc.detail)
+        parsed = spotify_api.parse_spotify_error(exc.detail)
         reason = (parsed.get("reason") or "").strip().lower()
         message = (parsed.get("message") or "").strip()
         detail_text = message or (exc.detail if isinstance(exc.detail, str) else str(exc.detail))
@@ -5360,89 +4171,7 @@ async def _rediscover_node(node_id: str, fingerprint: str) -> None:
 
 
 
-@app.post("/api/playback/stop-all")
-async def stop_all_channel_playback() -> dict:
-    now = int(time.time())
-    spotify_stopped: list[str] = []
-    radio_stopped: list[str] = []
-    radio_states: dict[str, dict] = {}
-    errors: dict[str, str] = {}
-    radio_mutated = False
-    for cid in channel_order:
-        channel = channels_by_id.get(cid)
-        if not channel:
-            continue
-        source = (channel.get("source") or "spotify").lower()
-        if source == "radio":
-            require_radio_provider()
-            state = _ensure_radio_state(channel)
-            if state.get("playback_enabled", True):
-                state["playback_enabled"] = False
-                state["updated_at"] = now
-                channel["radio_state"] = state
-                radio_runtime_status[cid] = {
-                    "state": "idle",
-                    "message": "Radio stopped",
-                    "bitrate": None,
-                    "station_id": state.get("station_id"),
-                    "metadata": None,
-                    "updated_at": now,
-                    "started_at": None,
-                }
-                radio_states[cid] = state
-                radio_stopped.append(cid)
-                radio_mutated = True
-            continue
-        require_spotify_provider()
-        try:
-            await _spotify_control("/me/player/pause", "PUT", channel_id=cid)
-            spotify_stopped.append(cid)
-        except HTTPException as exc:
-            raw_detail = exc.detail
-            parsed = _parse_spotify_error(raw_detail)
-            reason = (parsed.get("reason") or "").strip().lower()
-            message = (parsed.get("message") or "").strip()
-            detail_text = message or (raw_detail if isinstance(raw_detail, str) else str(raw_detail))
-            if reason == "no_active_device" or "no active device" in detail_text.lower():
-                log.debug("Skipping Spotify pause for %s: no active device", cid)
-                continue
-            errors[cid] = detail_text or "Failed to pause Spotify playback"
-        except Exception as exc:  # pragma: no cover - defensive
-            errors[cid] = str(exc)
-    if radio_mutated:
-        save_channels()
-        _mark_radio_assignments_dirty()
-    return {
-        "ok": True,
-        "spotify_stopped": spotify_stopped,
-        "radio_stopped": radio_stopped,
-        "radio_states": radio_states,
-        "errors": errors,
-    }
-
-
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
-
-@app.get("/", include_in_schema=False)
-async def serve_index():
-    index_path = STATIC_DIR / "index.html"
-    if not index_path.exists():
-        raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(index_path)
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-async def favicon():
-    # No asset yet; avoid 404 noise
-    return Response(status_code=204)
-
-
-@app.get("/web-node", include_in_schema=False)
-async def serve_web_node():
-    path = STATIC_DIR / "web-node.html"
-    if not path.exists():
-        raise HTTPException(status_code=404, detail="UI not found")
-    return FileResponse(path)
