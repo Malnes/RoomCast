@@ -41,6 +41,7 @@ from providers import radio as radio_provider
 from providers import audiobookshelf as audiobookshelf_provider
 
 from api.auth import create_auth_router
+from api.channels import create_channels_router
 from api.nodes import NodeRegistration, VolumePayload, create_nodes_router
 from api.providers import create_providers_router
 from api.spotify import create_spotify_router
@@ -1386,23 +1387,6 @@ async def _apply_channel_routing(channel_id: str) -> None:
         log.warning("Channel routing: Sonos reconcile failed: %s", exc)
 
     save_nodes()
-class SpotifyConfig(BaseModel):
-    device_name: str = Field(default="RoomCast")
-    bitrate: int = Field(default=320, ge=96, le=320)
-    initial_volume: int = Field(default=75, ge=0, le=100)
-    normalisation: bool = Field(default=True)
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    redirect_uri: Optional[str] = None
-
-
-class ChannelUpdatePayload(BaseModel):
-    name: Optional[str] = Field(default=None, min_length=1, max_length=120)
-    color: Optional[str] = Field(default=None, min_length=1, max_length=7)
-    order: Optional[int] = Field(default=None, ge=1, le=50)
-    snap_stream: Optional[str] = Field(default=None, min_length=1, max_length=160)
-    enabled: Optional[bool] = None
-    source_ref: Optional[str] = Field(default=None, max_length=60)
 
 
 class SnapcastClient:
@@ -2331,10 +2315,38 @@ app.include_router(
 
 
 app.include_router(
+    create_channels_router(
+        get_channels_by_id=lambda: channels_by_id,
+        get_channel_order=lambda: channel_order,
+        get_nodes=lambda: nodes,
+        get_sources_by_id=lambda: sources_by_id,
+        load_token=lambda source_id: load_token(source_id),
+        require_admin=require_admin,
+        resolve_channel_id=lambda channel_id: resolve_channel_id(channel_id),
+        channel_detail=lambda channel_id: channel_detail(channel_id),
+        all_channel_details=lambda: all_channel_details(),
+        update_channel_metadata=lambda channel_id, updates: update_channel_metadata(channel_id, updates),
+        apply_channel_routing=lambda channel_id: _apply_channel_routing(channel_id),
+        broadcast_nodes=lambda: broadcast_nodes(),
+        set_node_channel=lambda node, channel_id: _set_node_channel(node, channel_id),
+        normalize_channel_entry=lambda entry, fallback_order: _normalize_channel_entry(entry, fallback_order=fallback_order),
+        resequence_channel_order=lambda: _resequence_channel_order(),
+        primary_channel_id=lambda: _primary_channel_id(),
+        save_channels=lambda: save_channels(),
+        save_nodes=lambda: save_nodes(),
+        channel_id_prefix=CHANNEL_ID_PREFIX,
+    )
+)
+
+
+app.include_router(
     create_spotify_router(
         require_spotify_provider_dep=lambda: require_spotify_provider(),
         resolve_channel_id=lambda channel_id: resolve_channel_id(channel_id),
         resolve_spotify_source_id=lambda identifier: _resolve_spotify_source_id(identifier),
+        read_spotify_config=lambda identifier: read_spotify_config(identifier),
+        get_spotify_source=lambda source_id: get_spotify_source(source_id),
+        spotify_redirect_uri=SPOTIFY_REDIRECT_URI,
         current_spotify_creds=lambda source_id: current_spotify_creds(source_id),
         token_signer=TOKEN_SIGNER,
         save_token=lambda token, source_id: save_token(token, source_id),
@@ -5388,150 +5400,6 @@ async def _rediscover_node(node_id: str, fingerprint: str) -> None:
     finally:
         node_rediscovery_tasks.pop(node_id, None)
 
-
-@app.get("/api/channels")
-async def list_channels_api() -> dict:
-    return {"channels": all_channel_details()}
-
-
-class ChannelCountPayload(BaseModel):
-    count: int = Field(ge=1, le=10)
-
-
-@app.post("/api/channels/count")
-async def set_channels_count_api(payload: ChannelCountPayload, _: dict = Depends(require_admin)) -> dict:
-    desired = int(payload.count)
-    desired = max(1, min(10, desired))
-
-    keep_ids = [f"{CHANNEL_ID_PREFIX}{idx}" for idx in range(1, desired + 1)]
-    keep_set = set(keep_ids)
-    removed_ids = [cid for cid in list(channels_by_id.keys()) if cid not in keep_set]
-
-    # Ensure target channels exist, preserve existing entries when possible.
-    for idx, cid in enumerate(keep_ids, start=1):
-        existing = channels_by_id.get(cid)
-        if existing:
-            existing["order"] = idx
-            continue
-        defaults = {
-            "id": cid,
-            "name": f"Channel {idx}",
-            "order": idx,
-            "snap_stream": f"Spotify_CH{idx}",
-            "fifo_path": f"/tmp/snapfifo-{cid}",
-            "enabled": True,
-            "source": "none",
-            "source_ref": None,
-        }
-        channels_by_id[cid] = _normalize_channel_entry(defaults, fallback_order=idx)
-
-    # Remove channels outside the desired range.
-    for cid in removed_ids:
-        channels_by_id.pop(cid, None)
-
-    # Re-sequence and persist channels.
-    _resequence_channel_order()
-    save_channels()
-
-    # Reassign nodes that were pointing at removed channels.
-    primary = keep_ids[0] if keep_ids else _primary_channel_id()
-    moved = 0
-    for node in list(nodes.values()):
-        raw_channel = (node.get("channel_id") or "").strip().lower()
-        if raw_channel and raw_channel not in channels_by_id:
-            try:
-                await _set_node_channel(node, primary)
-                moved += 1
-            except Exception as exc:
-                log.warning("Failed to move node %s to %s after channel resize: %s", node.get("id"), primary, exc)
-    if moved:
-        save_nodes()
-        await broadcast_nodes()
-
-    return {"ok": True, "count": len(channel_order), "channels": all_channel_details()}
-
-
-@app.get("/api/sources")
-async def list_sources_api() -> dict:
-    sources = []
-    for sid, source in sorted(sources_by_id.items()):
-        if not isinstance(source, dict):
-            continue
-        kind = source.get("kind")
-        if kind != "spotify":
-            continue
-        token = load_token(sid)
-        sources.append({
-            "id": sid,
-            "kind": kind,
-            "name": source.get("name") or sid,
-            "snap_stream": source.get("snap_stream"),
-            "has_oauth_token": bool(token and token.get("access_token")),
-        })
-    return {"sources": sources}
-
-
-@app.patch("/api/channels/{channel_id}")
-async def update_channel_api(channel_id: str, payload: ChannelUpdatePayload) -> dict:
-    updates = payload.model_dump(exclude_unset=True)
-    if updates:
-        result = update_channel_metadata(channel_id, updates)
-        if bool(result.get("_routing_changed")):
-            await _apply_channel_routing(channel_id)
-            await broadcast_nodes()
-    return {"ok": True, "channel": channel_detail(resolve_channel_id(channel_id))}
-
-
-@app.get("/api/config/spotify")
-async def get_spotify_config(
-    channel_id: Optional[str] = Query(default=None),
-    source_id: Optional[str] = Query(default=None),
-    _: None = Depends(require_spotify_provider),
-) -> dict:
-    target = source_id if source_id else resolve_channel_id(channel_id)
-    return read_spotify_config(target)
-
-
-@app.post("/api/config/spotify")
-async def set_spotify_config(
-    cfg: SpotifyConfig,
-    channel_id: Optional[str] = Query(default=None),
-    source_id: Optional[str] = Query(default=None),
-    _: None = Depends(require_spotify_provider),
-) -> dict:
-    resolved_channel = resolve_channel_id(channel_id)
-    target = source_id if source_id else resolved_channel
-    spotify_source_id = _resolve_spotify_source_id(target)
-    if spotify_source_id is None:
-        raise HTTPException(status_code=400, detail="Spotify source not configured")
-    source = get_spotify_source(spotify_source_id)
-    cfg_path = Path(source["config_path"])
-    payload = cfg.model_dump()
-    existing = {}
-    if cfg_path.exists():
-        try:
-            existing = json.loads(cfg_path.read_text())
-        except json.JSONDecodeError:
-            existing = {}
-
-    if not payload.get("client_secret"):
-        payload["client_secret"] = existing.get("client_secret") or os.getenv("SPOTIFY_CLIENT_SECRET")
-    if not payload.get("client_id"):
-        payload["client_id"] = existing.get("client_id") or os.getenv("SPOTIFY_CLIENT_ID")
-    if not payload.get("redirect_uri"):
-        payload["redirect_uri"] = existing.get("redirect_uri") or SPOTIFY_REDIRECT_URI
-
-    # Keep env vars aligned with the default Spotify A instance for backwards compatibility.
-    if spotify_source_id == "spotify:a" and payload.get("client_id"):
-        os.environ["SPOTIFY_CLIENT_ID"] = payload["client_id"]
-    if spotify_source_id == "spotify:a" and payload.get("client_secret"):
-        os.environ["SPOTIFY_CLIENT_SECRET"] = payload["client_secret"]
-    if spotify_source_id == "spotify:a" and payload.get("redirect_uri"):
-        os.environ["SPOTIFY_REDIRECT_URI"] = payload["redirect_uri"]
-
-    cfg_path.parent.mkdir(parents=True, exist_ok=True)
-    cfg_path.write_text(json.dumps(payload, indent=2))
-    return {"ok": True, "config": read_spotify_config(target)}
 
 
 def _abs_settings() -> dict:

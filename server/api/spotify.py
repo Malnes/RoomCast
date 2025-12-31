@@ -1,5 +1,7 @@
 import json
+import os
 import time
+from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
@@ -24,11 +26,24 @@ class ActivateRoomcastPayload(BaseModel):
     play: bool = Field(default=False, description="Start playback immediately after transfer")
 
 
+class SpotifyConfig(BaseModel):
+    device_name: str = Field(default="RoomCast")
+    bitrate: int = Field(default=320, ge=96, le=320)
+    initial_volume: int = Field(default=75, ge=0, le=100)
+    normalisation: bool = Field(default=True)
+    client_id: Optional[str] = None
+    client_secret: Optional[str] = None
+    redirect_uri: Optional[str] = None
+
+
 def create_spotify_router(
     *,
     require_spotify_provider_dep: Callable[[], None],
     resolve_channel_id: Callable[[Optional[str]], str],
     resolve_spotify_source_id: Callable[[Optional[str]], Optional[str]],
+    read_spotify_config: Callable[[str], dict],
+    get_spotify_source: Callable[[str], dict],
+    spotify_redirect_uri: str,
     current_spotify_creds: Callable[[str], tuple[str, str, str]],
     token_signer: Any,
     save_token: Callable[[dict, str], None],
@@ -93,6 +108,56 @@ def create_spotify_router(
         if spotify_source_id is None:
             return {"state": "unknown", "message": "Not a Spotify source"}
         return read_librespot_status(spotify_source_id)
+
+    @router.get("/api/config/spotify")
+    async def get_spotify_config(
+        channel_id: Optional[str] = Query(default=None),
+        source_id: Optional[str] = Query(default=None),
+        _: None = Depends(require_spotify_provider_dep),
+    ) -> dict:
+        target = source_id if source_id else resolve_channel_id(channel_id)
+        return read_spotify_config(target)
+
+    @router.post("/api/config/spotify")
+    async def set_spotify_config(
+        cfg: SpotifyConfig,
+        channel_id: Optional[str] = Query(default=None),
+        source_id: Optional[str] = Query(default=None),
+        _: None = Depends(require_spotify_provider_dep),
+    ) -> dict:
+        resolved_channel = resolve_channel_id(channel_id)
+        target = source_id if source_id else resolved_channel
+        spotify_source_id = resolve_spotify_source_id(target)
+        if spotify_source_id is None:
+            raise HTTPException(status_code=400, detail="Spotify source not configured")
+        source = get_spotify_source(spotify_source_id)
+        cfg_path = Path(source["config_path"])
+        payload = cfg.model_dump()
+        existing: dict = {}
+        if cfg_path.exists():
+            try:
+                existing = json.loads(cfg_path.read_text())
+            except json.JSONDecodeError:
+                existing = {}
+
+        if not payload.get("client_secret"):
+            payload["client_secret"] = existing.get("client_secret") or os.getenv("SPOTIFY_CLIENT_SECRET")
+        if not payload.get("client_id"):
+            payload["client_id"] = existing.get("client_id") or os.getenv("SPOTIFY_CLIENT_ID")
+        if not payload.get("redirect_uri"):
+            payload["redirect_uri"] = existing.get("redirect_uri") or spotify_redirect_uri
+
+        # Keep env vars aligned with the default Spotify A instance for backwards compatibility.
+        if spotify_source_id == "spotify:a" and payload.get("client_id"):
+            os.environ["SPOTIFY_CLIENT_ID"] = payload["client_id"]
+        if spotify_source_id == "spotify:a" and payload.get("client_secret"):
+            os.environ["SPOTIFY_CLIENT_SECRET"] = payload["client_secret"]
+        if spotify_source_id == "spotify:a" and payload.get("redirect_uri"):
+            os.environ["SPOTIFY_REDIRECT_URI"] = payload["redirect_uri"]
+
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(payload, indent=2))
+        return {"ok": True, "config": read_spotify_config(target)}
 
     @router.get("/api/spotify/auth-url")
     async def spotify_auth_url(
