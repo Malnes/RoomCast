@@ -63,6 +63,8 @@ from services.node_registration import NodeRegistrationService
 from services.node_terminal import NodeTerminalService
 from services.node_discovery import NodeDiscoveryService
 from services.node_health import NodeHealthService
+from services.provider_runtime import ProviderRuntimeService
+from services.channel_idle import ChannelIdleService
 from services.web_node_approval import WebNodeApprovalService
 from services.auth_service import AuthService
 from services.node_broadcast import NodeBroadcastService
@@ -368,11 +370,6 @@ def spotify_instance_count() -> int:
     return 2 if value >= 2 else 1
 
 
-def _controller_container_id() -> str:
-    # In Docker, HOSTNAME is set to the container id (short).
-    return (os.getenv("HOSTNAME", "") or "").strip()
-
-
 def require_spotify_provider() -> None:
     if not is_provider_enabled("spotify"):
         raise HTTPException(status_code=503, detail="Spotify provider is not installed")
@@ -386,50 +383,6 @@ def require_radio_provider() -> None:
 def require_audiobookshelf_provider() -> None:
     if not is_provider_enabled("audiobookshelf"):
         raise HTTPException(status_code=503, detail="Audiobookshelf provider is not installed")
-
-
-def _reconcile_spotify_runtime(instances: int) -> None:
-    image = (os.getenv("ROOMCAST_LIBRESPOT_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-librespot:latest"
-    try:
-        spotify_provider.reconcile_runtime(
-            controller_container_id=_controller_container_id(),
-            instances=instances,
-            librespot_image=image,
-            fallback_name_a=LIBRESPOT_FALLBACK_NAME,
-            fallback_name_b=os.getenv("LIBRESPOT_NAME_CH2", "RoomCast CH2"),
-        )
-    except DockerUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-
-
-def _reconcile_radio_runtime(enabled: bool) -> None:
-    image = (os.getenv("ROOMCAST_RADIO_WORKER_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-radio-worker:latest"
-    try:
-        radio_provider.reconcile_runtime(
-            controller_container_id=_controller_container_id(),
-            enabled=enabled,
-            radio_worker_image=image,
-            controller_base_url=os.getenv("CONTROLLER_BASE_URL", "http://controller:8000"),
-            radio_worker_token=RADIO_WORKER_TOKEN,
-            assignment_interval=int(os.getenv("RADIO_ASSIGNMENT_INTERVAL", "10")),
-        )
-    except DockerUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
-
-
-def _reconcile_audiobookshelf_runtime(enabled: bool) -> None:
-    image = (os.getenv("ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-audiobookshelf-worker:latest"
-    try:
-        audiobookshelf_provider.reconcile_runtime(
-            controller_container_id=_controller_container_id(),
-            enabled=enabled,
-            worker_image=image,
-            controller_base_url=os.getenv("CONTROLLER_BASE_URL", "http://controller:8000"),
-            worker_token=ABS_WORKER_TOKEN,
-            assignment_interval=int(os.getenv("AUDIOBOOKSHELF_ASSIGNMENT_INTERVAL", "10")),
-        )
-    except DockerUnavailable as exc:
-        raise HTTPException(status_code=503, detail=str(exc))
 
 
 def _ensure_channel_exists(channel_id: str, *, name: str, order: int, snap_stream: str, fifo_path: str) -> None:
@@ -449,75 +402,6 @@ def _ensure_channel_exists(channel_id: str, *, name: str, order: int, snap_strea
     }, fallback_order=order)
     channels_by_id[cid] = entry
     channel_order.append(cid)
-
-
-def _apply_spotify_provider(instances: int) -> None:
-    instances = 2 if instances >= 2 else 1
-    sources_entries = spotify_provider.desired_source_entries(
-        instances=instances,
-        config_path_a=str(CONFIG_PATH),
-        token_path_a=str(SPOTIFY_TOKEN_PATH),
-        status_path_a=str(LIBRESPOT_STATUS_PATH),
-        config_path_b="/config/spotify-ch2.json",
-        token_path_b="/config/spotify-token-ch2.json",
-        status_path_b="/config/librespot-status-ch2.json",
-    )
-    _write_sources_file(sources_entries)
-    load_sources()
-    _reconcile_spotify_runtime(instances)
-
-
-def _disable_spotify_provider() -> None:
-    # Remove spotify sources and detach channels.
-    sources_by_id.pop("spotify:a", None)
-    sources_by_id.pop("spotify:b", None)
-    if SOURCES_PATH.exists():
-        save_sources()
-
-    for cid, channel in channels_by_id.items():
-        if (channel.get("source") or "").strip().lower() == "spotify":
-            channel["source"] = "none"
-            channel["source_ref"] = None
-            channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
-            channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
-    save_channels()
-    spotify_provider.stop_runtime()
-
-
-def _apply_radio_provider() -> None:
-    # Radio is a per-channel source; do not auto-create channels.
-    _reconcile_radio_runtime(True)
-
-
-def _apply_audiobookshelf_provider() -> None:
-    # Audiobookshelf is a per-channel source; do not auto-create channels.
-    _reconcile_audiobookshelf_runtime(True)
-
-
-def _disable_radio_provider() -> None:
-    # Detach radio channels.
-    for channel in channels_by_id.values():
-        if (channel.get("source") or "").strip().lower() == "radio":
-            channel["source"] = "none"
-            channel["source_ref"] = None
-            channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
-            channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
-            channel.pop("radio_state", None)
-    save_channels()
-    _reconcile_radio_runtime(False)
-
-
-def _disable_audiobookshelf_provider() -> None:
-    # Detach Audiobookshelf channels.
-    for channel in channels_by_id.values():
-        if (channel.get("source") or "").strip().lower() == "audiobookshelf":
-            channel["source"] = "none"
-            channel["source_ref"] = None
-            channel["snap_stream"] = f"Spotify_CH{channel.get('order', 1)}"
-            channel["fifo_path"] = f"/tmp/snapfifo-{channel['id']}"
-            channel.pop("abs_state", None)
-    save_channels()
-    _reconcile_audiobookshelf_runtime(False)
 
 
 def _sanitize_channel_color(value: Optional[str]) -> Optional[str]:
@@ -1324,46 +1208,6 @@ def _public_snap_client(client: dict, snapclient_nodes: dict[str, dict]) -> dict
     return payload
 
 
-async def _collect_channel_listener_counts() -> tuple[dict[str, int], bool]:
-    """Return (per-channel listeners, has_any_data)."""
-    counts: dict[str, int] = {cid: 0 for cid in channel_order}
-    stream_to_channel: dict[str, str] = {}
-    for cid in channel_order:
-        channel = channels_by_id.get(cid)
-        if not channel:
-            continue
-        stream_id = (channel.get("snap_stream") or "").strip()
-        if stream_id:
-            stream_to_channel[stream_id] = cid
-    data_sources = 0
-    try:
-        clients = await snapcast.list_clients()
-    except Exception as exc:  # pragma: no cover - network dependency
-        log.warning("Channel idle monitor: failed to list snapclients: %s", exc)
-        clients = None
-    if clients is not None:
-        data_sources += 1
-        for client in clients:
-            stream_id = client.get("_stream_id")
-            if not stream_id:
-                continue
-            cid = stream_to_channel.get(stream_id)
-            if not cid or not client.get("connected"):
-                continue
-            counts[cid] = counts.get(cid, 0) + 1
-    if webrtc_relay:
-        try:
-            webrtc_counts = await webrtc_relay.channel_listener_counts()
-        except Exception as exc:  # pragma: no cover - defensive logging
-            log.warning("Channel idle monitor: failed to read WebRTC listeners: %s", exc)
-        else:
-            data_sources += 1
-            for cid, value in (webrtc_counts or {}).items():
-                if value:
-                    counts[cid] = counts.get(cid, 0) + int(value)
-    return counts, data_sources > 0
-
-
 
 
 PUBLIC_API_PATHS = {
@@ -1432,7 +1276,7 @@ ABS_ASSIGNMENT_DEFAULT_WAIT = float(os.getenv("AUDIOBOOKSHELF_ASSIGNMENT_WAIT", 
 ABS_ASSIGNMENT_DEFAULT_WAIT = max(1.0, min(ABS_ASSIGNMENT_DEFAULT_WAIT, 30.0))
 ABS_ASSIGNMENT_MAX_WAIT = 30.0
 channel_idle_task: Optional[asyncio.Task] = None
-channel_idle_state: Dict[str, dict] = {}
+
 
 sonos_connection_task: Optional[asyncio.Task] = None
 sonos_reconcile_lock = asyncio.Lock()
@@ -1515,6 +1359,62 @@ node_health_service = NodeHealthService(
     sonos_service=sonos_service,
     sonos_http_user_agent=SONOS_HTTP_USER_AGENT,
     sonos_control_timeout=SONOS_CONTROL_TIMEOUT,
+)
+
+
+provider_runtime_service = ProviderRuntimeService(
+    spotify_provider=spotify_provider,
+    radio_provider=radio_provider,
+    audiobookshelf_provider=audiobookshelf_provider,
+    write_sources_file=_write_sources_file,
+    load_sources=load_sources,
+    save_sources=save_sources,
+    save_channels=save_channels,
+    sources_by_id=sources_by_id,
+    channels_by_id=channels_by_id,
+    sources_path=SOURCES_PATH,
+    config_path=CONFIG_PATH,
+    spotify_token_path=SPOTIFY_TOKEN_PATH,
+    librespot_status_path=LIBRESPOT_STATUS_PATH,
+    librespot_fallback_name=LIBRESPOT_FALLBACK_NAME,
+    radio_worker_token=RADIO_WORKER_TOKEN,
+    abs_worker_token=ABS_WORKER_TOKEN,
+)
+
+
+channel_idle_service = ChannelIdleService(
+    channel_order=channel_order,
+    channels_by_id=channels_by_id,
+    nodes=nodes,
+    snapcast=snapcast,
+    get_webrtc_relay=lambda: webrtc_relay,
+    ensure_radio_state=lambda channel: _ensure_radio_state(channel),
+    save_channels=lambda: save_channels(),
+    mark_radio_assignments_dirty=lambda: _mark_radio_assignments_dirty(),
+    radio_runtime_status=radio_runtime_status,
+    spotify_pause=lambda channel_id: spotify_api.spotify_control(
+        "/me/player/pause",
+        "PUT",
+        channel_id=channel_id,
+        ensure_spotify_token=lambda identifier=None: _ensure_spotify_token(identifier),
+        spotify_request_func=lambda method, path, token, identifier=None, **kwargs: spotify_api.spotify_request(
+            method,
+            path,
+            token,
+            identifier,
+            spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
+                token,
+                identifier,
+                current_spotify_creds=current_spotify_creds,
+                save_token=spotify_config.save_token,
+            ),
+            **kwargs,
+        ),
+    ),
+    parse_spotify_error=lambda detail: spotify_api.parse_spotify_error(detail),
+    idle_timeout=CHANNEL_IDLE_TIMEOUT,
+    poll_interval=CHANNEL_IDLE_POLL_INTERVAL,
+    logger=log,
 )
 
 
@@ -1827,12 +1727,12 @@ app.include_router(
         save_providers_state=save_providers_state,
         require_admin=require_admin,
         spotify_provider=spotify_provider,
-        apply_spotify_provider=_apply_spotify_provider,
-        disable_spotify_provider=_disable_spotify_provider,
-        apply_radio_provider=_apply_radio_provider,
-        disable_radio_provider=_disable_radio_provider,
-        apply_audiobookshelf_provider=_apply_audiobookshelf_provider,
-        disable_audiobookshelf_provider=_disable_audiobookshelf_provider,
+        apply_spotify_provider=provider_runtime_service.apply_spotify_provider,
+        disable_spotify_provider=provider_runtime_service.disable_spotify_provider,
+        apply_radio_provider=provider_runtime_service.apply_radio_provider,
+        disable_radio_provider=provider_runtime_service.disable_radio_provider,
+        apply_audiobookshelf_provider=provider_runtime_service.apply_audiobookshelf_provider,
+        disable_audiobookshelf_provider=provider_runtime_service.disable_audiobookshelf_provider,
     )
 )
 
@@ -2698,14 +2598,14 @@ async def _startup_events() -> None:
     # If a provider is installed+enabled, reconcile its runtime containers here.
     try:
         if is_provider_enabled("spotify"):
-            _reconcile_spotify_runtime(spotify_instance_count())
+            provider_runtime_service.reconcile_spotify_runtime(spotify_instance_count())
         else:
             # Best-effort cleanup (do not mutate config/channels).
             try:
                 spotify_provider.stop_runtime()
             except DockerUnavailable:
                 pass
-        _reconcile_radio_runtime(is_provider_enabled("radio"))
+        provider_runtime_service.reconcile_radio_runtime(is_provider_enabled("radio"))
     except HTTPException as exc:
         log.warning("Provider runtime reconcile skipped: %s", exc.detail)
     except Exception:  # pragma: no cover - defensive
@@ -2730,7 +2630,7 @@ async def _startup_events() -> None:
             CHANNEL_IDLE_TIMEOUT,
             CHANNEL_IDLE_POLL_INTERVAL,
         )
-        channel_idle_task = asyncio.create_task(_channel_idle_loop())
+        channel_idle_task = asyncio.create_task(channel_idle_service.loop())
 
     if sonos_connection_task is None:
         sonos_connection_task = asyncio.create_task(sonos_service.connection_loop())
@@ -2895,147 +2795,6 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
     elif node.get("type") == "browser" and webrtc_relay:
         await webrtc_relay.update_session_channel(node["id"], resolved, stream_id)
     node["channel_id"] = resolved
-
-
-def _channel_should_monitor(channel: dict) -> bool:
-    if not channel.get("enabled", True):
-        return False
-    if not channel.get("snap_stream"):
-        return False
-    source = (channel.get("source") or "spotify").lower()
-    if source == "radio":
-        state = _ensure_radio_state(channel)
-        return bool(state.get("playback_enabled", True) and state.get("stream_url"))
-    return True
-
-
-def _channel_has_active_hardware_listeners(channel_id: str) -> bool:
-    if not channel_id:
-        return False
-    for node in nodes.values():
-        if node.get("type") == "browser":
-            continue
-        if node.get("channel_id") != channel_id:
-            continue
-        if node.get("online"):
-            return True
-    return False
-
-
-async def _stop_channel_due_to_idle(channel: dict) -> bool:
-    cid = channel.get("id") or ""
-    if not cid:
-        return False
-    source = (channel.get("source") or "spotify").lower()
-    if source == "radio":
-        state = _ensure_radio_state(channel)
-        if not state.get("playback_enabled", True):
-            return False
-        now = int(time.time())
-        state["playback_enabled"] = False
-        state["updated_at"] = now
-        channel["radio_state"] = state
-        save_channels()
-        _mark_radio_assignments_dirty()
-        radio_runtime_status[cid] = {
-            "state": "idle",
-            "message": "Radio stopped (no listeners)",
-            "bitrate": None,
-            "station_id": state.get("station_id"),
-            "metadata": None,
-            "updated_at": now,
-            "started_at": None,
-        }
-        log.info("Auto-stopped radio channel %s after %.0f seconds without listeners", cid, CHANNEL_IDLE_TIMEOUT)
-        return True
-    try:
-        await spotify_api.spotify_control(
-            "/me/player/pause",
-            "PUT",
-            channel_id=cid,
-            ensure_spotify_token=lambda identifier=None: _ensure_spotify_token(identifier),
-            spotify_request_func=lambda method, path, token, identifier=None, **kwargs: spotify_api.spotify_request(
-                method,
-                path,
-                token,
-                identifier,
-                spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
-                    token,
-                    identifier,
-                    current_spotify_creds=current_spotify_creds,
-                    save_token=spotify_config.save_token,
-                ),
-                **kwargs,
-            ),
-        )
-        log.info("Auto-paused Spotify channel %s after %.0f seconds without listeners", cid, CHANNEL_IDLE_TIMEOUT)
-        return True
-    except HTTPException as exc:
-        parsed = spotify_api.parse_spotify_error(exc.detail)
-        reason = (parsed.get("reason") or "").strip().lower()
-        message = (parsed.get("message") or "").strip()
-        detail_text = message or (exc.detail if isinstance(exc.detail, str) else str(exc.detail))
-        if reason == "no_active_device" or (
-            isinstance(detail_text, str) and "no active device" in detail_text.lower()
-        ):
-            log.debug("Auto-stop skipped for Spotify channel %s: no active device", cid)
-            return True
-        log.warning("Auto-stop failed for Spotify channel %s: %s", cid, detail_text)
-        return False
-    except Exception as exc:  # pragma: no cover - defensive
-        log.exception("Auto-stop failed for Spotify channel %s", cid)
-        return False
-
-
-async def _evaluate_channel_idle() -> None:
-    counts, has_data = await _collect_channel_listener_counts()
-    if not has_data:
-        return
-    now = time.time()
-    tracked: set[str] = set()
-    for cid in channel_order:
-        channel = channels_by_id.get(cid)
-        if not channel:
-            channel_idle_state.pop(cid, None)
-            continue
-        if not _channel_should_monitor(channel):
-            channel_idle_state.pop(cid, None)
-            continue
-        tracked.add(cid)
-        listeners = counts.get(cid, 0)
-        if listeners <= 0 and _channel_has_active_hardware_listeners(cid):
-            listeners = 1
-        state = channel_idle_state.setdefault(cid, {"idle_since": None, "stopped": False})
-        if listeners > 0:
-            state["idle_since"] = None
-            state["stopped"] = False
-            state["last_active"] = now
-            continue
-        if state.get("idle_since") is None:
-            state["idle_since"] = now
-        idle_for = now - (state.get("idle_since") or now)
-        if idle_for < CHANNEL_IDLE_TIMEOUT or state.get("stopped"):
-            continue
-        stopped = await _stop_channel_due_to_idle(channel)
-        if stopped:
-            state["stopped"] = True
-    for cid in list(channel_idle_state.keys()):
-        if cid not in tracked:
-            channel_idle_state.pop(cid, None)
-
-
-async def _channel_idle_loop() -> None:
-    try:
-        while True:
-            try:
-                await _evaluate_channel_idle()
-            except Exception:
-                log.exception("Channel idle monitor iteration failed")
-            await asyncio.sleep(CHANNEL_IDLE_POLL_INTERVAL)
-    except asyncio.CancelledError:
-        pass
-
-
 
 
 @app.exception_handler(HTTPException)
