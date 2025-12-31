@@ -61,6 +61,8 @@ from services.channels import ChannelsService
 from services.nodes_store import NodesStore
 from services.node_registration import NodeRegistrationService
 from services.node_terminal import NodeTerminalService
+from services.web_node_approval import WebNodeApprovalService
+from services.auth_service import AuthService
 from services.sonos import SonosService
 from services.spotify_config import SpotifyConfigService
 
@@ -1375,16 +1377,27 @@ PUBLIC_API_PREFIXES = (
 )
 
 
+auth_service = AuthService(
+    users_path=USERS_PATH,
+    server_default_name=SERVER_DEFAULT_NAME,
+    session_signer=SESSION_SIGNER,
+    session_cookie_name=SESSION_COOKIE_NAME,
+    session_cookie_secure=SESSION_COOKIE_SECURE,
+    session_cookie_samesite=SESSION_COOKIE_SAMESITE,
+    session_max_age=SESSION_MAX_AGE,
+)
+
+
 @app.middleware("http")
 async def session_middleware(request: Request, call_next):
     path = request.url.path
     token = request.cookies.get(SESSION_COOKIE_NAME)
-    request.state.user = _resolve_session_user(token)
+    request.state.user = auth_service.resolve_session_user(token)
     is_worker_endpoint = path.startswith(RADIO_WORKER_PATH_PREFIX) or path.startswith(ABS_WORKER_PATH_PREFIX)
     is_public_path = path in PUBLIC_API_PATHS or path.startswith(PUBLIC_API_PREFIXES)
     requires_auth = path.startswith("/api/") and (not is_worker_endpoint) and (not is_public_path)
     if requires_auth:
-        initialized = _is_initialized()
+        initialized = auth_service.is_initialized()
         if not initialized and path != "/api/auth/initialize":
             return JSONResponse(status_code=403, content={"detail": "Instance setup required"})
         if initialized and request.state.user is None:
@@ -1406,9 +1419,6 @@ agent_refresh_tasks: Dict[str, asyncio.Task] = {}
 node_health_task: Optional[asyncio.Task] = None
 spotify_refresh_task: Optional[asyncio.Task] = None
 node_rediscovery_tasks: Dict[str, asyncio.Task] = {}
-auth_state: dict = {"server_name": SERVER_DEFAULT_NAME, "users": []}
-users_by_id: Dict[str, dict] = {}
-users_by_username: Dict[str, dict] = {}
 radio_runtime_status: Dict[str, dict] = {}
 radio_assignments_version = 1
 radio_assignment_waiters: set[asyncio.Future] = set()
@@ -1424,7 +1434,6 @@ ABS_ASSIGNMENT_DEFAULT_WAIT = max(1.0, min(ABS_ASSIGNMENT_DEFAULT_WAIT, 30.0))
 ABS_ASSIGNMENT_MAX_WAIT = 30.0
 channel_idle_task: Optional[asyncio.Task] = None
 channel_idle_state: Dict[str, dict] = {}
-pending_web_node_requests: Dict[str, dict] = {}
 
 sonos_connection_task: Optional[asyncio.Task] = None
 sonos_reconcile_lock = asyncio.Lock()
@@ -1434,6 +1443,19 @@ node_terminal_service = NodeTerminalService(
     ssh_password_default=NODE_TERMINAL_SSH_PASSWORD,
     ssh_key_path_default=NODE_TERMINAL_SSH_KEY_PATH,
     ssh_port_default=NODE_TERMINAL_SSH_PORT,
+)
+
+
+web_node_approval_service = WebNodeApprovalService(
+    webrtc_enabled=WEBRTC_ENABLED,
+    get_webrtc_relay=lambda: webrtc_relay,
+    create_browser_node=lambda name: create_browser_node(name),
+    resolve_node_channel_id=lambda node: resolve_node_channel_id(node),
+    get_channel_by_id=lambda channel_id: channels_by_id.get(channel_id) if channel_id else None,
+    normalize_stereo_mode=lambda value: _normalize_stereo_mode(value),
+    teardown_browser_node=lambda node_id: teardown_browser_node(node_id),
+    broadcast_nodes=lambda: broadcast_nodes(),
+    broadcast_payload=lambda payload: _broadcast_to_node_watchers(payload),
 )
 
 
@@ -1705,209 +1727,8 @@ def _apply_volume_limit(node: dict, requested_percent: int) -> int:
     return (requested * limit) // 100
 
 
-def _load_auth_state() -> None:
-    global auth_state, users_by_id, users_by_username
-    if USERS_PATH.exists():
-        try:
-            data = json.loads(USERS_PATH.read_text())
-        except Exception:
-            log.exception("Failed to read users file; using defaults")
-            data = {}
-    else:
-        data = {}
-    server_name = (data.get("server_name") or SERVER_DEFAULT_NAME).strip() or SERVER_DEFAULT_NAME
-    users = data.get("users") or []
-    auth_state = {"server_name": server_name, "users": []}
-    users_by_id = {}
-    users_by_username = {}
-    for entry in users:
-        if not isinstance(entry, dict):
-            continue
-        uid = entry.get("id") or str(uuid.uuid4())
-        username = (entry.get("username") or "").strip()
-        role = entry.get("role") or "member"
-        password_hash = entry.get("password_hash")
-        if not username or not password_hash:
-            continue
-        user = {
-            "id": uid,
-            "username": username,
-            "role": role,
-            "password_hash": password_hash,
-            "created_at": entry.get("created_at") or int(time.time()),
-            "updated_at": entry.get("updated_at") or int(time.time()),
-        }
-        users_by_id[uid] = user
-        users_by_username[username.lower()] = user
-    auth_state["users"] = list(users_by_id.values())
-
-
-def _save_auth_state() -> None:
-    data = {
-        "server_name": auth_state.get("server_name", SERVER_DEFAULT_NAME),
-        "users": list(users_by_id.values()),
-    }
-    USERS_PATH.write_text(json.dumps(data, indent=2, sort_keys=True))
-
-
-_load_auth_state()
-
-
-def _is_initialized() -> bool:
-    return bool(users_by_id)
-
-
-def _hash_password(raw: str) -> str:
-    value = raw.encode("utf-8")
-    hashed = bcrypt.hashpw(value, bcrypt.gensalt())
-    return hashed.decode("utf-8")
-
-
-def _verify_password(raw: str, hashed: str) -> bool:
-    if not raw or not hashed:
-        return False
-    try:
-        return bcrypt.checkpw(raw.encode("utf-8"), hashed.encode("utf-8"))
-    except ValueError:
-        return False
-
-
-def _create_user(username: str, password: str, role: str = "admin") -> dict:
-    normalized = username.strip()
-    if not normalized:
-        raise HTTPException(status_code=400, detail="Username is required")
-    lowered = normalized.lower()
-    if lowered in users_by_username:
-        raise HTTPException(status_code=409, detail="Username already exists")
-    if not password or len(password) < 4:
-        raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
-    role_normalized = role if role in {"admin", "member"} else "member"
-    now = int(time.time())
-    user = {
-        "id": str(uuid.uuid4()),
-        "username": normalized,
-        "role": role_normalized,
-        "password_hash": _hash_password(password),
-        "created_at": now,
-        "updated_at": now,
-    }
-    users_by_id[user["id"]] = user
-    users_by_username[normalized.lower()] = user
-    auth_state["users"] = list(users_by_id.values())
-    _save_auth_state()
-    return user
-
-
-def _update_user(user_id: str, *, username: Optional[str] = None, password: Optional[str] = None, role: Optional[str] = None) -> dict:
-    user = users_by_id.get(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    if username:
-        normalized = username.strip()
-        if not normalized:
-            raise HTTPException(status_code=400, detail="Username must not be empty")
-        lowered = normalized.lower()
-        existing = users_by_username.get(lowered)
-        if existing and existing["id"] != user_id:
-            raise HTTPException(status_code=409, detail="Username already exists")
-        users_by_username.pop(user["username"].lower(), None)
-        user["username"] = normalized
-        users_by_username[lowered] = user
-    if password:
-        if len(password) < 4:
-            raise HTTPException(status_code=400, detail="Password must be at least 4 characters")
-        user["password_hash"] = _hash_password(password)
-    if role:
-        if role not in {"admin", "member"}:
-            raise HTTPException(status_code=400, detail="Invalid role")
-        if user.get("role") == "admin" and role == "member":
-            admins = [u for u in users_by_id.values() if u.get("role") == "admin" and u.get("id") != user_id]
-            if not admins:
-                raise HTTPException(status_code=400, detail="Cannot remove the last admin")
-        user["role"] = role
-    user["updated_at"] = int(time.time())
-    auth_state["users"] = list(users_by_id.values())
-    _save_auth_state()
-    return user
-
-
-def _delete_user(user_id: str) -> None:
-    user = users_by_id.get(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    if user["role"] == "admin":
-        admins = [u for u in users_by_id.values() if u.get("role") == "admin" and u.get("id") != user_id]
-        if not admins:
-            raise HTTPException(status_code=400, detail="Cannot remove the last admin")
-    users_by_id.pop(user_id, None)
-    users_by_username.pop(user["username"].lower(), None)
-    auth_state["users"] = list(users_by_id.values())
-    _save_auth_state()
-
-
-def _public_user(user: dict) -> dict:
-    return {
-        "id": user.get("id"),
-        "username": user.get("username"),
-        "role": user.get("role"),
-        "created_at": user.get("created_at"),
-        "updated_at": user.get("updated_at"),
-    }
-
-
-def _session_payload(user_id: str) -> dict:
-    return {"user_id": user_id, "ts": int(time.time())}
-
-
-def _encode_session(user_id: str) -> str:
-    payload = _session_payload(user_id)
-    return SESSION_SIGNER.dumps(payload)
-
-
-def _decode_session(token: str) -> Optional[dict]:
-    if not token:
-        return None
-    try:
-        data = SESSION_SIGNER.loads(token, max_age=SESSION_MAX_AGE)
-    except BadSignature:
-        return None
-    return data
-
-
-def _resolve_session_user(token: Optional[str]) -> Optional[dict]:
-    data = _decode_session(token or "")
-    if not data:
-        return None
-    user_id = data.get("user_id")
-    if not user_id:
-        return None
-    return users_by_id.get(user_id)
-
-
-def _set_session_cookie(response: Response, user_id: str) -> None:
-    token = _encode_session(user_id)
-    response.set_cookie(
-        SESSION_COOKIE_NAME,
-        token,
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        secure=SESSION_COOKIE_SECURE,
-        samesite=SESSION_COOKIE_SAMESITE,
-        path="/",
-    )
-
-
-def _clear_session_cookie(response: Response) -> None:
-    response.delete_cookie(SESSION_COOKIE_NAME, path="/")
-
-
 async def _require_ws_user(ws: WebSocket) -> Optional[dict]:
-    token = ws.cookies.get(SESSION_COOKIE_NAME)
-    user = _resolve_session_user(token)
-    if not user:
-        await ws.close(code=4401)
-        return None
-    return user
+    return await auth_service.require_ws_user(ws)
 
 
 def get_current_user(request: Request) -> dict:
@@ -1925,20 +1746,19 @@ def require_admin(request: Request) -> dict:
 
 
 def _auth_server_name() -> str:
-    return auth_state.get("server_name", SERVER_DEFAULT_NAME)
+    return auth_service.get_server_name()
 
 
 def _auth_set_server_name(value: str) -> None:
-    auth_state["server_name"] = (value or "").strip() or SERVER_DEFAULT_NAME
-    _save_auth_state()
+    auth_service.set_server_name(value)
 
 
 def _auth_get_user_by_username(lowered: str) -> Optional[dict]:
-    return users_by_username.get((lowered or "").strip().lower())
+    return auth_service.get_user_by_username(lowered)
 
 
 def _auth_list_users() -> list[dict]:
-    return list(users_by_id.values())
+    return auth_service.list_users()
 
 
 app.include_router(create_health_router())
@@ -1946,18 +1766,18 @@ app.include_router(create_health_router())
 
 app.include_router(
     create_auth_router(
-        is_initialized=_is_initialized,
+        is_initialized=auth_service.is_initialized,
         get_server_name=_auth_server_name,
         set_server_name=_auth_set_server_name,
-        public_user=_public_user,
+        public_user=auth_service.public_user,
         get_user_by_username=_auth_get_user_by_username,
-        create_user=_create_user,
-        update_user=_update_user,
-        delete_user=_delete_user,
+        create_user=auth_service.create_user,
+        update_user=auth_service.update_user,
+        delete_user=auth_service.delete_user,
         list_users=_auth_list_users,
-        verify_password=_verify_password,
-        set_session_cookie=_set_session_cookie,
-        clear_session_cookie=_clear_session_cookie,
+        verify_password=auth_service.verify_password,
+        set_session_cookie=auth_service.set_session_cookie,
+        clear_session_cookie=auth_service.clear_session_cookie,
         require_admin=require_admin,
         server_default_name=SERVER_DEFAULT_NAME,
     )
@@ -1988,7 +1808,7 @@ app.include_router(
 
 
 def _auth_state() -> dict:
-    return auth_state
+    return auth_service.auth_state
 
 
 def _nodes() -> dict:
@@ -2013,7 +1833,7 @@ def _node_watchers() -> set:
 
 
 def _pending_web_node_requests() -> Dict[str, dict]:
-    return pending_web_node_requests
+    return web_node_approval_service.pending_requests()
 
 
 def _webrtc_relay() -> Optional[WebAudioRelay]:
@@ -2075,12 +1895,12 @@ app.include_router(
         find_section=lambda section_id: _find_section(section_id),
         public_section=_public_section,
         webrtc_enabled=WEBRTC_ENABLED,
-        get_web_node_snapshot=lambda entry: _get_web_node_snapshot(entry),
-        broadcast_web_node_request_event=lambda event, **kwargs: _broadcast_web_node_request_event(event, **kwargs),
+        get_web_node_snapshot=web_node_approval_service.get_snapshot,
+        broadcast_web_node_request_event=web_node_approval_service.broadcast_event,
         pending_web_node_requests=_pending_web_node_requests,
-        pending_web_node_snapshots=lambda: _pending_web_node_snapshots(),
-        pop_pending_web_node_request=lambda request_id: _pop_pending_web_node_request(request_id),
-        establish_web_node_session_for_request=lambda pending: _establish_web_node_session_for_request(pending),
+        pending_web_node_snapshots=web_node_approval_service.pending_snapshots,
+        pop_pending_web_node_request=web_node_approval_service.pop_pending_request,
+        establish_web_node_session_for_request=web_node_approval_service.establish_session_for_request,
         web_node_approval_timeout=WEB_NODE_APPROVAL_TIMEOUT,
         detect_discovery_networks=lambda: _detect_discovery_networks(),
         hosts_for_networks=lambda networks, limit=DISCOVERY_MAX_HOSTS: _hosts_for_networks(networks, limit=limit),
@@ -2527,25 +2347,6 @@ def _map_spotify_search_bucket(payload: Optional[dict], mapper: Callable[[dict],
     }
 
 
-def _get_web_node_snapshot(entry: dict) -> dict:
-    snapshot = entry.get("snapshot")
-    if snapshot:
-        return snapshot
-    snapshot = {
-        "id": entry["id"],
-        "name": entry.get("name"),
-        "client_host": entry.get("client_host"),
-        "requested_at": entry.get("created_at"),
-    }
-    entry["snapshot"] = snapshot
-    return snapshot
-
-
-def _pending_web_node_snapshots() -> list[dict]:
-    entries = sorted(pending_web_node_requests.values(), key=lambda item: item.get("created_at", 0))
-    return [_get_web_node_snapshot(entry) for entry in entries]
-
-
 async def _broadcast_to_node_watchers(payload: dict) -> None:
     if not node_watchers:
         return
@@ -2565,60 +2366,6 @@ async def broadcast_nodes() -> None:
         "sections": public_sections(),
         "nodes": public_nodes(),
     })
-
-
-async def _broadcast_web_node_request_event(
-    action: str,
-    *,
-    snapshot: Optional[dict] = None,
-    request_id: Optional[str] = None,
-    status: Optional[str] = None,
-    reason: Optional[str] = None,
-) -> None:
-    payload: dict[str, Any] = {"type": "web_node_request", "action": action}
-    if snapshot:
-        payload["request"] = snapshot
-    if request_id:
-        payload["request_id"] = request_id
-    if status:
-        payload["status"] = status
-    if reason:
-        payload["reason"] = reason
-    await _broadcast_to_node_watchers(payload)
-
-
-def _pop_pending_web_node_request(request_id: str) -> dict:
-    pending = pending_web_node_requests.pop(request_id, None)
-    if not pending:
-        raise HTTPException(status_code=404, detail="Web node request not found or already resolved")
-    return pending
-
-
-async def _establish_web_node_session_for_request(pending: dict) -> dict:
-    if not WEBRTC_ENABLED or not webrtc_relay:
-        raise HTTPException(status_code=503, detail="Web nodes are disabled")
-    name = pending.get("name") or "Web node"
-    node = create_browser_node(name)
-    channel_id = resolve_node_channel_id(node)
-    channel = channels_by_id.get(channel_id) if channel_id else None
-    stream_id = channel.get("snap_stream") if channel else None
-    if channel_id and (not channel or not stream_id):
-        await teardown_browser_node(node["id"])
-        raise HTTPException(status_code=500, detail="Channel is missing snap_stream mapping")
-    try:
-        session = await webrtc_relay.create_session(
-            node["id"],
-            channel_id,
-            stream_id,
-            stereo_mode=_normalize_stereo_mode(node.get("stereo_mode")),
-        )
-        answer = await session.accept(pending["offer_sdp"], pending["offer_type"])
-    except Exception as exc:  # pragma: no cover - defensive logging
-        log.exception("Failed to establish web node session")
-        await teardown_browser_node(node["id"])
-        raise HTTPException(status_code=500, detail=f"Failed to start WebRTC session: {exc}")
-    await broadcast_nodes()
-    return {"node": node, "answer": answer.sdp, "answer_type": answer.type}
 
 
 def _normalize_node_url(raw: str) -> str:
