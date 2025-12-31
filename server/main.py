@@ -56,8 +56,10 @@ from api.ui import create_ui_router
 from services.snapcast_client import SnapcastClient, is_rpc_method_not_found_error
 from services import spotify_api
 from services.agent_client import AgentClient
+from services.agent_metadata import AgentMetadataService
 from services.channels import ChannelsService
 from services.nodes_store import NodesStore
+from services.node_registration import NodeRegistrationService
 from services.sonos import SonosService
 from services.spotify_config import SpotifyConfigService
 
@@ -2806,70 +2808,11 @@ def _register_node_internal(
     fingerprint: Optional[str] = None,
     normalized_url: Optional[str] = None,
 ) -> dict:
-    normalized = normalized_url or _normalize_node_url(reg.url)
-    now = time.time()
-    if reg.id and reg.id in nodes:
-        node = nodes[reg.id]
-        node["url"] = normalized
-        node["last_seen"] = now
-        if fingerprint:
-            node["fingerprint"] = fingerprint
-        node["online"] = True
-        node.pop("offline_since", None)
-        return node
-    if fingerprint:
-        for existing in nodes.values():
-            if existing.get("fingerprint") == fingerprint:
-                existing["url"] = normalized
-                existing["last_seen"] = now
-                existing["fingerprint"] = fingerprint
-                existing["online"] = True
-                existing.pop("offline_since", None)
-                return existing
-    for existing in nodes.values():
-        if existing["url"].rstrip("/") == normalized:
-            existing["last_seen"] = now
-            if fingerprint:
-                existing["fingerprint"] = fingerprint
-            existing["online"] = True
-            existing.pop("offline_since", None)
-            return existing
-    node_id = reg.id or str(uuid.uuid4())
-    previous = nodes.get(node_id, {})
-    if normalized.startswith("browser:"):
-        node_type = "browser"
-    elif normalized.startswith("sonos://"):
-        node_type = "sonos"
-    else:
-        node_type = "agent"
-    nodes[node_id] = {
-        "id": node_id,
-        "name": reg.name,
-        "url": normalized,
-        "last_seen": now,
-        "type": node_type,
-        "eq": default_eq_state(),
-        "agent_secret": previous.get("agent_secret"),
-        "audio_configured": True if node_type in {"browser", "sonos"} else previous.get("audio_configured", False),
-        "agent_version": previous.get("agent_version"),
-        "volume_percent": _normalize_percent(previous.get("volume_percent", 75), default=75),
-        "max_volume_percent": _normalize_percent(previous.get("max_volume_percent", 100), default=100),
-        "muted": previous.get("muted", False),
-        "stereo_mode": _normalize_stereo_mode(previous.get("stereo_mode")),
-        "updating": bool(previous.get("updating", False)),
-        "playback_device": previous.get("playback_device"),
-        "outputs": previous.get("outputs", {}),
-        "fingerprint": fingerprint or previous.get("fingerprint"),
-        "channel_id": _select_initial_channel_id(previous.get("channel_id"), fallback=node_type != "browser"),
-        "snapclient_id": previous.get("snapclient_id"),
-        "online": True,
-        "offline_since": None,
-        "is_controller": bool(previous.get("is_controller")),
-        "sonos_udn": previous.get("sonos_udn"),
-        "sonos_rincon": previous.get("sonos_rincon"),
-    }
-    save_nodes()
-    return nodes[node_id]
+    return node_registration_service.register_node_internal(
+        reg,
+        fingerprint=fingerprint,
+        normalized_url=normalized_url,
+    )
 
 
 def create_browser_node(name: str) -> dict:
@@ -2885,62 +2828,15 @@ def _controller_node() -> Optional[dict]:
 
 
 async def _fetch_agent_fingerprint(url: str) -> Optional[str]:
-    normalized = _normalize_node_url(url)
-    if not normalized or normalized.startswith("browser:") or normalized.startswith("sonos://"):
-        return None
-    target = f"{normalized}/health"
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(target)
-        if resp.status_code != 200:
-            return None
-        data = resp.json()
-    except Exception:
-        return None
-    fingerprint = data.get("fingerprint")
-    if isinstance(fingerprint, str) and fingerprint:
-        return fingerprint
-    return None
+    return await node_registration_service.fetch_agent_fingerprint(url)
 
 
 async def request_agent_secret(node: dict, force: bool = False, *, recovery_code: str | None = None) -> str:
-    if node.get("type") != "agent":
-        raise HTTPException(status_code=400, detail="Pairing only applies to hardware nodes")
-    url = f"{node['url'].rstrip('/')}/pair"
-    payload: dict = {"force": bool(force)}
-    if isinstance(recovery_code, str) and recovery_code.strip():
-        payload["recovery_code"] = recovery_code.strip()
-    headers = {}
-    # If we already have a secret (same controller), prove it so the agent allows rotation.
-    secret = node.get("agent_secret")
-    if isinstance(secret, str) and secret:
-        headers["X-Agent-Secret"] = secret
-    async with httpx.AsyncClient(timeout=5) as client:
-        resp = await client.post(url, json=payload, headers=headers)
-    if resp.status_code >= 400:
-        raise HTTPException(status_code=resp.status_code, detail=resp.text or "Failed to pair node")
-    try:
-        data = resp.json()
-    except ValueError:
-        raise HTTPException(status_code=502, detail="Invalid response from node agent")
-    secret = data.get("secret")
-    if not secret:
-        raise HTTPException(status_code=502, detail="Node agent did not return a secret")
-    return secret
+    return await node_registration_service.request_agent_secret(node, force=force, recovery_code=recovery_code)
 
 
 async def configure_agent_audio(node: dict) -> dict:
-    if node.get("type") != "agent":
-        raise HTTPException(status_code=400, detail="Audio configuration only applies to hardware nodes")
-    payload = {
-        "snapserver_host": SNAPSERVER_AGENT_HOST,
-        "snapserver_port": SNAPCLIENT_PORT,
-    }
-    result = await agent_client.post(node, "/config/snapclient", payload)
-    node["audio_configured"] = bool(result.get("configured", True))
-    await refresh_agent_metadata(node, persist=False)
-    save_nodes()
-    return result
+    return await node_registration_service.configure_agent_audio(node)
 
 
 def _mark_node_online(node: dict, *, timestamp: Optional[float] = None) -> bool:
@@ -2983,103 +2879,21 @@ def schedule_node_rediscovery(node: dict) -> None:
     node_rediscovery_tasks[node_id] = asyncio.create_task(_rediscover_node(node_id, fingerprint))
 
 
-async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[bool, bool]:
-    if node.get("type") != "agent":
-        return False, False
-    url = f"{node['url'].rstrip('/')}/health"
-    now = time.time()
-    try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            resp = await client.get(url)
-        if resp.status_code != 200:
-            changed = _mark_node_offline(node, timestamp=now)
-            if changed and persist:
-                save_nodes()
-            schedule_node_rediscovery(node)
-            return False, changed
-        data = resp.json()
-    except Exception:
-        changed = _mark_node_offline(node, timestamp=now)
-        if changed and persist:
-            save_nodes()
-        schedule_node_rediscovery(node)
-        return False, changed
+agent_metadata_service = AgentMetadataService(
+    agent_client=agent_client,
+    mark_node_online=_mark_node_online,
+    mark_node_offline=_mark_node_offline,
+    normalize_percent=_normalize_percent,
+    get_node_max_volume=_get_node_max_volume,
+    schedule_node_rediscovery=schedule_node_rediscovery,
+    configure_agent_audio=configure_agent_audio,
+    sync_node_max_volume=_sync_node_max_volume,
+    save_nodes=lambda: save_nodes(),
+)
 
-    changed = False
-    if _mark_node_online(node, timestamp=now):
-        changed = True
-    fingerprint = data.get("fingerprint")
-    if isinstance(fingerprint, str) and fingerprint and node.get("fingerprint") != fingerprint:
-        node["fingerprint"] = fingerprint
-        changed = True
-    version = data.get("version")
-    if version and node.get("agent_version") != version:
-        node["agent_version"] = version
-        changed = True
-    configured = bool(data.get("configured"))
-    if node.get("audio_configured") != configured:
-        node["audio_configured"] = configured
-        changed = True
-        if configured:
-            node.setdefault("_needs_reconfig", False)
-        else:
-            node["_needs_reconfig"] = True
-    if "updating" in data:
-        updating = bool(data.get("updating"))
-        if node.get("updating") != updating:
-            node["updating"] = updating
-            changed = True
-    if "playback_device" in data:
-        device = data.get("playback_device")
-        if node.get("playback_device") != device:
-            node["playback_device"] = device
-            changed = True
-    if isinstance(data.get("outputs"), dict):
-        outputs = data["outputs"]
-        if node.get("outputs") != outputs:
-            node["outputs"] = outputs
-            changed = True
-    wifi_payload = data.get("wifi")
-    sanitized_wifi = None
-    if isinstance(wifi_payload, dict):
-        percent_raw = wifi_payload.get("percent")
-        if isinstance(percent_raw, (int, float)):
-            percent_val = max(0, min(100, int(round(percent_raw))))
-            sanitized_wifi = {"percent": percent_val}
-            signal_raw = wifi_payload.get("signal_dbm")
-            if isinstance(signal_raw, (int, float)):
-                sanitized_wifi["signal_dbm"] = float(signal_raw)
-            iface_raw = wifi_payload.get("interface")
-            if isinstance(iface_raw, str):
-                iface = iface_raw.strip()
-                if iface:
-                    sanitized_wifi["interface"] = iface
-    if sanitized_wifi:
-        if node.get("wifi") != sanitized_wifi:
-            node["wifi"] = sanitized_wifi
-            changed = True
-    elif "wifi" in node:
-        node.pop("wifi", None)
-        changed = True
-    if "max_volume_percent" in data:
-        max_vol = _normalize_percent(data.get("max_volume_percent"), default=_get_node_max_volume(node))
-        if node.get("max_volume_percent") != max_vol:
-            node["max_volume_percent"] = max_vol
-            changed = True
-    needs_reconfig = bool(node.pop("_needs_reconfig", False))
-    if configured and needs_reconfig:
-        try:
-            await configure_agent_audio(node)
-            await _sync_node_max_volume(node)
-        except Exception:
-            node["audio_configured"] = False
-            node["_needs_reconfig"] = True
-        else:
-            node["audio_configured"] = True
-            changed = True
-    if persist and changed:
-        save_nodes()
-    return True, changed
+
+async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[bool, bool]:
+    return await agent_metadata_service.refresh_agent_metadata(node, persist=persist)
 
 
 def schedule_agent_refresh(node_id: str, delay: float = 10.0, *, repeat: bool = False, attempts: int = 6) -> None:
@@ -3186,6 +3000,25 @@ def load_nodes() -> None:
 
 def save_nodes() -> None:
     nodes_store.save(nodes=nodes, sections=sections)
+
+
+node_registration_service = NodeRegistrationService(
+    get_nodes=lambda: nodes,
+    normalize_node_url=_normalize_node_url,
+    normalize_percent=_normalize_percent,
+    normalize_stereo_mode=_normalize_stereo_mode,
+    select_initial_channel_id=_select_initial_channel_id,
+    default_eq_state=default_eq_state,
+    snapserver_agent_host=SNAPSERVER_AGENT_HOST,
+    snapclient_port=SNAPCLIENT_PORT,
+    agent_client=agent_client,
+    refresh_agent_metadata=lambda node, persist=False: refresh_agent_metadata(node, persist=persist),
+    sync_node_max_volume=_sync_node_max_volume,
+    save_nodes=save_nodes,
+    broadcast_nodes=broadcast_nodes,
+    public_node=public_node,
+    sonos_service=sonos_service,
+)
 
 
 load_nodes()
@@ -3313,89 +3146,7 @@ def current_spotify_creds(identifier: Optional[str] = None) -> Tuple[str, str, s
 
 
 async def _register_node_payload(reg: NodeRegistration, *, mark_controller: bool = False) -> dict:
-    normalized_url = _normalize_node_url(reg.url)
-    reg.url = normalized_url
-    fingerprint = reg.fingerprint
-    desc: Optional[dict] = None
-    if normalized_url.startswith("sonos://"):
-        ip = sonos_service.ip_from_url(normalized_url)
-        if not ip:
-            raise HTTPException(status_code=400, detail="Invalid Sonos URL")
-        desc = await sonos_service.fetch_description(ip)
-        if not desc:
-            raise HTTPException(status_code=502, detail="Failed to read Sonos device description")
-        fingerprint = fingerprint or desc.get("udn")
-    else:
-        fingerprint = fingerprint or await _fetch_agent_fingerprint(normalized_url)
-    node = _register_node_internal(reg, fingerprint=fingerprint, normalized_url=normalized_url)
-    if mark_controller:
-        node["is_controller"] = True
-        save_nodes()
-    if node.get("type") == "sonos":
-        ip = sonos_service.ip_from_url(node.get("url"))
-        if not ip:
-            raise HTTPException(status_code=400, detail="Invalid Sonos node URL")
-        # Reuse the description we already fetched for fingerprinting when possible.
-        if desc is None:
-            desc = await sonos_service.fetch_description(ip)
-
-        friendly_name = (desc.get("friendly_name") if isinstance(desc, dict) else None) or None
-        zone_name = await sonos_service.get_zone_name(ip)
-        sonos_app_name = zone_name or friendly_name
-
-        if isinstance(desc, dict):
-            node["sonos_udn"] = desc.get("udn")
-            node["sonos_rincon"] = desc.get("rincon")
-            node["fingerprint"] = node.get("fingerprint") or desc.get("udn")
-        node["sonos_friendly_name"] = friendly_name
-        node["sonos_zone_name"] = zone_name
-
-        # Prevent Sonos metadata refreshes from overwriting manual renames.
-        name_is_custom = node.get("name_is_custom")
-        if not isinstance(name_is_custom, bool):
-            current_name = (node.get("name") or "").strip()
-            # Heuristic for older nodes: if the current name doesn't match any Sonos-reported
-            # name, treat it as user-custom.
-            inferred_custom = False
-            if current_name:
-                if sonos_app_name and current_name != sonos_app_name:
-                    if friendly_name and current_name != friendly_name:
-                        inferred_custom = True
-            node["name_is_custom"] = inferred_custom
-            name_is_custom = inferred_custom
-
-        if not name_is_custom and sonos_app_name:
-            node["name"] = sonos_app_name
-        node["audio_configured"] = True
-        node["agent_secret"] = None
-        save_nodes()
-        await broadcast_nodes()
-        return public_node(node)
-    if node.get("type") == "agent":
-        try:
-            secret = await request_agent_secret(node, force=True)
-            node["agent_secret"] = secret
-            await configure_agent_audio(node)
-            await _sync_node_max_volume(node)
-        except HTTPException as exc:
-            # If the node is already paired to another controller, keep it registered so the
-            # user can complete takeover pairing by entering the recovery code.
-            if exc.status_code in {423, 403} and "recovery" in str(exc.detail).lower():
-                node["agent_secret"] = None
-                node["audio_configured"] = False
-                save_nodes()
-                await broadcast_nodes()
-                return public_node(node)
-            nodes.pop(node["id"], None)
-            save_nodes()
-            raise
-        except Exception:
-            nodes.pop(node["id"], None)
-            save_nodes()
-            raise
-        save_nodes()
-    await broadcast_nodes()
-    return public_node(node)
+    return await node_registration_service.register_node_payload(reg, mark_controller=mark_controller)
 
 
 async def _assign_webrtc_stream(client_id: str, stream_id: str) -> None:
