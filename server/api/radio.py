@@ -72,7 +72,7 @@ def _radio_cache_put(cache: Dict[str, Tuple[float, Any]], key: str, payload: Any
 async def _radio_browser_request(
     *,
     cache: Dict[str, Tuple[float, Any]],
-    base_url: str,
+    base_urls: List[str],
     timeout: float,
     default_ttl: int,
     user_agent: str,
@@ -88,21 +88,75 @@ async def _radio_browser_request(
         cached = _radio_cache_get(cache, key)
         if cached is not None:
             return cached
-    url = f"{base_url}/{resolved_path}".rstrip("/")
     headers = {"User-Agent": user_agent}
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            response = await client.get(url, params=params, headers=headers)
-            response.raise_for_status()
-            payload = response.json()
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Radio directory timeout")
-    except httpx.HTTPError as exc:
-        log.warning("Radio Browser request failed for %s: %s", resolved_path, exc)
-        raise HTTPException(status_code=502, detail="Radio directory unavailable") from exc
+    base_urls = [entry.strip().rstrip("/") for entry in (base_urls or []) if entry and entry.strip()]
+    last_exc: Optional[BaseException] = None
+    all_timeouts = True
+    for base_url in base_urls:
+        url = f"{base_url}/{resolved_path}".rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.get(url, params=params, headers=headers)
+                response.raise_for_status()
+                payload = response.json()
+                break
+        except httpx.TimeoutException as exc:
+            last_exc = exc
+            log.warning("Radio Browser request timeout for %s via %s", resolved_path, base_url)
+            continue
+        except httpx.HTTPStatusError as exc:
+            all_timeouts = False
+            status_code = exc.response.status_code if exc.response else None
+            if status_code and (status_code >= 500 or status_code == 429):
+                last_exc = exc
+                log.warning(
+                    "Radio Browser server error for %s via %s (status=%s)",
+                    resolved_path,
+                    base_url,
+                    status_code,
+                )
+                continue
+            last_exc = exc
+            break
+        except httpx.RequestError as exc:
+            all_timeouts = False
+            last_exc = exc
+            log.warning("Radio Browser request failed for %s via %s: %s", resolved_path, base_url, exc)
+            continue
+    else:
+        payload = None
+
+    if payload is None:
+        if all_timeouts:
+            raise HTTPException(status_code=504, detail="Radio directory timeout")
+        raise HTTPException(status_code=502, detail="Radio directory unavailable") from last_exc
     if ttl_value and key:
         _radio_cache_put(cache, key, payload, ttl_value)
     return payload
+
+
+def _radio_browser_base_url_candidates(configured: str) -> List[str]:
+    configured_parts = [
+        part.strip().rstrip("/")
+        for part in (configured or "").split(",")
+        if part and part.strip()
+    ]
+    defaults = [
+        "https://all.api.radio-browser.info/json",
+        "https://de1.api.radio-browser.info/json",
+        "https://nl1.api.radio-browser.info/json",
+        "https://at1.api.radio-browser.info/json",
+        "https://fr1.api.radio-browser.info/json",
+    ]
+    seen: set[str] = set()
+    candidates: List[str] = []
+    for entry in [*configured_parts, *defaults]:
+        normalized = entry.strip().rstrip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        candidates.append(normalized)
+    return candidates
 
 
 def _serialize_radio_station(item: Optional[dict]) -> dict:
@@ -176,12 +230,13 @@ def create_radio_router(
 ) -> APIRouter:
     router = APIRouter()
     radio_browser_cache: Dict[str, Tuple[float, Any]] = {}
+    radio_browser_base_urls = _radio_browser_base_url_candidates(radio_browser_base_url)
 
     @router.get("/api/radio/genres")
     async def list_radio_genres(limit: int = Query(default=50, ge=1, le=400), _: None = Depends(require_radio_provider_dep)) -> dict:
         data = await _radio_browser_request(
             cache=radio_browser_cache,
-            base_url=radio_browser_base_url,
+            base_urls=radio_browser_base_urls,
             timeout=radio_browser_timeout,
             default_ttl=radio_browser_cache_ttl,
             user_agent=radio_browser_user_agent,
@@ -208,7 +263,7 @@ def create_radio_router(
     async def list_radio_countries(limit: int = Query(default=250, ge=1, le=400), _: None = Depends(require_radio_provider_dep)) -> dict:
         data = await _radio_browser_request(
             cache=radio_browser_cache,
-            base_url=radio_browser_base_url,
+            base_urls=radio_browser_base_urls,
             timeout=radio_browser_timeout,
             default_ttl=radio_browser_cache_ttl,
             user_agent=radio_browser_user_agent,
@@ -246,7 +301,7 @@ def create_radio_router(
         cache_key = f"radio:top:{metric}:{limit}"
         data = await _radio_browser_request(
             cache=radio_browser_cache,
-            base_url=radio_browser_base_url,
+            base_urls=radio_browser_base_urls,
             timeout=radio_browser_timeout,
             default_ttl=radio_browser_cache_ttl,
             user_agent=radio_browser_user_agent,
@@ -284,7 +339,7 @@ def create_radio_router(
             raise HTTPException(status_code=400, detail="Provide a query or filter")
         data = await _radio_browser_request(
             cache=radio_browser_cache,
-            base_url=radio_browser_base_url,
+            base_urls=radio_browser_base_urls,
             timeout=radio_browser_timeout,
             default_ttl=radio_browser_cache_ttl,
             user_agent=radio_browser_user_agent,
