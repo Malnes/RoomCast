@@ -48,6 +48,7 @@ from api.spotify import create_spotify_router
 from api.radio import create_radio_router
 from api.snapcast import create_snapcast_router
 from api.sonos import create_sonos_router
+from api.streams import create_streams_router
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -2335,6 +2336,24 @@ app.include_router(
         save_channels=lambda: save_channels(),
         save_nodes=lambda: save_nodes(),
         channel_id_prefix=CHANNEL_ID_PREFIX,
+    )
+)
+
+
+app.include_router(
+    create_streams_router(
+        resolve_channel_id=lambda channel_id: resolve_channel_id(channel_id),
+        get_channel_order=lambda: channel_order,
+        get_channels_by_id=lambda: channels_by_id,
+        get_nodes=lambda: nodes,
+        snapcast_status=lambda: snapcast.status(),
+        summarize_snapserver_status=lambda status: _summarize_snapserver_status(status),
+        public_snap_client=lambda client, snapclient_nodes: _public_snap_client(client, snapclient_nodes),
+        get_webrtc_relay=lambda: webrtc_relay,
+        read_spotify_config=lambda identifier: read_spotify_config(identifier),
+        read_librespot_status=lambda identifier: read_librespot_status(identifier),
+        snapserver_host=SNAPSERVER_HOST,
+        snapserver_port=SNAPSERVER_PORT,
     )
 )
 
@@ -5149,94 +5168,6 @@ async def _channel_idle_loop() -> None:
         pass
 
 
-@app.get("/api/streams/diagnostics")
-async def stream_diagnostics(channel_id: Optional[str] = Query(None)) -> dict:
-    if channel_id:
-        target_ids = [resolve_channel_id(channel_id)]
-    else:
-        target_ids = [cid for cid in channel_order if cid in channels_by_id]
-    snap_status = None
-    snap_error = None
-    try:
-        snap_status = await snapcast.status()
-    except Exception as exc:  # pragma: no cover - network dependency
-        snap_error = str(exc)
-        log.warning("Stream diagnostics: failed to read snapserver status: %s", exc)
-    streams_by_id, clients_by_stream = _summarize_snapserver_status(snap_status)
-    webrtc_diag = None
-    if webrtc_relay:
-        try:
-            webrtc_diag = await webrtc_relay.diagnostics()
-        except Exception as exc:  # pragma: no cover - defensive
-            log.warning("Stream diagnostics: failed to read WebRTC stats: %s", exc)
-            webrtc_diag = None
-    channel_payloads = []
-    node_lookup = {node_id: node for node_id, node in nodes.items()}
-    snapclient_nodes = {
-        node.get("snapclient_id"): node for node in nodes.values() if node.get("snapclient_id")
-    }
-    for cid in target_ids:
-        channel = channels_by_id.get(cid)
-        if not channel:
-            continue
-        stream_id = channel.get("snap_stream")
-        snap_stream = streams_by_id.get(stream_id)
-        hardware_clients = [
-            _public_snap_client(client, snapclient_nodes)
-            for client in clients_by_stream.get(stream_id, [])
-        ]
-        connected_clients = sum(1 for client in hardware_clients if client.get("connected"))
-        channel_webrtc = (webrtc_diag or {}).get("channels", {}).get(cid) if webrtc_diag else None
-        if channel_webrtc and channel_webrtc.get("sessions"):
-            for session in channel_webrtc["sessions"]:
-                node = node_lookup.get(session.get("node_id"))
-                if node:
-                    session["node_name"] = node.get("name")
-                    session["node_type"] = node.get("type")
-        spotify_summary = None
-        if channel.get("source") == "spotify":
-            cfg = read_spotify_config(channel["id"])
-            status = read_librespot_status(channel["id"])
-            spotify_summary = {
-                "bitrate_kbps": cfg.get("bitrate"),
-                "device_name": cfg.get("device_name"),
-                "normalisation": cfg.get("normalisation"),
-                "username": cfg.get("username"),
-                "status": status.get("state"),
-                "status_message": status.get("message"),
-            }
-        channel_payloads.append(
-            {
-                "id": channel["id"],
-                "name": channel.get("name"),
-                "color": channel.get("color"),
-                "source": channel.get("source", "spotify"),
-                "snap_stream": stream_id,
-                "fifo_path": channel.get("fifo_path"),
-                "spotify": spotify_summary,
-                "radio_state": channel.get("radio_state") if channel.get("source") == "radio" else None,
-                "snapserver_stream": snap_stream,
-                "hardware_clients": hardware_clients,
-                "listeners": {
-                    "hardware": len(hardware_clients),
-                    "hardware_connected": connected_clients,
-                    "webrtc": channel_webrtc.get("listeners") if channel_webrtc else 0,
-                },
-                "webrtc": channel_webrtc,
-            }
-        )
-    response = {
-        "timestamp": time.time(),
-        "channels": channel_payloads,
-        "snapserver": {
-            "host": SNAPSERVER_HOST,
-            "port": SNAPSERVER_PORT,
-            "error": snap_error,
-        },
-    }
-    if webrtc_diag:
-        response["webrtc"] = {"sample_rate": webrtc_diag.get("sample_rate")}
-    return response
 
 async def _probe_host(host: str) -> Optional[dict]:
     url = f"http://{host}:{AGENT_PORT}"
