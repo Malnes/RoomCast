@@ -1,12 +1,12 @@
-                                                                                                                    import logging
+import logging
 from typing import Any, Callable
 
 from fastapi import APIRouter, Depends, HTTPException
-                                                                                                                                                                                
+
 from api.nodes import VolumePayload
 
-                                                                                                            
-log = logging.getLogger("roomcast")           
+
+log = logging.getLogger("roomcast")
 
 
 def create_snapcast_router(
