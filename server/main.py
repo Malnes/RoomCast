@@ -61,8 +61,11 @@ from services.channels import ChannelsService
 from services.nodes_store import NodesStore
 from services.node_registration import NodeRegistrationService
 from services.node_terminal import NodeTerminalService
+from services.node_discovery import NodeDiscoveryService
+from services.node_health import NodeHealthService
 from services.web_node_approval import WebNodeApprovalService
 from services.auth_service import AuthService
+from services.node_broadcast import NodeBroadcastService
 from services.sonos import SonosService
 from services.spotify_config import SpotifyConfigService
 
@@ -1411,14 +1414,10 @@ async def session_middleware(request: Request, call_next):
 nodes: Dict[str, dict] = {}
 sections: list[dict] = []
 browser_ws: Dict[str, WebSocket] = {}
-node_watchers: set[WebSocket] = set()
 webrtc_relay: Optional[WebAudioRelay] = None
 DEFAULT_EQ_PRESET = "peq15"
-pending_restarts: Dict[str, dict] = {}
-agent_refresh_tasks: Dict[str, asyncio.Task] = {}
 node_health_task: Optional[asyncio.Task] = None
 spotify_refresh_task: Optional[asyncio.Task] = None
-node_rediscovery_tasks: Dict[str, asyncio.Task] = {}
 radio_runtime_status: Dict[str, dict] = {}
 radio_assignments_version = 1
 radio_assignment_waiters: set[asyncio.Future] = set()
@@ -1446,6 +1445,23 @@ node_terminal_service = NodeTerminalService(
 )
 
 
+node_broadcast_service = NodeBroadcastService()
+
+
+node_discovery_service = NodeDiscoveryService(
+    agent_port=AGENT_PORT,
+    discovery_cidr=DISCOVERY_CIDR,
+    discovery_concurrency=DISCOVERY_CONCURRENCY,
+    discovery_max_hosts=DISCOVERY_MAX_HOSTS,
+    node_rediscovery_interval=NODE_REDISCOVERY_INTERVAL,
+    get_nodes=lambda: nodes,
+    normalize_node_url=lambda raw: _normalize_node_url(raw),
+    save_nodes=lambda: save_nodes(),
+    refresh_agent_metadata=lambda node, persist=True: refresh_agent_metadata(node, persist=persist),
+    broadcast_nodes=lambda: broadcast_nodes(),
+)
+
+
 web_node_approval_service = WebNodeApprovalService(
     webrtc_enabled=WEBRTC_ENABLED,
     get_webrtc_relay=lambda: webrtc_relay,
@@ -1455,7 +1471,7 @@ web_node_approval_service = WebNodeApprovalService(
     normalize_stereo_mode=lambda value: _normalize_stereo_mode(value),
     teardown_browser_node=lambda node_id: teardown_browser_node(node_id),
     broadcast_nodes=lambda: broadcast_nodes(),
-    broadcast_payload=lambda payload: _broadcast_to_node_watchers(payload),
+    broadcast_payload=node_broadcast_service.broadcast,
 )
 
 
@@ -1483,8 +1499,22 @@ sonos_service = SonosService(
     scan_max_hosts=SONOS_SCAN_MAX_HOSTS,
     scan_concurrency=SONOS_SCAN_CONCURRENCY,
     scan_http_timeout=SONOS_SCAN_HTTP_TIMEOUT,
-    detect_discovery_networks=lambda: _detect_discovery_networks(),
-    hosts_for_networks=lambda networks, limit: _hosts_for_networks(networks, limit=limit),
+    detect_discovery_networks=node_discovery_service.detect_discovery_networks,
+    hosts_for_networks=lambda networks, limit: node_discovery_service.hosts_for_networks(networks, limit=limit),
+)
+
+
+node_health_service = NodeHealthService(
+    node_restart_timeout=NODE_RESTART_TIMEOUT,
+    node_restart_interval=NODE_RESTART_INTERVAL,
+    node_health_interval=NODE_HEALTH_INTERVAL,
+    get_nodes=lambda: nodes,
+    refresh_agent_metadata=lambda node, persist=True: refresh_agent_metadata(node, persist=persist),
+    save_nodes=lambda: save_nodes(),
+    broadcast_nodes=lambda: broadcast_nodes(),
+    sonos_service=sonos_service,
+    sonos_http_user_agent=SONOS_HTTP_USER_AGENT,
+    sonos_control_timeout=SONOS_CONTROL_TIMEOUT,
 )
 
 
@@ -1667,7 +1697,7 @@ def public_node(node: dict) -> dict:
         data["update_available"] = (node.get("agent_version") or "") != AGENT_LATEST_VERSION
     else:
         data["update_available"] = True
-    data["restarting"] = bool(pending_restarts.get(node["id"]))
+    data["restarting"] = node_health_service.is_restarting(node.get("id"))
     data["playback_device"] = node.get("playback_device")
     data["outputs"] = node.get("outputs") or {}
     data["fingerprint"] = node.get("fingerprint")
@@ -1829,7 +1859,7 @@ def _browser_ws() -> dict:
 
 
 def _node_watchers() -> set:
-    return node_watchers
+    return node_broadcast_service.watchers()
 
 
 def _pending_web_node_requests() -> Dict[str, dict]:
@@ -1878,8 +1908,8 @@ app.include_router(
         request_agent_secret=lambda node, force=False, recovery_code=None: request_agent_secret(node, force=force, recovery_code=recovery_code),
         configure_agent_audio=lambda node: configure_agent_audio(node),
         set_node_channel=lambda node, channel_id: _set_node_channel(node, channel_id),
-        schedule_agent_refresh=lambda *args, **kwargs: schedule_agent_refresh(*args, **kwargs),
-        schedule_restart_watch=lambda node_id: schedule_restart_watch(node_id),
+        schedule_agent_refresh=lambda *args, **kwargs: node_health_service.schedule_agent_refresh(*args, **kwargs),
+        schedule_restart_watch=node_health_service.schedule_restart_watch,
         node_restart_timeout=NODE_RESTART_TIMEOUT,
         resolve_terminal_target=lambda node: node_terminal_service.resolve_terminal_target(node),
         cleanup_terminal_sessions=lambda: node_terminal_service.cleanup_terminal_sessions(),
@@ -1888,7 +1918,7 @@ app.include_router(
         node_terminal_token_ttl=NODE_TERMINAL_TOKEN_TTL,
         node_terminal_max_duration=NODE_TERMINAL_MAX_DURATION,
         node_terminal_strict_host_key=NODE_TERMINAL_STRICT_HOST_KEY,
-        cancel_node_rediscovery=lambda node_id: cancel_node_rediscovery(node_id),
+        cancel_node_rediscovery=node_discovery_service.cancel_node_rediscovery,
         teardown_browser_node=lambda *args, **kwargs: teardown_browser_node(*args, **kwargs),
         get_webrtc_relay=_webrtc_relay,
         normalize_section_name=_normalize_section_name,
@@ -1902,9 +1932,9 @@ app.include_router(
         pop_pending_web_node_request=web_node_approval_service.pop_pending_request,
         establish_web_node_session_for_request=web_node_approval_service.establish_session_for_request,
         web_node_approval_timeout=WEB_NODE_APPROVAL_TIMEOUT,
-        detect_discovery_networks=lambda: _detect_discovery_networks(),
-        hosts_for_networks=lambda networks, limit=DISCOVERY_MAX_HOSTS: _hosts_for_networks(networks, limit=limit),
-        stream_host_probes=lambda hosts: _stream_host_probes(hosts),
+        detect_discovery_networks=node_discovery_service.detect_discovery_networks,
+        hosts_for_networks=lambda networks, limit=DISCOVERY_MAX_HOSTS: node_discovery_service.hosts_for_networks(networks, limit=limit),
+        stream_host_probes=node_discovery_service.stream_host_probes,
         sonos_ssdp_discover=lambda: sonos_service.ssdp_discover(),
         discovery_max_hosts=DISCOVERY_MAX_HOSTS,
         sonos_discovery_timeout=SONOS_DISCOVERY_TIMEOUT,
@@ -2347,21 +2377,8 @@ def _map_spotify_search_bucket(payload: Optional[dict], mapper: Callable[[dict],
     }
 
 
-async def _broadcast_to_node_watchers(payload: dict) -> None:
-    if not node_watchers:
-        return
-    dead: list[WebSocket] = []
-    for ws in list(node_watchers):
-        try:
-            await ws.send_json(payload)
-        except Exception:
-            dead.append(ws)
-    for ws in dead:
-        node_watchers.discard(ws)
-
-
 async def broadcast_nodes() -> None:
-    await _broadcast_to_node_watchers({
+    await node_broadcast_service.broadcast({
         "type": "nodes",
         "sections": public_sections(),
         "nodes": public_nodes(),
@@ -2561,34 +2578,13 @@ def _mark_node_offline(node: dict, *, timestamp: Optional[float] = None) -> bool
     return was_online
 
 
-def cancel_node_rediscovery(node_id: Optional[str]) -> None:
-    if not node_id:
-        return
-    task = node_rediscovery_tasks.pop(node_id, None)
-    if task:
-        task.cancel()
-
-
-def schedule_node_rediscovery(node: dict) -> None:
-    if not node or node.get("type") != "agent":
-        return
-    node_id = node.get("id")
-    fingerprint = node.get("fingerprint")
-    if not node_id or not fingerprint:
-        return
-    if node_id in node_rediscovery_tasks:
-        return
-    log.info("Scheduling rediscovery for node %s (fingerprint %s)", node_id, fingerprint[:8])
-    node_rediscovery_tasks[node_id] = asyncio.create_task(_rediscover_node(node_id, fingerprint))
-
-
 agent_metadata_service = AgentMetadataService(
     agent_client=agent_client,
     mark_node_online=_mark_node_online,
     mark_node_offline=_mark_node_offline,
     normalize_percent=_normalize_percent,
     get_node_max_volume=_get_node_max_volume,
-    schedule_node_rediscovery=schedule_node_rediscovery,
+    schedule_node_rediscovery=node_discovery_service.schedule_node_rediscovery,
     configure_agent_audio=configure_agent_audio,
     sync_node_max_volume=_sync_node_max_volume,
     save_nodes=lambda: save_nodes(),
@@ -2597,70 +2593,6 @@ agent_metadata_service = AgentMetadataService(
 
 async def refresh_agent_metadata(node: dict, *, persist: bool = True) -> tuple[bool, bool]:
     return await agent_metadata_service.refresh_agent_metadata(node, persist=persist)
-
-
-def schedule_agent_refresh(node_id: str, delay: float = 10.0, *, repeat: bool = False, attempts: int = 6) -> None:
-    existing = agent_refresh_tasks.pop(node_id, None)
-    if existing:
-        existing.cancel()
-
-    async def _task() -> None:
-        remaining = max(1, attempts)
-        try:
-            while remaining > 0:
-                await asyncio.sleep(delay)
-                node = nodes.get(node_id)
-                if not node:
-                    return
-                reachable, changed = await refresh_agent_metadata(node)
-                if reachable and changed:
-                    await broadcast_nodes()
-                if not repeat:
-                    return
-                if reachable and not node.get("updating"):
-                    return
-                remaining -= 1
-            node = nodes.get(node_id)
-            if repeat and node and node.get("updating"):
-                node["updating"] = False
-                save_nodes()
-                await broadcast_nodes()
-        finally:
-            agent_refresh_tasks.pop(node_id, None)
-
-    agent_refresh_tasks[node_id] = asyncio.create_task(_task())
-
-
-def schedule_restart_watch(node_id: str) -> None:
-    existing = pending_restarts.pop(node_id, None)
-    if existing:
-        task = existing.get("task")
-        if task:
-            task.cancel()
-    deadline = time.time() + NODE_RESTART_TIMEOUT
-
-    async def _monitor() -> None:
-        saw_offline = False
-        try:
-            while time.time() < deadline:
-                await asyncio.sleep(NODE_RESTART_INTERVAL)
-                node = nodes.get(node_id)
-                if not node:
-                    return
-                reachable, _ = await refresh_agent_metadata(node)
-                if reachable:
-                    if saw_offline:
-                        log.info("Node %s reported healthy after restart", node_id)
-                        return
-                else:
-                    saw_offline = True
-            log.warning("Node %s did not return within restart timeout", node_id)
-        finally:
-            pending_restarts.pop(node_id, None)
-            await broadcast_nodes()
-
-    task = asyncio.create_task(_monitor())
-    pending_restarts[node_id] = {"deadline": deadline, "task": task}
 
 
 async def teardown_browser_node(node_id: str, *, remove_entry: bool = True) -> None:
@@ -2789,7 +2721,7 @@ async def _startup_events() -> None:
         )
         await webrtc_relay.start()
     if node_health_task is None:
-        node_health_task = asyncio.create_task(_node_health_loop())
+        node_health_task = asyncio.create_task(node_health_service.health_loop())
     if spotify_refresh_task is None:
         spotify_refresh_task = asyncio.create_task(_spotify_refresh_loop())
     if channel_idle_task is None:
@@ -2964,59 +2896,6 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
         await webrtc_relay.update_session_channel(node["id"], resolved, stream_id)
     node["channel_id"] = resolved
 
-async def _refresh_all_agent_nodes() -> None:
-    dirty = False
-    for node in list(nodes.values()):
-        if node.get("type") == "agent":
-            _, changed = await refresh_agent_metadata(node, persist=False)
-            if changed:
-                dirty = True
-        elif node.get("type") == "sonos":
-            ip = sonos_service.ip_from_url(node.get("url"))
-            if not ip:
-                continue
-            now = time.time()
-            reachable = await sonos_service.ping(ip)
-            prev_online = node.get("online") is not False
-            node["online"] = bool(reachable)
-            if reachable:
-                node["last_seen"] = now
-                node["offline_since"] = None
-
-                # Best-effort network type detection for UI (Wi-Fi / Ethernet / SonosNet).
-                # This relies on undocumented Sonos diagnostics and may vary by firmware.
-                last_diag = node.get("sonos_network_last_refresh")
-                should_refresh = not isinstance(last_diag, (int, float)) or (now - float(last_diag)) >= 60.0
-                if should_refresh:
-                    headers = {"User-Agent": SONOS_HTTP_USER_AGENT}
-                    try:
-                        async with httpx.AsyncClient(timeout=SONOS_CONTROL_TIMEOUT) as client:
-                            resp = await client.get(f"http://{ip}:1400/support/review", headers=headers)
-                        if resp.status_code == 200:
-                            parsed = sonos_service.parse_network_from_review(resp.text)
-                            if parsed and parsed != node.get("sonos_network"):
-                                node["sonos_network"] = parsed
-                            node["sonos_network_last_refresh"] = now
-                    except Exception:
-                        # Never fail the refresh loop on diagnostics.
-                        node["sonos_network_last_refresh"] = now
-            else:
-                if prev_online:
-                    node["offline_since"] = now
-            dirty = True
-    if dirty:
-        save_nodes()
-        await broadcast_nodes()
-
-
-async def _node_health_loop() -> None:
-    try:
-        while True:
-            await _refresh_all_agent_nodes()
-            await asyncio.sleep(max(5, NODE_HEALTH_INTERVAL))
-    except asyncio.CancelledError:
-        pass
-
 
 def _channel_should_monitor(channel: dict) -> bool:
     if not channel.get("enabled", True):
@@ -3155,172 +3034,6 @@ async def _channel_idle_loop() -> None:
             await asyncio.sleep(CHANNEL_IDLE_POLL_INTERVAL)
     except asyncio.CancelledError:
         pass
-
-
-
-async def _probe_host(host: str) -> Optional[dict]:
-    url = f"http://{host}:{AGENT_PORT}"
-    try:
-        async with httpx.AsyncClient(timeout=2) as client:
-            resp = await client.get(f"{url}/health")
-        if resp.status_code == 200:
-            try:
-                data = resp.json()
-            except ValueError:
-                data = {}
-            return {
-                "host": host,
-                "url": f"{url}",
-                "healthy": True,
-                "version": data.get("version"),
-                "fingerprint": data.get("fingerprint"),
-            }
-    except Exception:
-        return None
-    return None
-
-
-def _configured_discovery_networks() -> list[str]:
-    configured: list[str] = []
-    raw_value = DISCOVERY_CIDR or ""
-    if not raw_value:
-        return configured
-    for chunk in raw_value.replace(";", ",").split(","):
-        part = chunk.strip()
-        if not part:
-            continue
-        try:
-            net = str(ipaddress.ip_network(part, strict=False))
-        except ValueError:
-            log.warning("Ignoring invalid DISCOVERY_CIDR entry: %s", part)
-            continue
-        if net not in configured:
-            configured.append(net)
-    return configured
-
-
-def _detect_discovery_networks() -> list[str]:
-    """Return IPv4 networks to scan, defaulting to DISCOVERY_CIDR."""
-    networks: list[str] = _configured_discovery_networks()
-    try:
-        output = subprocess.check_output(
-            ["ip", "-o", "-4", "addr", "show", "up", "scope", "global"],
-            text=True,
-        )
-    except Exception:
-        output = ""
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) < 4:
-            continue
-        cidr = parts[3]
-        try:
-            iface = ipaddress.ip_interface(cidr)
-        except ValueError:
-            continue
-        if iface.ip.is_loopback or iface.ip.is_link_local:
-            continue
-        net = iface.network
-        if net.num_addresses <= 2:
-            continue
-        if net.version != 4:
-            continue
-        _net_str = str(net)
-        if _net_str not in networks:
-            networks.append(_net_str)
-    if not networks:
-        return []
-    return networks
-
-
-def _hosts_for_networks(networks: list[str], limit: int = DISCOVERY_MAX_HOSTS) -> list[str]:
-    seen: set[str] = set()
-    hosts: list[str] = []
-    for net_str in networks:
-        try:
-            net = ipaddress.ip_network(net_str, strict=False)
-        except ValueError:
-            continue
-        if net.version != 4:
-            continue
-        for host in net.hosts():
-            host_str = str(host)
-            if host_str in seen:
-                continue
-            seen.add(host_str)
-            hosts.append(host_str)
-            if len(hosts) >= limit:
-                return hosts
-    return hosts
-
-
-async def _stream_host_probes(hosts: list[str]) -> AsyncIterator[dict]:
-    if not hosts:
-        return
-    sem = asyncio.Semaphore(max(1, DISCOVERY_CONCURRENCY))
-    tasks = []
-
-    async def _runner(target: str) -> Optional[dict]:
-        async with sem:
-            return await _probe_host(target)
-
-    for host in hosts:
-        tasks.append(asyncio.create_task(_runner(host)))
-
-    try:
-        for task in asyncio.as_completed(tasks):
-            result = await task
-            if result:
-                yield result
-    finally:
-        for task in tasks:
-            task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-
-async def _find_node_by_fingerprint(fingerprint: str) -> Optional[dict]:
-    if not fingerprint:
-        return None
-    networks = _detect_discovery_networks()
-    if not networks:
-        return None
-    hosts = _hosts_for_networks(networks)
-    if not hosts:
-        return None
-    async for result in _stream_host_probes(hosts):
-        if not result:
-            continue
-        if result.get("fingerprint") == fingerprint:
-            return result
-    return None
-
-
-async def _rediscover_node(node_id: str, fingerprint: str) -> None:
-    try:
-        interval = max(10, NODE_REDISCOVERY_INTERVAL)
-        while True:
-            node = nodes.get(node_id)
-            if not node or node.get("online"):
-                return
-            match = await _find_node_by_fingerprint(fingerprint)
-            if match and match.get("url"):
-                new_url = _normalize_node_url(match["url"])
-                if new_url:
-                    node["url"] = new_url
-                    save_nodes()
-                    reachable, _ = await refresh_agent_metadata(node)
-                    if reachable:
-                        log.info("Node %s rediscovered at %s", node_id, new_url)
-                        await broadcast_nodes()
-                        return
-            await asyncio.sleep(interval)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        node_rediscovery_tasks.pop(node_id, None)
-
-
 
 
 
