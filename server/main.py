@@ -297,6 +297,36 @@ def _resolve_public_controller_host() -> str:
 ROOMCAST_PUBLIC_HOST = _resolve_public_controller_host()
 ROOMCAST_PUBLIC_PORT = int(os.getenv("ROOMCAST_PUBLIC_PORT", "8000"))
 
+
+def _detect_sonos_discovery_networks(node_discovery_service: NodeDiscoveryService, public_host: str) -> list[str]:
+    """Return discovery networks for Sonos.
+
+    In Docker bridge mode the container's interfaces often only expose the docker subnet,
+    so SSDP multicast may fail and interface-based network detection may miss the LAN.
+    If ROOMCAST_PUBLIC_HOST is a private IPv4, include its /24 as a pragmatic fallback.
+    """
+
+    networks = node_discovery_service.detect_discovery_networks() or []
+    try:
+        ip = ipaddress.ip_address((public_host or "").strip())
+    except ValueError:
+        return networks
+    if ip.version != 4:
+        return networks
+    if ip.is_loopback or ip.is_link_local:
+        return networks
+    if not ip.is_private:
+        return networks
+
+    try:
+        inferred = str(ipaddress.ip_network(f"{ip}/24", strict=False))
+    except ValueError:
+        return networks
+
+    if inferred not in networks:
+        networks.insert(0, inferred)
+    return networks
+
 SONOS_HTTP_USER_AGENT = os.getenv("SONOS_HTTP_USER_AGENT", "RoomCast/Sonos").strip() or "RoomCast/Sonos"
 SONOS_DISCOVERY_TIMEOUT = float(os.getenv("SONOS_DISCOVERY_TIMEOUT", "2.0"))
 SONOS_CONTROL_TIMEOUT = float(os.getenv("SONOS_CONTROL_TIMEOUT", "8.0"))
@@ -1246,7 +1276,7 @@ sonos_service = SonosService(
     scan_max_hosts=SONOS_SCAN_MAX_HOSTS,
     scan_concurrency=SONOS_SCAN_CONCURRENCY,
     scan_http_timeout=SONOS_SCAN_HTTP_TIMEOUT,
-    detect_discovery_networks=node_discovery_service.detect_discovery_networks,
+    detect_discovery_networks=lambda: _detect_sonos_discovery_networks(node_discovery_service, ROOMCAST_PUBLIC_HOST),
     hosts_for_networks=lambda networks, limit: node_discovery_service.hosts_for_networks(networks, limit=limit),
 )
 

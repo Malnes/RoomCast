@@ -286,7 +286,7 @@ class SonosService:
         uri = root.findtext(".//{*}CurrentURI")
         return uri.strip() if uri else None
 
-    async def get_zone_name(self, ip: str) -> Optional[str]:
+    async def get_zone_name(self, ip: str, *, timeout: Optional[float] = None) -> Optional[str]:
         """Return the Sonos app 'room' / zone name for this device."""
 
         try:
@@ -296,6 +296,7 @@ class SonosService:
                 action="GetZoneAttributes",
                 control_path="/DeviceProperties/Control",
                 arguments={},
+                timeout=timeout,
             )
         except Exception as exc:
             log.warning("Sonos GetZoneAttributes failed (ip=%s): %s", ip, exc)
@@ -893,8 +894,16 @@ class SonosService:
                 location = headers.get("location")
                 if not location:
                     return
-                host = addr[0]
-                found[host] = {"ip": host, "location": location}
+                ip = addr[0]
+                try:
+                    parsed = urlparse(location)
+                    if parsed.hostname:
+                        ip = parsed.hostname
+                except Exception:
+                    pass
+                if not ip:
+                    return
+                found[ip] = {"ip": ip, "location": location}
 
         transport = None
         try:
@@ -915,12 +924,18 @@ class SonosService:
             desc = await self.fetch_description(ip)
             if not desc:
                 continue
+
+            zone_name = await self.get_zone_name(ip, timeout=self._scan_http_timeout)
+            friendly_name = desc.get("friendly_name") if isinstance(desc, dict) else None
+            display_name = zone_name or friendly_name or ip
             results.append(
                 {
                     "kind": "sonos",
-                    "host": desc.get("friendly_name") or ip,
+                    "host": display_name,
                     "url": f"sonos://{ip}",
                     "fingerprint": desc.get("udn"),
+                    "sonos_zone_name": zone_name,
+                    "sonos_friendly_name": friendly_name,
                     "version": "Sonos",
                 }
             )
@@ -941,17 +956,26 @@ class SonosService:
             udn = desc.get("udn")
             if not desc.get("rincon") and not (isinstance(udn, str) and "RINCON_" in udn):
                 return
+
+            zone_name = await self.get_zone_name(ip, timeout=self._scan_http_timeout)
+            if isinstance(desc, dict):
+                desc["zone_name"] = zone_name
             found[ip] = desc
 
         await asyncio.gather(*(_probe(ip) for ip in hosts))
         results: list[dict] = []
         for ip, desc in found.items():
+            zone_name = desc.get("zone_name") if isinstance(desc, dict) else None
+            friendly_name = desc.get("friendly_name") if isinstance(desc, dict) else None
+            display_name = zone_name or friendly_name or ip
             results.append(
                 {
                     "kind": "sonos",
-                    "host": desc.get("friendly_name") or ip,
+                    "host": display_name,
                     "url": f"sonos://{ip}",
                     "fingerprint": desc.get("udn"),
+                    "sonos_zone_name": zone_name,
+                    "sonos_friendly_name": friendly_name,
                     "version": "Sonos",
                 }
             )
@@ -959,11 +983,40 @@ class SonosService:
         return results
 
     async def discover(self) -> list[dict]:
-        items = await self.ssdp_discover()
-        if items:
-            return items
-        networks = self._detect_discovery_networks()
-        if not networks:
-            return []
-        log.info("Sonos SSDP returned no devices; falling back to HTTP scan")
-        return await self.http_scan(networks)
+        ssdp_items: list[dict] = []
+        try:
+            ssdp_items = await self.ssdp_discover()
+        except Exception as exc:
+            log.warning("Sonos SSDP discovery failed: %s", exc)
+            ssdp_items = []
+
+        networks = []
+        try:
+            networks = self._detect_discovery_networks() or []
+        except Exception:
+            networks = []
+
+        scan_items: list[dict] = []
+        should_scan = bool(networks) and (not ssdp_items or len(ssdp_items) < 3)
+        if should_scan:
+            if not ssdp_items:
+                log.info("Sonos SSDP returned no devices; falling back to HTTP scan")
+            try:
+                scan_items = await self.http_scan(networks)
+            except Exception as exc:
+                log.warning("Sonos HTTP scan failed: %s", exc)
+                scan_items = []
+
+        combined: list[dict] = []
+        seen: set[str] = set()
+        for item in (ssdp_items or []) + (scan_items or []):
+            url = item.get("url") if isinstance(item, dict) else None
+            fp = item.get("fingerprint") if isinstance(item, dict) else None
+            key = (str(url) if url else str(fp or "")).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            combined.append(item)
+
+        combined.sort(key=lambda x: ((x or {}).get("host") or "", (x or {}).get("url") or ""))
+        return combined

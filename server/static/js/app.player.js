@@ -1926,19 +1926,34 @@ async function scanSonosSpeakers() {
     addNodeSonosStatus.textContent = `Found ${devices.length} speaker${devices.length === 1 ? '' : 's'}.`;
     devices.forEach(item => {
       if (!item || !item.url || typeof item.url !== 'string' || !item.url.startsWith('sonos://')) return;
+
+      const sonosName = (item.sonos_zone_name || item.sonos_friendly_name || item.host || 'Sonos speaker').trim();
       const row = document.createElement('div');
       row.className = 'panel discover-row';
       row.style.marginBottom = '8px';
       const title = document.createElement('div');
-      title.innerHTML = `<strong>${item.host || 'Sonos speaker'}</strong> <span class="muted">${item.url}</span><div class="label">Sonos speaker</div>`;
+
+      const strong = document.createElement('strong');
+      strong.textContent = sonosName || 'Sonos speaker';
+      const urlSpan = document.createElement('span');
+      urlSpan.className = 'muted';
+      urlSpan.style.marginLeft = '8px';
+      urlSpan.textContent = item.url;
+      const label = document.createElement('div');
+      label.className = 'label';
+      label.textContent = 'Sonos speaker';
+      title.appendChild(strong);
+      title.appendChild(urlSpan);
+      title.appendChild(label);
+
       const nameInput = document.createElement('input');
       nameInput.style.marginTop = '6px';
       const existing = (typeof findNodeByFingerprint === 'function') ? findNodeByFingerprint(item.fingerprint) : null;
       if (existing) {
-        nameInput.value = existing.name || existing.id || (item.host || 'Sonos speaker');
+        nameInput.value = existing.name || existing.id || sonosName || 'Sonos speaker';
         nameInput.disabled = true;
       } else {
-        nameInput.value = item.host || 'Sonos speaker';
+        nameInput.value = sonosName || 'Sonos speaker';
       }
       const btn = document.createElement('button');
       btn.className = 'small-btn';
@@ -1956,7 +1971,7 @@ async function scanSonosSpeakers() {
       if (existing) {
         const hint = document.createElement('div');
         hint.className = 'label';
-        hint.textContent = `Matches registered node “${existing.name || existing.id}”`;
+        hint.textContent = `Registered as “${existing.name || existing.id}”`;
         row.appendChild(hint);
       }
       row.appendChild(btn);
