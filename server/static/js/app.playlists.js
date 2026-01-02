@@ -127,7 +127,13 @@ function renderPlaylistGrid(items) {
       card.appendChild(counts);
     }
 
-    card.addEventListener('click', () => selectPlaylist(item));
+    card.addEventListener('click', () => {
+      if (playlistPickerMode && typeof playlistPickerOnSelect === 'function') {
+        playlistPickerOnSelect(item);
+        return;
+      }
+      selectPlaylist(item);
+    });
     syncPlaylistHighlightForElement(card);
     playlistGrid.appendChild(card);
   });

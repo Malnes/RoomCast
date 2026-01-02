@@ -36,6 +36,11 @@ class SpotifyConfig(BaseModel):
     redirect_uri: Optional[str] = None
 
 
+class PlaylistAddTracksPayload(BaseModel):
+    track_uri: Optional[str] = Field(default=None, description="Single Spotify track URI")
+    uris: Optional[list[str]] = Field(default=None, description="List of Spotify track URIs")
+
+
 def create_spotify_router(
     *,
     require_spotify_provider_dep: Callable[[], None],
@@ -415,6 +420,37 @@ def create_spotify_router(
             "next": bool(data.get("next")),
             "previous": bool(data.get("previous")),
         }
+
+    @router.post("/api/spotify/playlists/{playlist_id}/tracks")
+    async def spotify_playlist_add_tracks(
+        playlist_id: str,
+        payload: PlaylistAddTracksPayload = Body(...),
+        channel_id: Optional[str] = Query(default=None),
+        _: None = Depends(require_spotify_provider_dep),
+    ) -> dict:
+        resolved = resolve_channel_id(channel_id)
+        token = ensure_spotify_token(resolved)
+        uris: list[str] = []
+        if isinstance(payload.track_uri, str) and payload.track_uri.strip():
+            uris.append(payload.track_uri.strip())
+        if isinstance(payload.uris, list):
+            for uri in payload.uris:
+                if isinstance(uri, str) and uri.strip():
+                    uris.append(uri.strip())
+        uris = list(dict.fromkeys(uris))
+        if not uris:
+            raise HTTPException(status_code=400, detail="Provide at least one track URI")
+        resp = await spotify_request(
+            "POST",
+            f"/playlists/{playlist_id}/tracks",
+            token,
+            resolved,
+            json={"uris": uris},
+        )
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        data = resp.json() if resp.text else {}
+        return {"ok": True, "snapshot_id": data.get("snapshot_id")}
 
     @router.get("/api/spotify/playlists/{playlist_id}/summary")
     async def spotify_playlist_summary(

@@ -587,6 +587,152 @@ function renderPlayer(status) {
   }
 }
 
+const PLAYER_ART_LONG_PRESS_MS = 650;
+let playerArtLongPressTimer = null;
+let playerArtLongPressPointerId = null;
+let playerArtLongPressStart = null;
+
+function closePlayerContextMenu() {
+  if (!playerContextMenu) return;
+  playerContextMenu.hidden = true;
+  playerContextMenu.setAttribute('aria-hidden', 'true');
+  playerContextMenu.innerHTML = '';
+}
+
+function positionPlayerContextMenu(x, y) {
+  if (!playerContextMenu) return;
+  const margin = 8;
+  const vw = window.innerWidth || 0;
+  const vh = window.innerHeight || 0;
+  playerContextMenu.style.left = `${Math.max(margin, Math.min(x, vw - margin))}px`;
+  playerContextMenu.style.top = `${Math.max(margin, Math.min(y, vh - margin))}px`;
+  requestAnimationFrame(() => {
+    const rect = playerContextMenu.getBoundingClientRect();
+    const clampedLeft = Math.max(margin, Math.min(rect.left, vw - rect.width - margin));
+    const clampedTop = Math.max(margin, Math.min(rect.top, vh - rect.height - margin));
+    playerContextMenu.style.left = `${clampedLeft}px`;
+    playerContextMenu.style.top = `${clampedTop}px`;
+  });
+}
+
+async function openPlaylistPicker({ trackUri }) {
+  if (!trackUri) return;
+  playlistPickerMode = true;
+  playlistPickerTitle = 'Add to playlist';
+  playlistPickerSubtitle = 'Select a playlist to add this song.';
+
+  playlistPickerOnSelect = async playlist => {
+    const channelId = getActiveChannelId();
+    const playlistId = playlist?.id || extractSpotifyPlaylistId(playlist?.uri);
+    if (!channelId || !playlistId) {
+      showError('Unable to add to this playlist.');
+      return;
+    }
+    try {
+      const res = await fetch(withChannel(`/api/spotify/playlists/${encodeURIComponent(playlistId)}/tracks`, channelId), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ track_uri: trackUri }),
+      });
+      await ensureOk(res);
+      showSuccess('Added to playlist.');
+      closePlaylistOverlay();
+    } catch (err) {
+      showError(`Failed to add to playlist: ${err.message}`);
+    }
+  };
+
+  openPlaylistOverlay({ picker: true });
+}
+
+function buildPlayerContextMenuActions() {
+  const channel = getActiveChannel();
+  const actions = [];
+
+  if (isRadioChannel(channel)) {
+    const state = getRadioState(channel) || {};
+    const canAdd = !!(state.station_id && state.stream_url && state.station_name);
+    actions.push({
+      id: 'radio-favorite',
+      label: 'Add to favorites',
+      disabled: !canAdd,
+      run: async () => {
+        if (!canAdd) {
+          showError('Tune a station before adding to favorites.');
+          return;
+        }
+        const payload = {
+          station_id: state.station_id,
+          name: state.station_name,
+          stream_url: state.stream_url,
+          country: state.station_country || null,
+          countrycode: state.station_countrycode || null,
+          bitrate: state.bitrate || null,
+          favicon: state.station_favicon || null,
+          homepage: state.station_homepage || null,
+          tags: Array.isArray(state.tags) ? state.tags : [],
+        };
+        const res = await fetch('/api/radio/favorites', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        await ensureOk(res);
+        showSuccess('Added to favorites.');
+      },
+    });
+  } else if (channel && (channel.source || '').toLowerCase() === 'spotify') {
+    const trackUri = playerStatus?.active ? (playerStatus?.item?.uri || null) : null;
+    actions.push({
+      id: 'spotify-add-playlist',
+      label: 'Add to playlist',
+      disabled: !trackUri,
+      run: async () => {
+        if (!trackUri) {
+          showError('Start playback before adding to a playlist.');
+          return;
+        }
+        await openPlaylistPicker({ trackUri });
+      },
+    });
+  }
+
+  return actions;
+}
+
+function openPlayerContextMenuAt(x, y) {
+  if (!playerContextMenu) return;
+  closePlayerContextMenu();
+  const actions = buildPlayerContextMenuActions();
+  if (!actions.length) return;
+
+  const title = document.createElement('div');
+  title.className = 'context-menu-title';
+  title.textContent = 'Actions';
+  playerContextMenu.appendChild(title);
+
+  actions.forEach(action => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'small-btn ghost-btn';
+    btn.textContent = action.label;
+    btn.disabled = !!action.disabled;
+    btn.addEventListener('click', async () => {
+      closePlayerContextMenu();
+      try {
+        await action.run();
+      } catch (err) {
+        showError(err?.message || 'Action failed.');
+      }
+    });
+    playerContextMenu.appendChild(btn);
+  });
+
+  playerContextMenu.hidden = false;
+  playerContextMenu.setAttribute('aria-hidden', 'false');
+  positionPlayerContextMenu(x, y);
+}
+
 async function handleRadioPlayToggle(channel) {
   if (!channel || !channel.id) {
     showError('Select a radio channel before toggling playback.');
@@ -2216,6 +2362,10 @@ if (playerArt) {
     if (!isPlayerArtInteractive()) return;
     openQueueOverlay();
   });
+  playerArt.addEventListener('contextmenu', evt => {
+    evt.preventDefault();
+    openPlayerContextMenuAt(evt.clientX, evt.clientY);
+  });
   playerArt.addEventListener('keydown', evt => {
     if (evt.key === 'Enter' || evt.key === ' ') {
       if (!isPlayerArtInteractive()) return;
@@ -2223,7 +2373,51 @@ if (playerArt) {
       openQueueOverlay();
     }
   });
+
+  playerArt.addEventListener('pointerdown', evt => {
+    if (evt.pointerType === 'mouse') return;
+    playerArtLongPressPointerId = evt.pointerId;
+    playerArtLongPressStart = { x: evt.clientX, y: evt.clientY };
+    clearTimeout(playerArtLongPressTimer);
+    playerArtLongPressTimer = setTimeout(() => {
+      playerArtLongPressTimer = null;
+      openPlayerContextMenuAt(playerArtLongPressStart?.x || 0, playerArtLongPressStart?.y || 0);
+    }, PLAYER_ART_LONG_PRESS_MS);
+  });
+
+  playerArt.addEventListener('pointermove', evt => {
+    if (!playerArtLongPressTimer) return;
+    if (playerArtLongPressPointerId !== evt.pointerId) return;
+    const start = playerArtLongPressStart;
+    if (!start) return;
+    const dx = (evt.clientX - start.x);
+    const dy = (evt.clientY - start.y);
+    if ((dx * dx + dy * dy) > 64) {
+      clearTimeout(playerArtLongPressTimer);
+      playerArtLongPressTimer = null;
+    }
+  });
+
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(type => {
+    playerArt.addEventListener(type, evt => {
+      if (playerArtLongPressPointerId && evt.pointerId !== playerArtLongPressPointerId) return;
+      if (playerArtLongPressTimer) {
+        clearTimeout(playerArtLongPressTimer);
+        playerArtLongPressTimer = null;
+      }
+      playerArtLongPressPointerId = null;
+      playerArtLongPressStart = null;
+    });
+  });
 }
+
+document.addEventListener('pointerdown', evt => {
+  if (!playerContextMenu || playerContextMenu.hidden) return;
+  if (evt.target === playerContextMenu || playerContextMenu.contains(evt.target)) return;
+  closePlayerContextMenu();
+});
+
+window.addEventListener('blur', () => closePlayerContextMenu());
 
 setPlayerArtInteractivity(false);
 

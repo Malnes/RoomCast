@@ -70,7 +70,9 @@ function setRadioActiveTab(tabId, options = {}) {
     const match = pane.dataset.radioPane === normalized;
     pane.hidden = !match;
   });
-  if (normalized === 'genres') {
+  if (normalized === 'favorites') {
+    ensureRadioFavorites();
+  } else if (normalized === 'genres') {
     ensureRadioGenres();
   } else if (normalized === 'countries') {
     ensureRadioCountries();
@@ -79,6 +81,82 @@ function setRadioActiveTab(tabId, options = {}) {
   } else if (normalized === 'search' && options.focusSearch && radioSearchInput) {
     setTimeout(() => radioSearchInput.focus({ preventScroll: true }), 50);
   }
+}
+
+function invalidateRadioFavoritesCache() {
+  radioDataCache.favorites = null;
+}
+
+async function ensureRadioFavorites(force = false) {
+  if (radioDataCache.favorites && !force) {
+    renderRadioFavorites(radioDataCache.favorites);
+    return;
+  }
+  setRadioResultsStatus('Loading favorites…');
+  radioResultsList && (radioResultsList.innerHTML = '');
+  try {
+    const res = await fetch('/api/radio/favorites');
+    await ensureOk(res);
+    const data = await res.json();
+    const favorites = Array.isArray(data?.favorites) ? data.favorites : [];
+    radioDataCache.favorites = favorites;
+    renderRadioFavorites(favorites);
+  } catch (err) {
+    setRadioResultsStatus('Unable to load favorites.');
+    showError(`Failed to load favorites: ${err.message}`);
+  }
+}
+
+function renderRadioFavorites(favorites) {
+  if (!radioResultsList) return;
+  radioResultsList.innerHTML = '';
+  const list = Array.isArray(favorites) ? favorites : [];
+  const channel = getRadioOverlayChannel();
+  if (!list.length) {
+    const empty = document.createElement('div');
+    empty.className = 'muted';
+    empty.textContent = 'No favorites yet. Long-press or right-click the player artwork to add the current station.';
+    radioResultsList.appendChild(empty);
+    setRadioResultsStatus('No favorites saved.');
+    return;
+  }
+  list.forEach(station => {
+    const card = buildRadioFavoriteCard(station, channel);
+    if (card) radioResultsList.appendChild(card);
+  });
+  setRadioResultsStatus(`Showing ${list.length} favorite${list.length === 1 ? '' : 's'}.`);
+}
+
+function buildRadioFavoriteCard(station, channel) {
+  const card = buildRadioStationCard(station, channel);
+  if (!card) return null;
+  const actions = card.querySelector('.radio-station-actions');
+  if (!actions) return card;
+
+  const removeBtn = document.createElement('button');
+  removeBtn.type = 'button';
+  removeBtn.className = 'small-btn ghost-btn';
+  removeBtn.textContent = 'Remove';
+  removeBtn.addEventListener('click', async evt => {
+    evt.stopPropagation();
+    const sid = station?.station_id;
+    if (!sid) return;
+    removeBtn.disabled = true;
+    try {
+      const res = await fetch(`/api/radio/favorites/${encodeURIComponent(sid)}`, { method: 'DELETE' });
+      await ensureOk(res);
+      const data = await res.json();
+      const updated = Array.isArray(data?.favorites) ? data.favorites : [];
+      radioDataCache.favorites = updated;
+      renderRadioFavorites(updated);
+      showSuccess('Removed favorite.');
+    } catch (err) {
+      removeBtn.disabled = false;
+      showError(`Failed to remove favorite: ${err.message}`);
+    }
+  });
+  actions.appendChild(removeBtn);
+  return card;
 }
 
 async function ensureRadioGenres(force = false) {
@@ -1122,10 +1200,16 @@ function selectAudiobookshelfPodcast(podcast) {
   fetchAudiobookshelfEpisodes(podcast.id);
 }
 
-function openPlaylistOverlay() {
+function openPlaylistOverlay(options = {}) {
   if (!playlistOverlay) return;
   const channel = getActiveChannel();
   const abs = isAudiobookshelfChannel(channel);
+  const picker = options?.picker === true;
+
+  if (playlistModalTitle && !playlistModalTitle.dataset.baseLabel) {
+    playlistModalTitle.dataset.baseLabel = playlistModalTitle.textContent.trim();
+  }
+
   setPlaylistOverlayMode(abs ? 'audiobookshelf' : 'spotify');
   resetPlaylistFilters();
   resetPlaylistTrackFilter();
@@ -1134,9 +1218,17 @@ function openPlaylistOverlay() {
   playlistSummaryAbortController = null;
   resetPlaylistDetails();
   setPlaylistOverlayOpen(true);
-  if (playlistSubtitle) playlistSubtitle.textContent = '';
+  if (playlistModalTitle) {
+    if (picker && playlistPickerTitle) playlistModalTitle.textContent = playlistPickerTitle;
+    else playlistModalTitle.textContent = playlistModalTitle.dataset.baseLabel || 'Playlists';
+  }
+  if (playlistSubtitle) playlistSubtitle.textContent = picker ? (playlistPickerSubtitle || '') : '';
   setPlaylistErrorMessage('');
   if (playlistTracklist) playlistTracklist.innerHTML = '';
+  if (picker) {
+    showPlaylistsGrid();
+    return;
+  }
   if (abs) {
     absLibraryId = null;
     absPodcastsCache = [];
@@ -1173,6 +1265,14 @@ function closePlaylistOverlay() {
   absLibraryId = null;
   absShowPlayed = false;
   setPlaylistOverlayMode('spotify');
+
+  playlistPickerMode = false;
+  playlistPickerOnSelect = null;
+  playlistPickerTitle = '';
+  playlistPickerSubtitle = '';
+  if (playlistModalTitle && playlistModalTitle.dataset.baseLabel) {
+    playlistModalTitle.textContent = playlistModalTitle.dataset.baseLabel;
+  }
 }
 
 function handlePlaylistBack() {

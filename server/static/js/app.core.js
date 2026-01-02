@@ -109,6 +109,7 @@ const playlistLoadMoreBtn = document.getElementById('playlist-load-more');
 const playlistTrackFilterInput = document.getElementById('playlist-track-filter');
 const playlistGridView = document.querySelector('.playlist-grid-view');
 const playlistTracksView = document.querySelector('.playlist-tracks-view');
+const playlistModalTitle = document.getElementById('playlist-modal-title');
 const playlistSubtitle = document.getElementById('playlist-modal-subtitle');
 const playlistSearchInput = document.getElementById('playlist-search');
 const playlistSortSelect = document.getElementById('playlist-sort');
@@ -298,7 +299,7 @@ let lastSearchQuery = '';
 let searchHasAttempted = false;
 let searchResultsState = defaultSearchBuckets();
 let searchAbortController = null;
-const RADIO_TABS = ['genres', 'top', 'countries', 'search'];
+const RADIO_TABS = ['favorites', 'genres', 'top', 'countries', 'search'];
 let radioActiveTab = 'genres';
 let radioActiveChannelId = null;
 let radioTopMetric = 'votes';
@@ -306,10 +307,18 @@ const radioDataCache = {
   genres: null,
   countries: null,
   top: { votes: null, clicks: null },
+  favorites: null,
 };
 let radioResultsAbortController = null;
 let radioCurrentResults = [];
 let radioResultsContextLabel = '';
+
+let playlistPickerMode = false;
+let playlistPickerOnSelect = null;
+let playlistPickerTitle = '';
+let playlistPickerSubtitle = '';
+
+const playerContextMenu = document.getElementById('player-context-menu');
 const playerCarouselCards = new Map();
 const playerCarouselIndicatorRefs = new Map();
 // Runtime data for the swipeable player carousel.

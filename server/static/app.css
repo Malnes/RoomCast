@@ -545,6 +545,10 @@ button.status-pill:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.6
 #player-panel.is-carousel-enabled { cursor: grab; }
 #player-panel.is-dragging { cursor: grabbing; }
 #player-panel:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.7); outline-offset: -4px; }
+.context-menu { position: fixed; z-index: 1200; min-width: 200px; max-width: min(320px, calc(100vw - 24px)); background: rgba(15,23,42,0.96); border: 1px solid rgba(255,255,255,0.12); border-radius: 16px; padding: 10px; box-shadow: 0 22px 60px rgba(0,0,0,0.55); display: flex; flex-direction: column; gap: 8px; }
+.context-menu[hidden] { display: none !important; }
+.context-menu-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.8px; color: rgba(255,255,255,0.6); padding: 2px 2px 0; }
+.context-menu button { width: 100%; justify-content: flex-start; }
 .player-card-contents { position: relative; display: flex; flex-direction: column; gap: 0; will-change: transform; }
 .player-card-contents.is-swipe-hidden { opacity: 0; pointer-events: none; }
 .player-card-contents.is-swiping { animation-duration: 0.35s; animation-timing-function: cubic-bezier(0.22, 0.61, 0.36, 1); animation-fill-mode: both; }

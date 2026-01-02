@@ -40,6 +40,32 @@ class RadioSlotsUpdatePayload(BaseModel):
     max_slots: int = Field(ge=1)
 
 
+class RadioFavoriteAddPayload(BaseModel):
+    station_id: str = Field(min_length=1, max_length=160)
+    name: str = Field(min_length=1, max_length=200)
+    stream_url: str = Field(min_length=1, max_length=500)
+    country: Optional[str] = Field(default=None, max_length=120)
+    countrycode: Optional[str] = Field(default=None, max_length=4)
+    bitrate: Optional[int] = Field(default=None, ge=0, le=1536)
+    favicon: Optional[str] = Field(default=None, max_length=500)
+    homepage: Optional[str] = Field(default=None, max_length=500)
+    tags: Optional[List[str]] = None
+
+    @classmethod
+    def from_station_payload(cls, payload: RadioStationSelectionPayload) -> "RadioFavoriteAddPayload":
+        return cls(
+            station_id=payload.station_id,
+            name=payload.name,
+            stream_url=payload.stream_url,
+            country=payload.country,
+            countrycode=payload.countrycode,
+            bitrate=payload.bitrate,
+            favicon=payload.favicon,
+            homepage=payload.homepage,
+            tags=payload.tags,
+        )
+
+
 def _make_radio_cache_key(path: str, params: Optional[dict]) -> str:
     if not params:
         return path
@@ -232,6 +258,51 @@ def create_radio_router(
     radio_browser_cache: Dict[str, Tuple[float, Any]] = {}
     radio_browser_base_urls = _radio_browser_base_url_candidates(radio_browser_base_url)
 
+    def _get_radio_favorites() -> List[dict]:
+        providers_by_id = get_providers_by_id()
+        state = providers_by_id.get("radio")
+        settings = state.settings if state and isinstance(state.settings, dict) else {}
+        raw = settings.get("favorites")
+        if not isinstance(raw, list):
+            return []
+        seen: set[str] = set()
+        favorites: List[dict] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            station_id = str(entry.get("station_id") or "").strip()
+            if not station_id or station_id in seen:
+                continue
+            stream_url = str(entry.get("stream_url") or "").strip()
+            name = str(entry.get("name") or "").strip()
+            if not name or not stream_url:
+                continue
+            seen.add(station_id)
+            favorites.append(
+                {
+                    "station_id": station_id,
+                    "name": name,
+                    "stream_url": stream_url,
+                    "country": entry.get("country"),
+                    "countrycode": entry.get("countrycode"),
+                    "bitrate": entry.get("bitrate"),
+                    "favicon": entry.get("favicon"),
+                    "homepage": entry.get("homepage"),
+                    "tags": entry.get("tags") if isinstance(entry.get("tags"), list) else None,
+                }
+            )
+        return favorites
+
+    def _set_radio_favorites(favorites: List[dict]) -> None:
+        providers_by_id = get_providers_by_id()
+        state = providers_by_id.get("radio")
+        if not state:
+            raise HTTPException(status_code=503, detail="Radio provider is not installed")
+        if not isinstance(state.settings, dict):
+            state.settings = {}
+        state.settings["favorites"] = favorites
+        save_providers_state()
+
     @router.get("/api/radio/genres")
     async def list_radio_genres(limit: int = Query(default=50, ge=1, le=400), _: None = Depends(require_radio_provider_dep)) -> dict:
         data = await _radio_browser_request(
@@ -349,6 +420,45 @@ def create_radio_router(
         )
         stations = [_serialize_radio_station(item) for item in data]
         return {"stations": stations[:limit]}
+
+    @router.get("/api/radio/favorites")
+    async def list_radio_favorites(_: None = Depends(require_radio_provider_dep)) -> dict:
+        return {"favorites": _get_radio_favorites()}
+
+    @router.post("/api/radio/favorites")
+    async def add_radio_favorite(
+        payload: RadioStationSelectionPayload,
+        _: None = Depends(require_radio_provider_dep),
+    ) -> dict:
+        favorite = RadioFavoriteAddPayload.from_station_payload(payload).model_dump()
+        station_id = favorite.get("station_id")
+        favorites = _get_radio_favorites()
+        by_id = {entry.get("station_id"): entry for entry in favorites if isinstance(entry, dict)}
+        by_id[station_id] = favorite
+        ordered: List[dict] = []
+        seen: set[str] = set()
+        for entry in favorites:
+            sid = entry.get("station_id") if isinstance(entry, dict) else None
+            if not sid or sid in seen:
+                continue
+            ordered.append(by_id.get(sid) or entry)
+            seen.add(sid)
+        if station_id and station_id not in seen:
+            ordered.append(favorite)
+        _set_radio_favorites(ordered)
+        return {"ok": True, "favorite": favorite, "favorites": ordered}
+
+    @router.delete("/api/radio/favorites/{station_id}")
+    async def remove_radio_favorite(
+        station_id: str,
+        _: None = Depends(require_radio_provider_dep),
+    ) -> dict:
+        sid = (station_id or "").strip()
+        if not sid:
+            raise HTTPException(status_code=400, detail="station_id is required")
+        favorites = [entry for entry in _get_radio_favorites() if entry.get("station_id") != sid]
+        _set_radio_favorites(favorites)
+        return {"ok": True, "removed": sid, "favorites": favorites}
 
     @router.post("/api/radio/{channel_id}/station")
     async def assign_radio_station(
