@@ -118,6 +118,27 @@ class AgentMetadataService:
                 node["max_volume_percent"] = max_vol
                 changed = True
 
+        if "eq_max_bands" in data:
+            try:
+                max_bands = int(data.get("eq_max_bands"))
+            except (TypeError, ValueError):
+                max_bands = None
+            if max_bands is not None:
+                max_bands = max(1, min(31, max_bands))
+                if node.get("eq_max_bands") != max_bands:
+                    node["eq_max_bands"] = max_bands
+                    changed = True
+
+        if "eq_active_bands" in data:
+            try:
+                active_bands = int(data.get("eq_active_bands"))
+            except (TypeError, ValueError):
+                active_bands = None
+            if active_bands is not None and active_bands >= 0:
+                if node.get("eq_active_bands") != active_bands:
+                    node["eq_active_bands"] = active_bands
+                    changed = True
+
         needs_reconfig = bool(node.pop("_needs_reconfig", False))
         if configured and needs_reconfig:
             try:

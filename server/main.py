@@ -111,7 +111,7 @@ TRANSIENT_NODE_FIELDS = {
     "sonos_stream_active",
     "sonos_stream_last_client",
 }
-AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.22").strip()
+AGENT_LATEST_VERSION = os.getenv("AGENT_LATEST_VERSION", "0.3.23").strip()
 NODE_RESTART_TIMEOUT = int(os.getenv("NODE_RESTART_TIMEOUT", "120"))
 NODE_RESTART_INTERVAL = int(os.getenv("NODE_RESTART_INTERVAL", "5"))
 NODE_HEALTH_INTERVAL = int(os.getenv("NODE_HEALTH_INTERVAL", "30"))

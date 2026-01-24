@@ -2093,6 +2093,32 @@ function persistEqSkinPreference(value) {
 }
 let eqSkin = loadEqSkinPreference();
 
+function getEqMaxBands(nodeId) {
+  const node = nodesCache.find(n => n.id === nodeId);
+  const raw = node?.eq_max_bands;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  if (value <= 0) return null;
+  return Math.max(1, Math.min(31, Math.round(value)));
+}
+
+function countActiveEqBands(bands = []) {
+  if (!Array.isArray(bands)) return 0;
+  return bands.reduce((total, band) => {
+    const gain = Number(band?.gain || 0);
+    return total + (Math.abs(gain) >= 0.1 ? 1 : 0);
+  }, 0);
+}
+
+function updateEqUsageLabel(nodeId) {
+  const el = document.getElementById(`eq-usage-${nodeId}`);
+  if (!el) return;
+  const state = getEqState(nodeId);
+  const active = countActiveEqBands(state.bands);
+  const maxBands = getEqMaxBands(nodeId);
+  el.textContent = maxBands ? `Bands in use: ${active} / ${maxBands}` : `Bands in use: ${active}`;
+}
+
 function setNodeSections(sections) {
   nodeSectionsCache = Array.isArray(sections) ? sections.filter(s => s && typeof s === 'object') : [];
 }

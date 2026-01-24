@@ -1190,6 +1190,32 @@ function setEqSkin(nextSkin) {
   persistEqSkinPreference(eqSkin);
 }
 
+function getEqMaxBands(nodeId) {
+  const node = nodesCache.find(n => n.id === nodeId);
+  const raw = node?.eq_max_bands;
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return null;
+  if (value <= 0) return null;
+  return Math.max(1, Math.min(31, Math.round(value)));
+}
+
+function countActiveEqBands(bands = []) {
+  if (!Array.isArray(bands)) return 0;
+  return bands.reduce((total, band) => {
+    const gain = Number(band?.gain || 0);
+    return total + (Math.abs(gain) >= 0.1 ? 1 : 0);
+  }, 0);
+}
+
+function updateEqUsageLabel(nodeId) {
+  const el = document.getElementById(`eq-usage-${nodeId}`);
+  if (!el) return;
+  const state = getEqState(nodeId);
+  const active = countActiveEqBands(state.bands);
+  const maxBands = getEqMaxBands(nodeId);
+  el.textContent = maxBands ? `Bands in use: ${active} / ${maxBands}` : `Bands in use: ${active}`;
+}
+
 function normalizeEqPayload(payload) {
   if (!payload) return { mode: 'peq15', bands: defaultEqBands('peq15') };
   const sourceBands = Array.isArray(payload.bands) ? payload.bands : [];
@@ -1275,6 +1301,13 @@ function handleCamillaPending(nodeId, pending) {
 
 async function pushEq(nodeId) {
   const state = getEqState(nodeId);
+  const maxBands = getEqMaxBands(nodeId);
+  const activeBands = countActiveEqBands(state.bands);
+  if (maxBands && activeBands > maxBands) {
+    showError(`EQ band limit reached (${activeBands} / ${maxBands}). Reset a band to enable more.`);
+    updateEqUsageLabel(nodeId);
+    return;
+  }
   const payload = {
     preset: state.mode,
     band_count: state.bands.length,
@@ -1308,6 +1341,7 @@ async function pushEq(nodeId) {
     markEqClean(nodeId);
     const pending = !!data?.result?.camilla_pending;
     handleCamillaPending(nodeId, pending);
+    updateEqUsageLabel(nodeId);
   } catch (err) {
     showError(`Failed to update EQ: ${err.message}`);
   }
@@ -1315,6 +1349,7 @@ async function pushEq(nodeId) {
 
 function renderEqBandsClassic(nodeId, container) {
   const state = getEqState(nodeId);
+  const maxBands = getEqMaxBands(nodeId);
   container.innerHTML = '';
   state.bands.forEach((band, idx) => {
     const row = document.createElement('div');
@@ -1374,11 +1409,24 @@ function renderEqBandsClassic(nodeId, container) {
     gainValue.className = 'muted';
     gainValue.textContent = `${band.gain.toFixed(1)} dB`;
     gainSlider.addEventListener('input', () => {
-      band.gain = clampValue(Number(gainSlider.value), EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
+      const nextGain = clampValue(Number(gainSlider.value), EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
+      const wasActive = Math.abs(band.gain) >= 0.1;
+      const willActive = Math.abs(nextGain) >= 0.1;
+      if (maxBands && !wasActive && willActive) {
+        const active = countActiveEqBands(state.bands);
+        if (active >= maxBands) {
+          showError(`EQ band limit reached (${active} / ${maxBands}). Reset a band to enable more.`);
+          gainSlider.value = band.gain;
+          setRangeProgress(gainSlider, gainSlider.value, gainSlider.max || 1);
+          return;
+        }
+      }
+      band.gain = nextGain;
       gainValue.textContent = `${band.gain.toFixed(1)} dB`;
       setRangeProgress(gainSlider, gainSlider.value, gainSlider.max || 1);
       markEqDirty(nodeId);
       scheduleEqPush(nodeId);
+      updateEqUsageLabel(nodeId);
     });
     gainCell.appendChild(gainLabel);
     gainCell.appendChild(gainSlider);
@@ -1410,6 +1458,7 @@ function renderEqBandsClassic(nodeId, container) {
 
 function renderEqBandsFaders(nodeId, container) {
   const state = getEqState(nodeId);
+  const maxBands = getEqMaxBands(nodeId);
   container.innerHTML = '';
   const view = document.createElement('div');
   view.className = 'eq-fader-view';
@@ -1447,11 +1496,24 @@ function renderEqBandsFaders(nodeId, container) {
     const knob = document.createElement('div');
     knob.className = 'eq-fader-thumb';
     gainSlider.addEventListener('input', () => {
-      band.gain = clampValue(Number(gainSlider.value), EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
+      const nextGain = clampValue(Number(gainSlider.value), EQ_GAIN_RANGE.min, EQ_GAIN_RANGE.max);
+      const wasActive = Math.abs(band.gain) >= 0.1;
+      const willActive = Math.abs(nextGain) >= 0.1;
+      if (maxBands && !wasActive && willActive) {
+        const active = countActiveEqBands(state.bands);
+        if (active >= maxBands) {
+          showError(`EQ band limit reached (${active} / ${maxBands}). Reset a band to enable more.`);
+          gainSlider.value = band.gain.toFixed(1);
+          updateFaderThumbPosition(sliderWrap, gainSlider, knob);
+          return;
+        }
+      }
+      band.gain = nextGain;
       gainValue.textContent = `${band.gain.toFixed(1)} dB`;
       updateFaderThumbPosition(sliderWrap, gainSlider, knob);
       markEqDirty(nodeId);
       scheduleEqPush(nodeId);
+      updateEqUsageLabel(nodeId);
     });
     sliderWrap.appendChild(gainSlider);
     sliderWrap.appendChild(knob);
@@ -1609,6 +1671,7 @@ function openEqModal(nodeId, nodeName) {
     setEqMode(nodeId, modeSelect.value);
     renderEqBands(nodeId, bandList);
     scheduleEqPush(nodeId);
+    updateEqUsageLabel(nodeId);
   });
   const resetBtn = document.createElement('button');
   resetBtn.className = 'small-btn';
@@ -1618,6 +1681,7 @@ function openEqModal(nodeId, nodeName) {
     markEqDirty(nodeId);
     renderEqBands(nodeId, bandList);
     scheduleEqPush(nodeId);
+    updateEqUsageLabel(nodeId);
   });
   const savePresetBtn = document.createElement('button');
   savePresetBtn.className = 'small-btn';
@@ -1627,12 +1691,18 @@ function openEqModal(nodeId, nodeName) {
   controls.appendChild(modeSelect);
   controls.appendChild(resetBtn);
   controls.appendChild(savePresetBtn);
+  const usageLabel = document.createElement('div');
+  usageLabel.id = `eq-usage-${nodeId}`;
+  usageLabel.className = 'muted';
+  usageLabel.style.marginLeft = 'auto';
+  controls.appendChild(usageLabel);
   card.appendChild(controls);
 
   const bandList = document.createElement('div');
   bandList.className = 'eq-band-list';
   renderEqBands(nodeId, bandList);
   card.appendChild(bandList);
+  updateEqUsageLabel(nodeId);
 
   const presetWrap = document.createElement('div');
   presetWrap.className = 'panel';
@@ -1685,6 +1755,7 @@ function renderPresets(nodeId, container, modeSelect, bandList) {
       markEqDirty(nodeId);
       renderEqBands(nodeId, bandList);
       scheduleEqPush(nodeId);
+      updateEqUsageLabel(nodeId);
     });
     row.appendChild(label);
     row.appendChild(apply);

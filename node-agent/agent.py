@@ -23,7 +23,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 
-AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.22")
+AGENT_VERSION = os.getenv("AGENT_VERSION", "0.3.23")
 MIXER_CONTROL = os.getenv("MIXER_CONTROL", "Master")
 MIXER_FALLBACKS = [
     MIXER_CONTROL,
@@ -53,6 +53,7 @@ AGENT_CONFIG_PATH = Path(os.getenv("AGENT_CONFIG_PATH", "/var/lib/roomcast/agent
 NODE_UID_PATH = Path(os.getenv("NODE_UID_PATH", "/var/lib/roomcast/node-uid"))
 SNAPCLIENT_BIN = os.getenv("SNAPCLIENT_BIN", "snapclient")
 SNAPCLIENT_DEFAULT_PORT = int(os.getenv("SNAPCLIENT_PORT", "1704"))
+EQ_MAX_ACTIVE_BANDS = int(os.getenv("EQ_MAX_ACTIVE_BANDS", "31"))
 RECOVERY_CODE_SECONDS = int(os.getenv("RECOVERY_CODE_SECONDS", "600"))
 RECOVERY_LED_ENABLED = os.getenv("RECOVERY_LED_ENABLED", "1").lower() not in {"0", "false", "no"}
 RECOVERY_LED_PATH = os.getenv("RECOVERY_LED_PATH", "").strip() or None
@@ -78,6 +79,29 @@ snapclient_lock = asyncio.Lock()
 
 recovery_state: dict = {}
 recovery_task: asyncio.Task | None = None
+
+
+def _normalize_eq_max_bands(value: int) -> int:
+    try:
+        target = int(value)
+    except (TypeError, ValueError):
+        target = 31
+    return max(1, min(31, target))
+
+
+EQ_MAX_ACTIVE_BANDS = _normalize_eq_max_bands(EQ_MAX_ACTIVE_BANDS)
+
+
+def _count_active_eq_bands(bands: list[dict]) -> int:
+    active = 0
+    for band in bands or []:
+        try:
+            gain = float(band.get("gain", 0))
+        except (TypeError, ValueError):
+            gain = 0.0
+        if abs(gain) >= 0.1:
+            active += 1
+    return active
 
 
 def _read_text_safely(path: Path) -> str:
@@ -1079,6 +1103,8 @@ async def health() -> dict:
         "fingerprint": node_uid,
         "max_volume_percent": _max_volume_percent(),
         "wifi": _wifi_signal_snapshot(),
+        "eq_max_bands": EQ_MAX_ACTIVE_BANDS,
+        "eq_active_bands": _count_active_eq_bands(eq_state.get("bands", [])),
     }
 
 
@@ -1183,9 +1209,19 @@ async def set_mute(payload: MutePayload, request: Request) -> dict:
 @app.post("/eq")
 async def set_eq(payload: EqPayload, request: Request) -> dict:
     _auth(request)
+    bands_payload = [band.model_dump() for band in payload.bands]
+    active_bands = _count_active_eq_bands(bands_payload)
+    if active_bands > EQ_MAX_ACTIVE_BANDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"EQ band limit exceeded ({active_bands} active, max {EQ_MAX_ACTIVE_BANDS}). "
+                "Reset an active band before enabling more."
+            ),
+        )
     eq_state["preset"] = payload.preset or eq_state.get("preset") or "peq15"
     eq_state["band_count"] = payload.band_count
-    eq_state["bands"] = [band.model_dump() for band in payload.bands]
+    eq_state["bands"] = bands_payload
     global camilla_pending_eq
     try:
         await _apply_camilla_eq()
@@ -1201,7 +1237,13 @@ async def set_eq(payload: EqPayload, request: Request) -> dict:
         else:
             log.exception("Failed to apply EQ via CamillaDSP")
             raise HTTPException(status_code=500, detail=f"Failed to apply EQ: {exc}")
-    return {"ok": True, "eq": eq_state, "camilla_pending": pending}
+    return {
+        "ok": True,
+        "eq": eq_state,
+        "camilla_pending": pending,
+        "eq_active_bands": active_bands,
+        "eq_max_bands": EQ_MAX_ACTIVE_BANDS,
+    }
 
 
 @app.post("/stereo")

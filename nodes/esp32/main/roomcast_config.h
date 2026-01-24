@@ -1,0 +1,24 @@
+#pragma once
+
+#define ROOMCAST_HTTP_PORT 80
+#define ROOMCAST_AGENT_PORT 9700
+#define ROOMCAST_SOFTAP_SSID_PREFIX "RoomCast-Setup-"
+#define ROOMCAST_SOFTAP_PASS "roomcast"
+#define ROOMCAST_SOFTAP_CHANNEL 6
+#define ROOMCAST_SOFTAP_MAX_CONN 4
+
+#define ROOMCAST_EQ_MAX_BANDS_DEFAULT 5
+
+#define ROOMCAST_I2S_BCK_GPIO 17
+#define ROOMCAST_I2S_LRCK_GPIO 18
+#define ROOMCAST_I2S_DATA_GPIO 16
+
+#define ROOMCAST_NVS_NAMESPACE "roomcast"
+#define ROOMCAST_NVS_KEY_AGENT_SECRET "agent_secret"
+#define ROOMCAST_NVS_KEY_SNAP_HOST "snap_host"
+#define ROOMCAST_NVS_KEY_SNAP_PORT "snap_port"
+#define ROOMCAST_NVS_KEY_WIFI_SSID "wifi_ssid"
+#define ROOMCAST_NVS_KEY_WIFI_PASS "wifi_pass"
+#define ROOMCAST_NVS_KEY_EQ_STATE "eq_state"
+#define ROOMCAST_NVS_KEY_MAX_VOLUME "max_volume"
+#define ROOMCAST_NVS_KEY_OTA_URL "ota_url"

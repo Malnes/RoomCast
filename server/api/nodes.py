@@ -341,8 +341,34 @@ def create_nodes_router(
         node = nodes().get(node_id)
         if not node:
             raise HTTPException(status_code=404, detail="Unknown node")
+        eq_bands = [band.model_dump() for band in payload.bands]
+        active_bands = 0
+        for band in eq_bands:
+            try:
+                gain = float(band.get("gain", 0))
+            except (TypeError, ValueError):
+                gain = 0.0
+            if abs(gain) >= 0.1:
+                active_bands += 1
+        max_bands_raw = node.get("eq_max_bands")
+        try:
+            max_bands = int(max_bands_raw)
+        except (TypeError, ValueError):
+            max_bands = None
+        if max_bands is not None:
+            max_bands = max(1, min(31, max_bands))
+            if active_bands > max_bands:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"EQ band limit exceeded ({active_bands} active, max {max_bands}). "
+                        "Reset an active band before enabling more."
+                    ),
+                )
         eq_data = payload.model_dump()
+        eq_data["bands"] = eq_bands
         node["eq"] = eq_data
+        node["eq_active_bands"] = active_bands
         save_nodes()
         if node.get("type") == "browser":
             ws = browser_ws().get(node_id)
