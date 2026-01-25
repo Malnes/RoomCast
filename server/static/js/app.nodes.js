@@ -722,14 +722,16 @@ async function unregisterNode(nodeId) {
   const node = nodesCache.find(n => n.id === nodeId);
   const name = node?.name ? `"${node.name}"` : 'this node';
   const confirmed = window.confirm(`Are you sure you want to unregister ${name}?`);
-  if (!confirmed) return;
+  if (!confirmed) return false;
   try {
     const res = await fetch(`/api/nodes/${nodeId}`, { method: 'DELETE' });
     await ensureOk(res);
     showSuccess('Node unregistered');
     await fetchNodes();
+    return true;
   } catch (err) {
     showError(`Failed to unregister node: ${err.message}`);
+    return false;
   }
 }
 

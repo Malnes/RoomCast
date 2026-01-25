@@ -935,7 +935,7 @@ async function registerNode() {
   }
 }
 
-async function registerNodeWithName(name, url, btn, nodeId, fingerprint) {
+async function registerNodeWithName(name, url, btn, nodeId, fingerprint, successMessage) {
   const normalizedUrl = normalizeNodeUrl(url);
   if (!normalizedUrl) {
     showError('Agent URL is required');
@@ -956,7 +956,7 @@ async function registerNodeWithName(name, url, btn, nodeId, fingerprint) {
       body: JSON.stringify(payload),
     });
     await ensureOk(res);
-    showSuccess(nodeId ? 'Node relinked' : 'Node registered');
+    showSuccess(successMessage || (nodeId ? 'Node relinked' : 'Node registered'));
     await fetchNodes();
   } finally {
     if (btn) btn.disabled = false;
@@ -1939,42 +1939,75 @@ async function scanSonosSpeakers() {
       urlSpan.className = 'muted';
       urlSpan.style.marginLeft = '8px';
       urlSpan.textContent = item.url;
-      const label = document.createElement('div');
-      label.className = 'label';
-      label.textContent = 'Sonos speaker';
       title.appendChild(strong);
       title.appendChild(urlSpan);
-      title.appendChild(label);
-
       const nameInput = document.createElement('input');
-      nameInput.style.marginTop = '6px';
+      nameInput.style.flex = '1';
+      nameInput.style.minWidth = '180px';
+
+      const actionRow = document.createElement('div');
+      actionRow.style.display = 'flex';
+      actionRow.style.gap = '8px';
+      actionRow.style.alignItems = 'center';
+      actionRow.style.flexWrap = 'wrap';
+      actionRow.style.marginTop = '6px';
+
+      const btn = document.createElement('button');
+      btn.className = 'small-btn';
+
       const existing = (typeof findNodeByFingerprint === 'function') ? findNodeByFingerprint(item.fingerprint) : null;
       if (existing) {
         nameInput.value = existing.name || existing.id || sonosName || 'Sonos speaker';
         nameInput.disabled = true;
+        btn.textContent = 'Remove';
+        btn.classList.add('danger-btn');
       } else {
         nameInput.value = sonosName || 'Sonos speaker';
+        btn.textContent = 'Register';
       }
-      const btn = document.createElement('button');
-      btn.className = 'small-btn';
-      btn.textContent = existing ? 'Relink node' : 'Register';
-      btn.style.marginTop = '6px';
-      btn.addEventListener('click', () => registerNodeWithName(
-        existing ? existing.name : nameInput.value,
-        item.url,
-        btn,
-        existing ? existing.id : undefined,
-        item.fingerprint,
-      ));
-      row.appendChild(title);
-      row.appendChild(nameInput);
+
+      const applyRegisteredState = node => {
+        if (!node) return;
+        nameInput.value = node.name || node.id || nameInput.value;
+        nameInput.disabled = true;
+        btn.textContent = 'Remove';
+        btn.classList.add('danger-btn');
+        btn.onclick = async () => {
+          const removed = await unregisterNode(node.id);
+          if (!removed) return;
+          nameInput.disabled = false;
+          btn.textContent = 'Register';
+          btn.classList.remove('danger-btn');
+          btn.onclick = handleRegister;
+        };
+      };
+
+      const handleRegister = async () => {
+        try {
+          await registerNodeWithName(
+            existing ? existing.name : nameInput.value,
+            item.url,
+            btn,
+            existing ? existing.id : undefined,
+            item.fingerprint,
+            existing ? 'Speaker relinked' : 'Speaker registered',
+          );
+        } catch (_) {
+          return;
+        }
+        const registered = (typeof findNodeByFingerprint === 'function') ? findNodeByFingerprint(item.fingerprint) : null;
+        applyRegisteredState(registered || existing);
+      };
+
       if (existing) {
-        const hint = document.createElement('div');
-        hint.className = 'label';
-        hint.textContent = `Registered as “${existing.name || existing.id}”`;
-        row.appendChild(hint);
+        applyRegisteredState(existing);
+      } else {
+        btn.onclick = handleRegister;
       }
-      row.appendChild(btn);
+      row.appendChild(title);
+      actionRow.appendChild(nameInput);
+      actionRow.appendChild(btn);
+      row.appendChild(actionRow);
       addNodeSonosList.appendChild(row);
     });
   } catch (err) {
