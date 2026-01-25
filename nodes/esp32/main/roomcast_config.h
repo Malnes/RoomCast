@@ -24,3 +24,4 @@
 #define ROOMCAST_NVS_KEY_EQ_STATE "eq_state"
 #define ROOMCAST_NVS_KEY_MAX_VOLUME "max_volume"
 #define ROOMCAST_NVS_KEY_OTA_URL "ota_url"
+#define ROOMCAST_NVS_KEY_DEVICE_NAME "device_name"

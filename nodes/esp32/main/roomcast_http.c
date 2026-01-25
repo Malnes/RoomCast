@@ -33,8 +33,10 @@ static char g_snap_host[64] = {0};
 static uint16_t g_snap_port = 1704;
 static char g_fingerprint[20] = {0};
 static char g_ota_url[160] = {0};
+static char g_device_name[64] = {0};
 static bool g_ota_task_running = false;
 static httpd_handle_t g_portal_server = NULL;
+static httpd_handle_t g_agent_server = NULL;
 
 static bool load_agent_secret(void) {
     return roomcast_storage_get_string(ROOMCAST_NVS_KEY_AGENT_SECRET, g_agent_secret, sizeof(g_agent_secret));
@@ -81,6 +83,12 @@ static void load_ota_url(void) {
     roomcast_storage_get_string(ROOMCAST_NVS_KEY_OTA_URL, g_ota_url, sizeof(g_ota_url));
 }
 
+static void load_device_name(void) {
+    if (!roomcast_storage_get_string(ROOMCAST_NVS_KEY_DEVICE_NAME, g_device_name, sizeof(g_device_name))) {
+        strncpy(g_device_name, "RoomCast ESP32", sizeof(g_device_name) - 1);
+    }
+}
+
 static bool require_auth(httpd_req_t *req) {
     const char *header = httpd_req_get_hdr_value_len(req, "X-Agent-Secret") > 0 ? "X-Agent-Secret" : NULL;
     if (!header) {
@@ -115,7 +123,8 @@ static esp_err_t health_handler(httpd_req_t *req) {
     cJSON_AddStringToObject(root, "status", "ok");
     cJSON_AddBoolToObject(root, "paired", g_agent_secret[0] != '\0');
     cJSON_AddBoolToObject(root, "configured", g_snap_host[0] != '\0');
-    cJSON_AddStringToObject(root, "version", "esp32-0.1.5");
+    cJSON_AddStringToObject(root, "version", "esp32-0.1.12");
+    cJSON_AddStringToObject(root, "name", g_device_name);
     cJSON_AddBoolToObject(root, "updating", g_updating);
     cJSON_AddStringToObject(root, "playback_device", "i2s");
     cJSON *outputs = cJSON_CreateObject();
@@ -441,18 +450,74 @@ static esp_err_t restart_post_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static void escape_html_attr(const char *src, char *dest, size_t dest_len) {
+    size_t out = 0;
+    if (!src || !dest || dest_len == 0) return;
+    for (size_t i = 0; src[i] && out + 6 < dest_len; i++) {
+        char c = src[i];
+        if (c == '&') {
+            memcpy(dest + out, "&amp;", 5);
+            out += 5;
+        } else if (c == '"') {
+            memcpy(dest + out, "&quot;", 6);
+            out += 6;
+        } else if (c == '<') {
+            memcpy(dest + out, "&lt;", 4);
+            out += 4;
+        } else if (c == '>') {
+            memcpy(dest + out, "&gt;", 4);
+            out += 4;
+        } else {
+            dest[out++] = c;
+        }
+    }
+    dest[out] = '\0';
+}
+
 static esp_err_t wifi_portal_get(httpd_req_t *req) {
-    const char *html =
-        "<html><head><title>RoomCast Wi-Fi</title></head><body>"
-        "<h2>Connect RoomCast node to Wi-Fi</h2>"
+    static const char *prefix =
+        "<!doctype html>"
+        "<html lang='en'><head>"
+        "<meta charset='UTF-8'/>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1.0'/>"
+        "<title>RoomCast Setup</title>"
+        "<style>"
+        "*,*::before,*::after{box-sizing:border-box;}"
+        ":root{--accent:#22c55e;--bg:#0b1020;--panel:#0f172a;--text:#e2e8f0;--muted:#94a3b8;}"
+        "body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,sans-serif;display:flex;min-height:100vh;align-items:center;justify-content:center;padding:24px;}"
+        ".panel{width:min(520px,100%);background:rgba(15,23,42,.85);border:1px solid rgba(148,163,184,.18);border-radius:18px;padding:22px;box-shadow:0 20px 50px rgba(0,0,0,.35);}" 
+        ".title{font-size:1.4rem;font-weight:700;margin:0 0 8px;}"
+        ".subtitle{color:var(--muted);margin:0 0 18px;line-height:1.45;}"
+        "label{display:block;margin-bottom:6px;color:#cbd5e1;font-size:.9rem;}"
+        "input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(148,163,184,.25);background:rgba(2,6,23,.6);color:var(--text);}" 
+        "button{margin-top:14px;width:100%;padding:12px 14px;border:none;border-radius:12px;background:linear-gradient(135deg,#22c55e,#16a34a);color:#0b1020;font-weight:700;cursor:pointer;}"
+        ".pill{display:inline-flex;align-items:center;gap:8px;padding:6px 12px;border-radius:999px;border:1px solid rgba(148,163,184,.25);background:rgba(2,6,23,.6);font-size:.75rem;letter-spacing:.08em;text-transform:uppercase;color:#a7f3d0;}"
+        "</style></head><body>"
+        "<div class='panel'>"
+        "<div class='pill'>RoomCast Setup</div>"
+        "<h1 class='title'>Connect this node to Wi‑Fi</h1>"
+        "<p class='subtitle'>Enter your Wi‑Fi details to finish setup. The node will reboot after saving.</p>"
         "<form method='POST' action='/wifi'>"
-        "SSID:<br/><input name='ssid' /><br/>"
-        "Password:<br/><input name='pass' type='password' /><br/>"
-        "<button type='submit'>Save</button>"
+        "<label for='name'>Device name</label>"
+        "<input id='name' name='name' autocomplete='off' placeholder='RoomCast ESP32' value='";
+    static const char *suffix =
+        "'/>"
+        "<label for='ssid' style='margin-top:12px;'>Wi‑Fi name (SSID)</label>"
+        "<input id='ssid' name='ssid' autocomplete='off' placeholder='e.g. Office Wi‑Fi'/>"
+        "<label for='pass' style='margin-top:12px;'>Password</label>"
+        "<input id='pass' name='pass' type='password' autocomplete='off' placeholder='••••••••'/>"
+        "<button type='submit'>Save & Restart</button>"
         "</form>"
-        "</body></html>";
+        "</div></body></html>";
+
+    char escaped_name[192] = {0};
+    escape_html_attr(g_device_name, escaped_name, sizeof(escaped_name));
+
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_sendstr(req, html);
+    httpd_resp_sendstr_chunk(req, prefix);
+    httpd_resp_sendstr_chunk(req, escaped_name);
+    httpd_resp_sendstr_chunk(req, suffix);
+    httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }
 
@@ -477,7 +542,14 @@ static esp_err_t wifi_portal_post(httpd_req_t *req) {
     if (len < 0) return ESP_FAIL;
     char ssid[64] = {0};
     char pass[64] = {0};
-    sscanf(buf, "ssid=%63[^&]&pass=%63s", ssid, pass);
+    char name[64] = {0};
+    httpd_query_key_value(buf, "ssid", ssid, sizeof(ssid));
+    httpd_query_key_value(buf, "pass", pass, sizeof(pass));
+    httpd_query_key_value(buf, "name", name, sizeof(name));
+    if (name[0]) {
+        roomcast_storage_set_string(ROOMCAST_NVS_KEY_DEVICE_NAME, name);
+        strncpy(g_device_name, name, sizeof(g_device_name) - 1);
+    }
     roomcast_storage_set_string(ROOMCAST_NVS_KEY_WIFI_SSID, ssid);
     roomcast_storage_set_string(ROOMCAST_NVS_KEY_WIFI_PASS, pass);
     httpd_resp_sendstr(req, "Saved. Rebooting...");
@@ -493,6 +565,7 @@ static bool start_portal_server(void) {
     portal_cfg.max_uri_handlers = 8;
     portal_cfg.max_open_sockets = 4;
     portal_cfg.lru_purge_enable = true;
+    portal_cfg.stack_size = 16384;
 
     if (httpd_start(&g_portal_server, &portal_cfg) != ESP_OK) {
         ESP_LOGW(TAG, "Failed to start captive portal server");
@@ -519,6 +592,11 @@ static void stop_portal_server(void) {
 
 void roomcast_http_set_portal_enabled(bool enabled) {
     if (enabled) {
+        if (g_agent_server) {
+            httpd_stop(g_agent_server);
+            g_agent_server = NULL;
+            ESP_LOGI(TAG, "Agent server stopped (portal active)");
+        }
         if (!start_portal_server()) {
             roomcast_led_set_status(ROOMCAST_LED_ERROR);
         } else {
@@ -529,46 +607,36 @@ void roomcast_http_set_portal_enabled(bool enabled) {
     }
 }
 
-bool roomcast_http_start(void) {
-    load_agent_secret();
-    roomcast_eq_init(&g_eq_state, 15);
-    roomcast_eq_set_active_limit(ROOMCAST_EQ_MAX_BANDS_DEFAULT);
-    load_snap_config();
-    load_max_volume();
-    load_ota_url();
-
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_STA);
-    snprintf(g_fingerprint, sizeof(g_fingerprint), "%02X:%02X:%02X:%02X:%02X:%02X",
-             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-
+static bool start_agent_server(void) {
+    if (g_agent_server) return true;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = ROOMCAST_AGENT_PORT;
     config.max_uri_handlers = 24;
     config.max_open_sockets = 7;
     config.lru_purge_enable = true;
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) != ESP_OK) {
+    if (httpd_start(&g_agent_server, &config) != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start agent server");
+        g_agent_server = NULL;
         return false;
     }
 
     httpd_uri_t health = {.uri = "/health", .method = HTTP_GET, .handler = health_handler};
-    httpd_register_uri_handler(server, &health);
+    httpd_register_uri_handler(g_agent_server, &health);
 
     httpd_uri_t pair_get = {.uri = "/pair", .method = HTTP_GET, .handler = pair_get_handler};
     httpd_uri_t pair_post = {.uri = "/pair", .method = HTTP_POST, .handler = pair_post_handler};
-    httpd_register_uri_handler(server, &pair_get);
-    httpd_register_uri_handler(server, &pair_post);
+    httpd_register_uri_handler(g_agent_server, &pair_get);
+    httpd_register_uri_handler(g_agent_server, &pair_post);
 
     httpd_uri_t snap_get = {.uri = "/config/snapclient", .method = HTTP_GET, .handler = snapclient_get_handler};
     httpd_uri_t snap_post = {.uri = "/config/snapclient", .method = HTTP_POST, .handler = snapclient_post_handler};
-    httpd_register_uri_handler(server, &snap_get);
-    httpd_register_uri_handler(server, &snap_post);
+    httpd_register_uri_handler(g_agent_server, &snap_get);
+    httpd_register_uri_handler(g_agent_server, &snap_post);
 
     httpd_uri_t outputs_get = {.uri = "/outputs", .method = HTTP_GET, .handler = outputs_get_handler};
     httpd_uri_t outputs_post = {.uri = "/outputs", .method = HTTP_POST, .handler = outputs_post_handler};
-    httpd_register_uri_handler(server, &outputs_get);
-    httpd_register_uri_handler(server, &outputs_post);
+    httpd_register_uri_handler(g_agent_server, &outputs_get);
+    httpd_register_uri_handler(g_agent_server, &outputs_post);
 
     httpd_uri_t vol_post = {.uri = "/volume", .method = HTTP_POST, .handler = volume_post_handler};
     httpd_uri_t mute_post = {.uri = "/mute", .method = HTTP_POST, .handler = mute_post_handler};
@@ -578,27 +646,46 @@ bool roomcast_http_start(void) {
     httpd_uri_t update_post = {.uri = "/update", .method = HTTP_POST, .handler = update_post_handler};
     httpd_uri_t restart_post = {.uri = "/restart", .method = HTTP_POST, .handler = restart_post_handler};
 
-    httpd_register_uri_handler(server, &vol_post);
-    httpd_register_uri_handler(server, &mute_post);
-    httpd_register_uri_handler(server, &eq_post);
-    httpd_register_uri_handler(server, &stereo_post);
-    httpd_register_uri_handler(server, &max_volume_post);
-    httpd_register_uri_handler(server, &update_post);
-    httpd_register_uri_handler(server, &restart_post);
+    httpd_register_uri_handler(g_agent_server, &vol_post);
+    httpd_register_uri_handler(g_agent_server, &mute_post);
+    httpd_register_uri_handler(g_agent_server, &eq_post);
+    httpd_register_uri_handler(g_agent_server, &stereo_post);
+    httpd_register_uri_handler(g_agent_server, &max_volume_post);
+    httpd_register_uri_handler(g_agent_server, &update_post);
+    httpd_register_uri_handler(g_agent_server, &restart_post);
 
-    if (!roomcast_wifi_is_connected()) {
-        roomcast_http_set_portal_enabled(true);
-    }
+    ESP_LOGI(TAG, "Agent server started");
+    return true;
+}
 
-    httpd_config_t portal_config = HTTPD_DEFAULT_CONFIG();
-    portal_config.server_port = ROOMCAST_HTTP_PORT;
-    httpd_handle_t portal = NULL;
-    if (httpd_start(&portal, &portal_config) == ESP_OK) {
-        httpd_uri_t wifi_get = {.uri = "/", .method = HTTP_GET, .handler = wifi_portal_get};
-        httpd_uri_t wifi_post = {.uri = "/wifi", .method = HTTP_POST, .handler = wifi_portal_post};
-        httpd_register_uri_handler(portal, &wifi_get);
-        httpd_register_uri_handler(portal, &wifi_post);
+void roomcast_http_set_agent_enabled(bool enabled) {
+    if (enabled) {
+        stop_portal_server();
+        if (!start_agent_server()) {
+            roomcast_led_set_status(ROOMCAST_LED_ERROR);
+        }
+    } else {
+        if (g_agent_server) {
+            httpd_stop(g_agent_server);
+            g_agent_server = NULL;
+            ESP_LOGI(TAG, "Agent server stopped");
+        }
     }
+}
+
+bool roomcast_http_init(void) {
+    load_agent_secret();
+    roomcast_eq_init(&g_eq_state, 15);
+    roomcast_eq_set_active_limit(ROOMCAST_EQ_MAX_BANDS_DEFAULT);
+    load_snap_config();
+    load_max_volume();
+    load_ota_url();
+    load_device_name();
+
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(g_fingerprint, sizeof(g_fingerprint), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
     return true;
 }

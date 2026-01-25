@@ -13,10 +13,14 @@ static rmt_channel_t g_rmt_channel = RMT_CHANNEL_0;
 static TaskHandle_t g_led_task = NULL;
 static roomcast_led_status_t g_status = ROOMCAST_LED_OFF;
 
+static uint8_t scale_half(uint8_t v) {
+    return (uint8_t)((uint16_t)v * 128 / 255);
+}
+
 static void set_color(uint8_t r, uint8_t g, uint8_t b) {
     if (!g_rmt_ready) return;
     rmt_item32_t items[24];
-    uint32_t grb = ((uint32_t)g << 16) | ((uint32_t)r << 8) | (uint32_t)b;
+    uint32_t grb = ((uint32_t)scale_half(g) << 16) | ((uint32_t)scale_half(r) << 8) | (uint32_t)scale_half(b);
 
     const uint32_t t0h = 16; // 0.4us @ 40MHz
     const uint32_t t0l = 34; // 0.85us

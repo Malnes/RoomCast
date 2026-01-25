@@ -17,6 +17,14 @@
 #include "cJSON.h"
 
 #include "roomcast_config.h"
+#include "roomcast_storage.h"
+
+static void load_device_name(char *out, size_t out_len) {
+    if (!out || out_len == 0) return;
+    if (!roomcast_storage_get_string(ROOMCAST_NVS_KEY_DEVICE_NAME, out, out_len)) {
+        strncpy(out, "RoomCast ESP32", out_len - 1);
+    }
+}
 
 static const char *TAG = "roomcast_snapclient";
 
@@ -125,16 +133,36 @@ static void send_hello(void) {
     snprintf(mac_str, sizeof(mac_str), "%02X:%02X:%02X:%02X:%02X:%02X",
              mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 
+    char device_name[64] = {0};
+    load_device_name(device_name, sizeof(device_name));
+    char hostname[64] = {0};
+    size_t name_len = strlen(device_name);
+    size_t host_len = 0;
+    for (size_t i = 0; i < name_len && host_len < sizeof(hostname) - 1; i++) {
+        char c = device_name[i];
+        if ((c >= 'A' && c <= 'Z')) c = (char)(c + 32);
+        if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
+            hostname[host_len++] = c;
+        } else if (c == ' ' || c == '-' || c == '_') {
+            if (host_len > 0 && hostname[host_len - 1] != '-') {
+                hostname[host_len++] = '-';
+            }
+        }
+    }
+    if (host_len == 0) {
+        strncpy(hostname, "roomcast-esp32", sizeof(hostname) - 1);
+    }
+
     cJSON *root = cJSON_CreateObject();
     cJSON_AddStringToObject(root, "Arch", "xtensa");
-    cJSON_AddStringToObject(root, "ClientName", "RoomCast ESP32");
-    cJSON_AddStringToObject(root, "HostName", "roomcast-esp32");
+    cJSON_AddStringToObject(root, "ClientName", device_name);
+    cJSON_AddStringToObject(root, "HostName", hostname);
     cJSON_AddStringToObject(root, "ID", mac_str);
     cJSON_AddNumberToObject(root, "Instance", 1);
     cJSON_AddStringToObject(root, "MAC", mac_str);
     cJSON_AddStringToObject(root, "OS", "ESP-IDF");
     cJSON_AddNumberToObject(root, "SnapStreamProtocolVersion", 2);
-    cJSON_AddStringToObject(root, "Version", "esp32-0.1.5");
+    cJSON_AddStringToObject(root, "Version", "esp32-0.1.12");
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);

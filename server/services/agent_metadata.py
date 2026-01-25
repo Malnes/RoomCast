@@ -58,6 +58,13 @@ class AgentMetadataService:
             node["agent_version"] = version
             changed = True
 
+        name_val = data.get("name") or data.get("device_name")
+        if isinstance(name_val, str):
+            name = name_val.strip()
+            if name and node.get("name") != name:
+                node["name"] = name
+                changed = True
+
         configured = bool(data.get("configured"))
         if node.get("audio_configured") != configured:
             node["audio_configured"] = configured

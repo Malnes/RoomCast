@@ -20,12 +20,12 @@ void app_main(void) {
     }
     roomcast_led_init();
     roomcast_led_set_status(ROOMCAST_LED_PORTAL);
-    roomcast_wifi_start();
-
-    if (!roomcast_http_start()) {
-        ESP_LOGE(TAG, "HTTP server failed");
+    if (!roomcast_http_init()) {
+        ESP_LOGE(TAG, "HTTP init failed");
         return;
     }
+    roomcast_wifi_start();
+    roomcast_http_set_portal_enabled(true);
 
     // If snapserver config exists, start snapclient task.
     char host[64] = {0};

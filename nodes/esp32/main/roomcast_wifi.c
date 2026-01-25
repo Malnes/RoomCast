@@ -44,6 +44,7 @@ static void handle_wifi_event(void *arg, esp_event_base_t event_base, int32_t ev
     }
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
         wifi_ready = false;
+        roomcast_http_set_agent_enabled(false);
         roomcast_http_set_portal_enabled(true);
         roomcast_led_set_status(ROOMCAST_LED_PORTAL);
     }
@@ -52,6 +53,7 @@ static void handle_wifi_event(void *arg, esp_event_base_t event_base, int32_t ev
         snprintf(g_ip, sizeof(g_ip), IPSTR, IP2STR(&event->ip_info.ip));
         wifi_ready = true;
         roomcast_http_set_portal_enabled(false);
+        roomcast_http_set_agent_enabled(true);
         roomcast_led_set_status(ROOMCAST_LED_CONNECTED);
     }
 }
@@ -94,6 +96,7 @@ void roomcast_wifi_start(void) {
     esp_wifi_set_config(WIFI_IF_STA, &wifi_sta);
     esp_wifi_set_config(WIFI_IF_AP, &wifi_ap);
     esp_wifi_start();
+
 
     esp_netif_ip_info_t ip_info = {0};
     if (esp_netif_get_ip_info(ap_netif, &ip_info) == ESP_OK) {
