@@ -2,6 +2,7 @@
 #include "roomcast_wifi.h"
 #include "roomcast_http.h"
 #include "roomcast_snapclient.h"
+#include "roomcast_led.h"
 #include "roomcast_config.h"
 
 #include "esp_log.h"
@@ -17,6 +18,8 @@ void app_main(void) {
         ESP_LOGE(TAG, "Wi-Fi init failed");
         return;
     }
+    roomcast_led_init();
+    roomcast_led_set_status(ROOMCAST_LED_PORTAL);
     roomcast_wifi_start();
 
     if (!roomcast_http_start()) {

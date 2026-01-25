@@ -3,10 +3,12 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <inttypes.h>
 
 #include "driver/i2s.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_mac.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -132,7 +134,7 @@ static void send_hello(void) {
     cJSON_AddStringToObject(root, "MAC", mac_str);
     cJSON_AddStringToObject(root, "OS", "ESP-IDF");
     cJSON_AddNumberToObject(root, "SnapStreamProtocolVersion", 2);
-    cJSON_AddStringToObject(root, "Version", "esp32-0.1.0");
+    cJSON_AddStringToObject(root, "Version", "esp32-0.1.5");
 
     char *json = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
@@ -439,7 +441,7 @@ static void snapclient_task(void *arg) {
         if (base.size > 0) {
             uint8_t *payload = (uint8_t *)malloc(base.size);
             if (!payload) {
-                ESP_LOGE(TAG, "Out of memory for payload size %u", base.size);
+                ESP_LOGE(TAG, "Out of memory for payload size %" PRIu32, base.size);
                 break;
             }
             if (recv_exact(g_sock, payload, base.size) <= 0) {

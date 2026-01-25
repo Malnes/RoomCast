@@ -1,6 +1,9 @@
 #include "roomcast_wifi.h"
 #include "roomcast_storage.h"
 #include "roomcast_config.h"
+#include "roomcast_dns.h"
+#include "roomcast_http.h"
+#include "roomcast_led.h"
 
 #include <string.h>
 
@@ -8,6 +11,8 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
+#include "lwip/inet.h"
+#include "lwip/ip4_addr.h"
 
 static const char *TAG = "roomcast_wifi";
 static esp_netif_t *sta_netif = NULL;
@@ -37,10 +42,17 @@ static void handle_wifi_event(void *arg, esp_event_base_t event_base, int32_t ev
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     }
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        wifi_ready = false;
+        roomcast_http_set_portal_enabled(true);
+        roomcast_led_set_status(ROOMCAST_LED_PORTAL);
+    }
     if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
         snprintf(g_ip, sizeof(g_ip), IPSTR, IP2STR(&event->ip_info.ip));
         wifi_ready = true;
+        roomcast_http_set_portal_enabled(false);
+        roomcast_led_set_status(ROOMCAST_LED_CONNECTED);
     }
 }
 
@@ -82,8 +94,22 @@ void roomcast_wifi_start(void) {
     esp_wifi_set_config(WIFI_IF_STA, &wifi_sta);
     esp_wifi_set_config(WIFI_IF_AP, &wifi_ap);
     esp_wifi_start();
+
+    esp_netif_ip_info_t ip_info = {0};
+    if (esp_netif_get_ip_info(ap_netif, &ip_info) == ESP_OK) {
+        roomcast_dns_start(ip_info.ip);
+    } else {
+        ip4_addr_t fallback_ip4;
+        IP4_ADDR(&fallback_ip4, 192, 168, 4, 1);
+        esp_ip4_addr_t fallback = {.addr = fallback_ip4.addr};
+        roomcast_dns_start(fallback);
+    }
 }
 
 const char *roomcast_wifi_get_ip(void) {
     return g_ip;
+}
+
+bool roomcast_wifi_is_connected(void) {
+    return wifi_ready;
 }

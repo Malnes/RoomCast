@@ -2,3 +2,9 @@
 snapserver.json
 pat
 newFeatures.md
+
+# ESP32 build artifacts
+nodes/esp32/build/
+nodes/esp32/sdkconfig
+nodes/esp32/sdkconfig.*
+nodes/esp32/idf_component.yml

@@ -4,6 +4,7 @@
 #include "roomcast_eq.h"
 #include "roomcast_snapclient.h"
 #include "roomcast_wifi.h"
+#include "roomcast_led.h"
 
 #include <string.h>
 
@@ -12,6 +13,7 @@
 #include "esp_http_client.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
@@ -32,6 +34,7 @@ static uint16_t g_snap_port = 1704;
 static char g_fingerprint[20] = {0};
 static char g_ota_url[160] = {0};
 static bool g_ota_task_running = false;
+static httpd_handle_t g_portal_server = NULL;
 
 static bool load_agent_secret(void) {
     return roomcast_storage_get_string(ROOMCAST_NVS_KEY_AGENT_SECRET, g_agent_secret, sizeof(g_agent_secret));
@@ -112,7 +115,7 @@ static esp_err_t health_handler(httpd_req_t *req) {
     cJSON_AddStringToObject(root, "status", "ok");
     cJSON_AddBoolToObject(root, "paired", g_agent_secret[0] != '\0');
     cJSON_AddBoolToObject(root, "configured", g_snap_host[0] != '\0');
-    cJSON_AddStringToObject(root, "version", "esp32-0.1.0");
+    cJSON_AddStringToObject(root, "version", "esp32-0.1.5");
     cJSON_AddBoolToObject(root, "updating", g_updating);
     cJSON_AddStringToObject(root, "playback_device", "i2s");
     cJSON *outputs = cJSON_CreateObject();
@@ -180,7 +183,7 @@ static esp_err_t pair_post_handler(httpd_req_t *req) {
         force = cJSON_IsTrue(forceNode);
     }
     if (g_agent_secret[0] && !force) {
-        httpd_resp_send_err(req, HTTPD_409_CONFLICT, "Already paired");
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Already paired");
         cJSON_Delete(payload);
         return ESP_OK;
     }
@@ -188,7 +191,7 @@ static esp_err_t pair_post_handler(httpd_req_t *req) {
         char secret[96] = {0};
         httpd_req_get_hdr_value_str(req, "X-Agent-Secret", secret, sizeof(secret));
         if (strcmp(secret, g_agent_secret) != 0) {
-            httpd_resp_send_err(req, HTTPD_423_LOCKED, "Node paired to another controller. Provide recovery code.");
+            httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Node paired to another controller. Provide recovery code.");
             cJSON_Delete(payload);
             return ESP_OK;
         }
@@ -361,7 +364,6 @@ static esp_err_t eq_post_handler(httpd_req_t *req) {
     roomcast_eq_apply(&g_eq_state);
     cJSON_Delete(payload);
     char response[96];
-    int active = roomcast_eq_count_active(&g_eq_state);
     snprintf(response, sizeof(response), "{\"ok\":true,\"eq_active_bands\":%d,\"eq_max_bands\":%d}",
              active, roomcast_eq_get_active_limit());
     httpd_resp_sendstr(req, response);
@@ -454,6 +456,21 @@ static esp_err_t wifi_portal_get(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t captive_portal_handler(httpd_req_t *req) {
+    if (strcmp(req->uri, "/") == 0 || strcmp(req->uri, "/wifi") == 0 ||
+        strcmp(req->uri, "/generate_204") == 0 ||
+        strcmp(req->uri, "/hotspot-detect.html") == 0 ||
+        strcmp(req->uri, "/ncsi.txt") == 0) {
+        return wifi_portal_get(req);
+    }
+
+    const char *location = "http://192.168.4.1/wifi";
+    httpd_resp_set_status(req, "302 Found");
+    httpd_resp_set_hdr(req, "Location", location);
+    httpd_resp_send(req, NULL, 0);
+    return ESP_OK;
+}
+
 static esp_err_t wifi_portal_post(httpd_req_t *req) {
     char buf[256] = {0};
     int len = httpd_req_recv(req, buf, sizeof(buf) - 1);
@@ -466,6 +483,50 @@ static esp_err_t wifi_portal_post(httpd_req_t *req) {
     httpd_resp_sendstr(req, "Saved. Rebooting...");
     esp_restart();
     return ESP_OK;
+}
+
+static bool start_portal_server(void) {
+    if (g_portal_server) return true;
+    httpd_config_t portal_cfg = HTTPD_DEFAULT_CONFIG();
+    portal_cfg.server_port = ROOMCAST_HTTP_PORT;
+    portal_cfg.uri_match_fn = httpd_uri_match_wildcard;
+    portal_cfg.max_uri_handlers = 8;
+    portal_cfg.max_open_sockets = 4;
+    portal_cfg.lru_purge_enable = true;
+
+    if (httpd_start(&g_portal_server, &portal_cfg) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to start captive portal server");
+        g_portal_server = NULL;
+        return false;
+    }
+
+    httpd_uri_t portal_wifi_get = {.uri = "/wifi", .method = HTTP_GET, .handler = wifi_portal_get};
+    httpd_uri_t portal_wifi_post = {.uri = "/wifi", .method = HTTP_POST, .handler = wifi_portal_post};
+    httpd_uri_t portal_catchall = {.uri = "/*", .method = HTTP_GET, .handler = captive_portal_handler};
+    httpd_register_uri_handler(g_portal_server, &portal_wifi_get);
+    httpd_register_uri_handler(g_portal_server, &portal_wifi_post);
+    httpd_register_uri_handler(g_portal_server, &portal_catchall);
+    ESP_LOGI(TAG, "Captive portal server started");
+    return true;
+}
+
+static void stop_portal_server(void) {
+    if (!g_portal_server) return;
+    httpd_stop(g_portal_server);
+    g_portal_server = NULL;
+    ESP_LOGI(TAG, "Captive portal server stopped");
+}
+
+void roomcast_http_set_portal_enabled(bool enabled) {
+    if (enabled) {
+        if (!start_portal_server()) {
+            roomcast_led_set_status(ROOMCAST_LED_ERROR);
+        } else {
+            roomcast_led_set_status(ROOMCAST_LED_PORTAL);
+        }
+    } else {
+        stop_portal_server();
+    }
 }
 
 bool roomcast_http_start(void) {
@@ -483,6 +544,9 @@ bool roomcast_http_start(void) {
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.server_port = ROOMCAST_AGENT_PORT;
+    config.max_uri_handlers = 24;
+    config.max_open_sockets = 7;
+    config.lru_purge_enable = true;
     httpd_handle_t server = NULL;
     if (httpd_start(&server, &config) != ESP_OK) {
         return false;
@@ -521,6 +585,10 @@ bool roomcast_http_start(void) {
     httpd_register_uri_handler(server, &max_volume_post);
     httpd_register_uri_handler(server, &update_post);
     httpd_register_uri_handler(server, &restart_post);
+
+    if (!roomcast_wifi_is_connected()) {
+        roomcast_http_set_portal_enabled(true);
+    }
 
     httpd_config_t portal_config = HTTPD_DEFAULT_CONFIG();
     portal_config.server_port = ROOMCAST_HTTP_PORT;

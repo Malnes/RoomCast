@@ -7,6 +7,7 @@ extern "C" {
 #endif
 
 bool roomcast_http_start(void);
+void roomcast_http_set_portal_enabled(bool enabled);
 
 #ifdef __cplusplus
 }

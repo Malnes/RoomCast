@@ -13,6 +13,8 @@
 #define ROOMCAST_I2S_LRCK_GPIO 18
 #define ROOMCAST_I2S_DATA_GPIO 16
 
+#define ROOMCAST_WS2812_GPIO 48
+
 #define ROOMCAST_NVS_NAMESPACE "roomcast"
 #define ROOMCAST_NVS_KEY_AGENT_SECRET "agent_secret"
 #define ROOMCAST_NVS_KEY_SNAP_HOST "snap_host"
