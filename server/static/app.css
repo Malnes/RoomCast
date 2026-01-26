@@ -630,13 +630,13 @@ button.status-pill:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.6
 .player-icon-btn.play svg { width: 36px; height: 36px; }
 .player-icon-btn:disabled { opacity: 0.35; cursor: default; box-shadow: none; }
 .player-icon-btn.repeat-track::after { content: '1'; position: absolute; top: 6px; right: 8px; font-size: 10px; font-weight: 700; color: currentColor; }
-.player-volume-slider { position: absolute; right: 50%; bottom: calc(100% + 16px); transform: translateX(50%) translateY(8px); opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.18s ease; display: flex; justify-content: center; z-index: 60; }
+.player-volume-slider { position: absolute; right: 50%; bottom: calc(100% + 16px); transform: translateX(50%) translateY(8px); opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.18s ease; display: flex; justify-content: center; z-index: 60; padding: 10px 8px; border-radius: 16px; background: rgba(15,23,42,0.9); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 10px 24px rgba(0,0,0,0.45); }
 .player-volume-inline.is-open .player-volume-slider { opacity: 1; pointer-events: auto; transform: translateX(50%) translateY(0); }
-.player-volume-inline input[type=range] { appearance: none; -webkit-appearance: slider-vertical; width: 6px; height: 150px; border-radius: 999px; background: transparent; writing-mode: bt-lr; }
-.player-volume-inline input[type=range]::-webkit-slider-runnable-track { width: 6px; height: 100%; border-radius: 999px; background: rgba(255,255,255,0.15); }
-.player-volume-inline input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 12px; height: 12px; border-radius: 50%; background: var(--range-accent, var(--accent)); border: none; margin-top: -4px; transform: translateX(3px); }
-.player-volume-inline input[type=range]::-moz-range-track { width: 6px; height: 100%; border-radius: 999px; background: rgba(255,255,255,0.15); }
-.player-volume-inline input[type=range]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: var(--range-accent, var(--accent)); border: none; transform: translateX(3px); }
+.player-volume-inline input[type=range] { appearance: none; -webkit-appearance: none; width: 18px; height: 150px; border-radius: 999px; background: transparent; writing-mode: vertical-rl; direction: rtl; touch-action: none; }
+.player-volume-inline input[type=range]::-webkit-slider-runnable-track { width: 8px; height: 100%; border-radius: 999px; background: rgba(255,255,255,0.15); }
+.player-volume-inline input[type=range]::-webkit-slider-thumb { -webkit-appearance: none; appearance: none; width: 16px; height: 16px; border-radius: 50%; background: var(--range-accent, var(--accent)); border: none; transform: translateX(-2px); }
+.player-volume-inline input[type=range]::-moz-range-track { width: 8px; height: 100%; border-radius: 999px; background: rgba(255,255,255,0.15); }
+.player-volume-inline input[type=range]::-moz-range-thumb { width: 16px; height: 16px; border-radius: 50%; background: var(--range-accent, var(--accent)); border: none; transform: translateX(-2px); }
 @keyframes playerCardSlideInFromRight { from { transform: translateX(30%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 @keyframes playerCardSlideInFromLeft { from { transform: translateX(-30%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
 @keyframes playerCardSlideOutLeft { from { transform: translateX(0); opacity: 1; } to { transform: translateX(-30%); opacity: 0; } }

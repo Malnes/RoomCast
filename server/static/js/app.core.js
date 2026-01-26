@@ -401,10 +401,18 @@ function setRangeProgress(el, value, maxOverride) {
   const percent = Math.max(0, Math.min(100, ratio * 100));
   const { accent } = resolveRangeAccent(el);
   const inactive = 'rgba(255,255,255,0.12)';
-  el.style.background = `linear-gradient(90deg, ${accent} 0%, ${accent} ${percent}%, ${inactive} ${percent}%, ${inactive} 100%)`;
-  el.style.backgroundSize = '100% 4px';
-  el.style.backgroundPosition = 'center';
-  el.style.backgroundRepeat = 'no-repeat';
+  const isVertical = el.classList?.contains('range-vertical');
+  if (isVertical) {
+    el.style.background = `linear-gradient(0deg, ${accent} 0%, ${accent} ${percent}%, ${inactive} ${percent}%, ${inactive} 100%)`;
+    el.style.backgroundSize = '4px 100%';
+    el.style.backgroundPosition = 'center';
+    el.style.backgroundRepeat = 'no-repeat';
+  } else {
+    el.style.background = `linear-gradient(90deg, ${accent} 0%, ${accent} ${percent}%, ${inactive} ${percent}%, ${inactive} 100%)`;
+    el.style.backgroundSize = '100% 4px';
+    el.style.backgroundPosition = 'center';
+    el.style.backgroundRepeat = 'no-repeat';
+  }
 }
 
 function isAuthenticated() {

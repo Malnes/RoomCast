@@ -2633,8 +2633,20 @@ const handleVolumeKey = evt => {
 };
 if (playerVolumeToggle) playerVolumeToggle.addEventListener('keydown', handleVolumeKey);
 if (masterVolume) {
-  masterVolume.addEventListener('input', () => setRangeProgress(masterVolume, masterVolume.value, masterVolume.max || 100));
-  masterVolume.addEventListener('change', () => setMasterVolume(masterVolume.value));
+  let masterVolumeCommitTimer = null;
+  const commitMasterVolume = () => {
+    if (masterVolumeCommitTimer) {
+      clearTimeout(masterVolumeCommitTimer);
+      masterVolumeCommitTimer = null;
+    }
+    setMasterVolume(masterVolume.value);
+  };
+  masterVolume.addEventListener('input', () => {
+    setRangeProgress(masterVolume, masterVolume.value, masterVolume.max || 100);
+    if (masterVolumeCommitTimer) clearTimeout(masterVolumeCommitTimer);
+    masterVolumeCommitTimer = setTimeout(commitMasterVolume, 200);
+  });
+  masterVolume.addEventListener('change', commitMasterVolume);
   masterVolume.addEventListener('keydown', handleVolumeKey);
 }
 document.addEventListener('click', evt => {

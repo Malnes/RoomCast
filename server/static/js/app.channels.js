@@ -312,17 +312,16 @@ function setTakeoverBannerVisible(visible, message) {
 function updateTakeoverBanner(status) {
   if (!takeoverBanner) return;
   const active = !!status?.active;
-  const playing = !!status?.is_playing;
   const isRoomcastDevice = !!status?.device_is_roomcast;
-  const shouldShow = active && playing && !isRoomcastDevice;
+  const shouldShow = active && !isRoomcastDevice;
   if (!shouldShow) {
     setTakeoverBannerVisible(false);
     return;
   }
   const deviceName = (status?.device?.name || '').trim();
   const message = deviceName
-    ? `Spotify is playing on “${deviceName}”.`
-    : 'Spotify is playing on another device.';
+    ? `Spotify is active on “${deviceName}”.`
+    : 'Spotify is active on another device.';
   setTakeoverBannerVisible(true, message);
 }
 
