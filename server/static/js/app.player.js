@@ -917,10 +917,52 @@ async function startSpotifyAuth() {
     const res = await fetch(`/api/spotify/auth-url?source_id=${encodeURIComponent(sourceId)}`);
     await ensureOk(res);
     const data = await res.json();
-    if (data.url) window.open(data.url, '_blank');
+    if (data.url) {
+      const authWindow = window.open(data.url, '_blank');
+      if (authWindow) {
+        const start = Date.now();
+        const poll = setInterval(() => {
+          if (authWindow.closed || Date.now() - start > 120000) {
+            clearInterval(poll);
+            fetchSpotifyConfig(sourceId);
+            fetchLibrespotStatus(sourceId);
+          }
+        }, 700);
+        window.addEventListener('focus', () => {
+          fetchSpotifyConfig(sourceId);
+          fetchLibrespotStatus(sourceId);
+        }, { once: true });
+      }
+    }
   } catch (err) {
     showError(`Failed to start Spotify auth: ${err.message}`);
     reportSpotifyError(err);
+  }
+}
+
+async function signOutSpotify() {
+  try {
+    const sourceId = getSettingsChannelId();
+    if (!sourceId) {
+      showError('No Spotify source selected.');
+      return;
+    }
+    spotifySpinner.style.display = 'block';
+    if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.disabled = true;
+    const res = await fetch(`/api/spotify/logout?source_id=${encodeURIComponent(sourceId)}`, {
+      method: 'POST',
+    });
+    await ensureOk(res);
+    spotifyAuthLinked = false;
+    if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.textContent = 'Sign in to Spotify';
+    showSuccess('Spotify account signed out.');
+    await fetchSpotifyConfig(sourceId);
+    await pollLibrespotStatus(sourceId);
+  } catch (err) {
+    showError(`Failed to sign out of Spotify: ${err.message}`);
+  } finally {
+    if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.disabled = false;
+    spotifySpinner.style.display = 'none';
   }
 }
 
@@ -977,18 +1019,13 @@ async function saveSpotify() {
       bitrate: Number(spBitrate.value) || 320,
       initial_volume: Number(spInitVol.value) || 75,
       normalisation: spNormalise.checked,
-      client_id: spClientId.value,
-      client_secret: spClientSecret.value,
-      redirect_uri: spRedirect.value || 'http://localhost:8000/api/spotify/callback',
     };
-    if (!payload.client_secret) delete payload.client_secret;
     const res = await fetch(`/api/config/spotify?source_id=${encodeURIComponent(sourceId)}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
     await ensureOk(res);
-    spClientSecret.value = '';
     showSuccess('Spotify config saved. Librespot will reload and connect.');
     await pollLibrespotStatus(sourceId);
   } catch (err) {
@@ -1598,13 +1635,14 @@ function openProviderSettingsModal(providerId) {
   }
 
   const footer = document.createElement('div');
-  footer.style.marginTop = '14px';
+  footer.style.marginTop = '10px';
   footer.style.display = 'flex';
-  footer.style.justifyContent = 'flex-end';
+  footer.style.justifyContent = 'stretch';
   const removeBtn = document.createElement('button');
   removeBtn.type = 'button';
   removeBtn.className = 'small-btn danger-btn';
   removeBtn.textContent = 'Remove provider';
+  removeBtn.style.width = '100%';
   removeBtn.addEventListener('click', async () => {
     await removeProviderById(pid, removeBtn);
   });
@@ -1890,7 +1928,10 @@ async function openSettings() {
     if (spotifyLinkStatus) {
       spotifyLinkStatus.textContent = 'Spotify provider not installed';
       spotifyLinkStatus.className = 'status-pill warn';
+      spotifyLinkStatus.style.display = 'inline-flex';
     }
+    spotifyAuthLinked = false;
+    if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.textContent = 'Sign in to Spotify';
   }
   fetchStatus();
   fetchUsersList();
@@ -2086,57 +2127,19 @@ function closeDiscover() {
 
 startDiscoverBtn.addEventListener('click', discoverNodes);
 saveSpotifyBtn.addEventListener('click', saveSpotify);
-if (spotifyLinkWizardOpenBtn && spotifyLinkWizard) {
-  const spotifyRedirectCopyBtn = document.getElementById('spotify-redirect-copy');
-  const spotifyRedirectValue = document.getElementById('spotify-redirect-value');
-  const redirectDefault = 'http://172.17.0.1:18080/api/spotify/callback';
-  const showWizardStep = step => {
-    const showStep1 = step === 1;
-    if (spotifyLinkStep1) {
-      spotifyLinkStep1.hidden = !showStep1;
-      spotifyLinkStep1.setAttribute('aria-hidden', showStep1 ? 'false' : 'true');
-    }
-    if (spotifyLinkStep2) {
-      spotifyLinkStep2.hidden = showStep1;
-      spotifyLinkStep2.setAttribute('aria-hidden', showStep1 ? 'true' : 'false');
-    }
-  };
-  const openWizard = () => {
-    spotifyLinkWizard.hidden = false;
-    spotifyLinkWizard.setAttribute('aria-hidden', 'false');
-    spotifyLinkWizard.style.display = 'flex';
-    if (spRedirect) spRedirect.value = redirectDefault;
-    showWizardStep(1);
-  };
-  const closeWizard = () => {
-    spotifyLinkWizard.style.display = 'none';
-    spotifyLinkWizard.hidden = true;
-    spotifyLinkWizard.setAttribute('aria-hidden', 'true');
-  };
-  spotifyLinkWizardOpenBtn.addEventListener('click', openWizard);
-  if (spotifyLinkCloseBtn) spotifyLinkCloseBtn.addEventListener('click', closeWizard);
-  if (spotifyLinkWizard) {
-    spotifyLinkWizard.addEventListener('click', evt => {
-      if (evt.target === spotifyLinkWizard) closeWizard();
-    });
-  }
-  if (spotifyLinkNextBtn) spotifyLinkNextBtn.addEventListener('click', () => showWizardStep(2));
-  if (spotifyLinkBackBtn) spotifyLinkBackBtn.addEventListener('click', () => showWizardStep(1));
-  if (spotifyRedirectCopyBtn && spotifyRedirectValue) {
-    spotifyRedirectCopyBtn.addEventListener('click', async () => {
-      const value = spotifyRedirectValue.textContent || '';
-      if (!value) return;
-      try {
-        await navigator.clipboard.writeText(value);
-        spotifyRedirectCopyBtn.textContent = '✓';
-        setTimeout(() => {
-          spotifyRedirectCopyBtn.textContent = '⧉';
-        }, 1500);
-      } catch (_) {
-        showError('Copy failed. Select the URL and copy it manually.');
+if (spotifyLinkWizardOpenBtn) {
+  spotifyLinkWizardOpenBtn.addEventListener('click', async () => {
+    try {
+      if (spotifyAuthLinked) {
+        await signOutSpotify();
+        return;
       }
-    });
-  }
+      await saveSpotify();
+      await startSpotifyAuth();
+    } catch (_) {
+      /* saveSpotify already shows error */
+    }
+  });
 }
 if (providerAddOpenBtn) providerAddOpenBtn.addEventListener('click', async () => {
   if (!providersAvailableCache?.length) {

@@ -31,24 +31,25 @@ async def spotify_refresh(
     token: dict,
     identifier: Optional[str],
     *,
-    current_spotify_creds: Callable[[Optional[str]], tuple[str, str, str]],
+    spotify_auth_broker_url: str,
     save_token: Callable[[dict, Optional[str]], None],
     timeout: float = 10,
 ) -> dict:
     if not token or "refresh_token" not in token:
         raise HTTPException(status_code=401, detail="Spotify not authorized")
-    client_id, client_secret, _ = current_spotify_creds(identifier)
-    payload = {
-        "grant_type": "refresh_token",
-        "refresh_token": token["refresh_token"],
-        "client_id": client_id,
-        "client_secret": client_secret,
-    }
+    if not spotify_auth_broker_url:
+        raise HTTPException(status_code=503, detail="Spotify auth broker not configured")
+    payload = {"refresh_token": token["refresh_token"]}
     async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post("https://accounts.spotify.com/api/token", data=payload)
+        resp = await client.post(
+            f"{spotify_auth_broker_url.rstrip('/')}/refresh",
+            json=payload,
+        )
     if resp.status_code >= 400:
         raise HTTPException(status_code=401, detail="Failed to refresh Spotify token")
     data = resp.json()
+    if "access_token" not in data:
+        raise HTTPException(status_code=502, detail="Spotify auth broker returned an invalid token")
     token["access_token"] = data["access_token"]
     token["expires_in"] = data.get("expires_in")
     save_token(token, identifier)

@@ -26,6 +26,7 @@ def create_providers_router(
     spotify_provider: Any,
     apply_spotify_provider: Callable[[int], None],
     disable_spotify_provider: Callable[[], None],
+    delete_spotify_tokens: Callable[[], None],
     apply_radio_provider: Callable[[], None],
     disable_radio_provider: Callable[[], None],
     apply_audiobookshelf_provider: Callable[[], None],
@@ -157,6 +158,7 @@ def create_providers_router(
         # Disable runtime and detach channels/sources as needed.
         if pid == "spotify":
             disable_spotify_provider()
+            delete_spotify_tokens()
         elif pid == "radio":
             disable_radio_provider()
         elif pid == "audiobookshelf":

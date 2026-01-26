@@ -450,16 +450,12 @@
 
           <div id="provider-settings-spotify" hidden aria-hidden="true" style="margin-top:14px;">
             <div class="label" style="margin-bottom:6px;">Spotify settings</div>
-            <div id="spotify-link-status" class="status-pill warn" style="margin-bottom:12px;">Account link status: unknown</div>
-
-            <div style="display:flex; justify-content:flex-start; margin-bottom:12px;">
-              <button class="small-btn" id="spotify-link-wizard-open">Link account</button>
-            </div>
             <div class="spotify-channel-select">
               <label for="spotify-channel-select">Account</label>
-              <div class="muted" style="font-size:12px; margin-bottom:6px;">Choose account A or B.</div>
+                <div class="muted" style="font-size:12px; margin-bottom:6px;">Choose Account A or Account B.</div>
               <select id="spotify-channel-select"></select>
             </div>
+              <div id="spotify-link-status" class="status-pill warn" style="margin-bottom:12px; display:none;">Account link status: unknown</div>
             <div class="grid">
               <div>
                 <label>Device name</label>
@@ -482,9 +478,11 @@
                 <input id="sp-normalise" type="checkbox" style="width:auto;">
               </div>
             </div>
-            <div style="margin-top:12px;">
+            <div class="spotify-actions">
               <button id="save-spotify">Save Spotify settings</button>
-              <div id="spotify-spinner" style="display:none; margin-top:8px;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
+              <div id="spotify-spinner" style="display:none;"><span class="spinner"></span> <span class="muted">Saving & restarting…</span></div>
+              <div id="spotify-account-info" class="muted" style="display:none; font-size:13px;"></div>
+              <button class="small-btn full-width-btn" id="spotify-link-wizard-open">Sign in to Spotify</button>
             </div>
           </div>
 
@@ -597,46 +595,11 @@
         <button id="spotify-link-close" class="icon-btn" type="button" aria-label="Close Spotify link wizard">✕</button>
       </div>
       <div class="node-settings-content">
-        <div id="spotify-link-step-1">
-          <div class="wizard-step-title" style="margin-bottom:8px;">Step 1 — Create a Spotify app</div>
-          <ol style="margin:0 0 12px 18px; padding:0; display:grid; gap:8px;">
-            <li>Open the <a href="https://developer.spotify.com/dashboard" target="_blank" rel="noopener">Spotify Developer Dashboard</a>.</li>
-            <li>Click “Create app” and give it any name (for example, RoomCast).</li>
-            <li>Open the app settings and add the Redirect URI shown below.</li>
-          </ol>
-          <div class="redirect-row" style="margin-bottom:12px;">
-            <div class="redirect-label">Redirect URI</div>
-            <div class="redirect-inline">
-              <code id="spotify-redirect-value">http://172.17.0.1:18080/api/spotify/callback</code>
-              <button class="icon-btn" id="spotify-redirect-copy" type="button" aria-label="Copy redirect URI">⧉</button>
-            </div>
-            <div class="muted" style="font-size:12px; margin-top:6px;">If you use the controller on your LAN, add your server’s LAN IP redirect URI as well.</div>
-          </div>
-          <ol start="4" style="margin:0 0 12px 18px; padding:0; display:grid; gap:8px;">
-            <li>Copy the <strong>Client ID</strong> and <strong>Client Secret</strong> — you’ll need them in Step 2.</li>
-          </ol>
+        <div>
+          <div class="wizard-step-title" style="margin-bottom:8px;">Link your Spotify account</div>
+          <div class="muted" style="margin-bottom:12px; font-size:13px;">Click the button below, sign in to Spotify, and approve the permissions. You will return here when linking is complete.</div>
           <div style="display:flex; justify-content:flex-end; gap:8px;">
-            <button class="small-btn" id="spotify-link-next" type="button">Continue</button>
-          </div>
-        </div>
-        <div id="spotify-link-step-2" hidden aria-hidden="true">
-          <div class="label" style="margin-bottom:8px;">Step 2 — Enter the Client ID and Client Secret from the Spotify Developer Dashboard</div>
-          <div class="grid" style="margin-bottom:12px;">
-            <div>
-              <label>Spotify client ID</label>
-              <input id="sp-client-id" placeholder="client id">
-            </div>
-            <div>
-              <label>Spotify client secret</label>
-              <input id="sp-client-secret" type="password" placeholder="client secret">
-            </div>
-            <input id="sp-redirect" type="hidden" value="http://172.17.0.1:18080/api/spotify/callback">
-          </div>
-          <div style="display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap;">
-            <button class="small-btn" id="spotify-link-back" type="button">Back</button>
-            <div style="display:flex; gap:8px; flex-wrap:wrap;">
-              <button class="small-btn" id="spotify-auth" type="button">Link Spotify account</button>
-            </div>
+            <button class="small-btn" id="spotify-auth" type="button">Link Spotify account</button>
           </div>
         </div>
       </div>

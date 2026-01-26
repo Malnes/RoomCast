@@ -150,6 +150,15 @@ class SpotifyConfigService:
         token_path.parent.mkdir(parents=True, exist_ok=True)
         token_path.write_text(json.dumps(data, indent=2))
 
+    def delete_token(self, identifier: Optional[str] = None) -> None:
+        spotify_source_id = self._resolve_spotify_source_id(identifier)
+        if spotify_source_id is None:
+            raise HTTPException(status_code=400, detail="Spotify source not configured")
+        source = self._get_spotify_source(spotify_source_id)
+        token_path = Path(source["token_path"])
+        if token_path.exists():
+            token_path.unlink()
+
     @staticmethod
     def token_seconds_until_expiry(token: Optional[dict]) -> Optional[float]:
         if not token:

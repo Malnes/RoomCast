@@ -1,12 +1,10 @@
 import json
-import os
-import time
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.nodes import VolumePayload
@@ -31,9 +29,13 @@ class SpotifyConfig(BaseModel):
     bitrate: int = Field(default=320, ge=96, le=320)
     initial_volume: int = Field(default=75, ge=0, le=100)
     normalisation: bool = Field(default=True)
-    client_id: Optional[str] = None
-    client_secret: Optional[str] = None
-    redirect_uri: Optional[str] = None
+
+
+class SpotifyBrokerCallback(BaseModel):
+    device_id: Optional[str] = None
+    source_id: Optional[str] = None
+    token: dict = Field(default_factory=dict)
+    received_at: Optional[int] = None
 
 
 class PlaylistAddTracksPayload(BaseModel):
@@ -48,10 +50,10 @@ def create_spotify_router(
     resolve_spotify_source_id: Callable[[Optional[str]], Optional[str]],
     read_spotify_config: Callable[[str], dict],
     get_spotify_source: Callable[[str], dict],
-    spotify_redirect_uri: str,
-    current_spotify_creds: Callable[[str], tuple[str, str, str]],
-    token_signer: Any,
+    spotify_auth_broker_url: str,
+    public_base_url: str,
     save_token: Callable[[dict, str], None],
+    delete_token: Callable[[str], None],
     ensure_spotify_token: Callable[[Optional[str]], dict],
     load_token: Callable[[Optional[str]], Optional[dict]],
     spotify_request: Callable[..., Awaitable[Any]],
@@ -72,6 +74,37 @@ def create_spotify_router(
     read_librespot_status: Callable[[str], dict],
 ) -> APIRouter:
     router = APIRouter()
+
+    def _broker_callback_url() -> str:
+        if not public_base_url:
+            raise HTTPException(status_code=500, detail="RoomCast public base URL not configured")
+        return f"{public_base_url.rstrip('/')}/api/spotify/broker/callback"
+
+    async def _fetch_spotify_profile(access_token: str) -> Optional[dict]:
+        if not access_token:
+            return None
+        headers = {"Authorization": f"Bearer {access_token}"}
+        async with httpx.AsyncClient(timeout=10) as client:
+            resp = await client.get("https://api.spotify.com/v1/me", headers=headers)
+        if resp.status_code >= 400:
+            return None
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+
+    def _store_spotify_username(spotify_source_id: str, username: str) -> None:
+        if not username:
+            return
+        source = get_spotify_source(spotify_source_id)
+        cfg_path = Path(source["config_path"])
+        payload: dict = {}
+        if cfg_path.exists():
+            try:
+                payload = json.loads(cfg_path.read_text())
+            except json.JSONDecodeError:
+                payload = {}
+        payload["username"] = username
+        cfg_path.parent.mkdir(parents=True, exist_ok=True)
+        cfg_path.write_text(json.dumps(payload, indent=2))
 
     def _with_query(path: str, params: Optional[dict] = None) -> str:
         if not params:
@@ -138,90 +171,76 @@ def create_spotify_router(
         source = get_spotify_source(spotify_source_id)
         cfg_path = Path(source["config_path"])
         payload = cfg.model_dump()
-        existing: dict = {}
-        if cfg_path.exists():
-            try:
-                existing = json.loads(cfg_path.read_text())
-            except json.JSONDecodeError:
-                existing = {}
-
-        if not payload.get("client_secret"):
-            payload["client_secret"] = existing.get("client_secret") or os.getenv("SPOTIFY_CLIENT_SECRET")
-        if not payload.get("client_id"):
-            payload["client_id"] = existing.get("client_id") or os.getenv("SPOTIFY_CLIENT_ID")
-        if not payload.get("redirect_uri"):
-            payload["redirect_uri"] = existing.get("redirect_uri") or spotify_redirect_uri
-
-        # Keep env vars aligned with the default Spotify A instance for backwards compatibility.
-        if spotify_source_id == "spotify:a" and payload.get("client_id"):
-            os.environ["SPOTIFY_CLIENT_ID"] = payload["client_id"]
-        if spotify_source_id == "spotify:a" and payload.get("client_secret"):
-            os.environ["SPOTIFY_CLIENT_SECRET"] = payload["client_secret"]
-        if spotify_source_id == "spotify:a" and payload.get("redirect_uri"):
-            os.environ["SPOTIFY_REDIRECT_URI"] = payload["redirect_uri"]
-
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(payload, indent=2))
         return {"ok": True, "config": read_spotify_config(target)}
 
     @router.get("/api/spotify/auth-url")
     async def spotify_auth_url(
+        request: Request,
         channel_id: Optional[str] = Query(default=None),
         source_id: Optional[str] = Query(default=None),
         _: None = Depends(require_spotify_provider_dep),
     ) -> dict:
-        from urllib.parse import urlencode
-
         resolved_channel = resolve_channel_id(channel_id)
         target = source_id if source_id else resolved_channel
         spotify_source_id = resolve_spotify_source_id(target)
         if spotify_source_id is None:
             raise HTTPException(status_code=400, detail="Spotify source not configured")
-        cid, secret, redirect = current_spotify_creds(spotify_source_id)
-        if not (cid and secret):
-            raise HTTPException(status_code=400, detail="Spotify client_id/client_secret not set")
-        state = token_signer.dumps({"t": time.time(), "source_id": spotify_source_id})
-        scope = "user-read-playback-state user-modify-playback-state streaming user-read-email user-read-private"
-        params = {
-            "client_id": cid,
-            "response_type": "code",
-            "redirect_uri": redirect,
-            "scope": scope,
-            "state": state,
-        }
-
-        return {"url": f"https://accounts.spotify.com/authorize?{urlencode(params)}"}
-
-    @router.get("/api/spotify/callback", include_in_schema=False)
-    async def spotify_callback(
-        code: str,
-        state: str,
-        _: None = Depends(require_spotify_provider_dep),
-    ):
-        try:
-            payload = token_signer.loads(state)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid state")
-
-        spotify_source_id = resolve_spotify_source_id((payload or {}).get("source_id"))
-        if spotify_source_id is None:
-            raise HTTPException(status_code=400, detail="Invalid state")
-        cid, secret, redirect = current_spotify_creds(spotify_source_id)
-
-        data = {
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect,
-            "client_id": cid,
-            "client_secret": secret,
+        if not spotify_auth_broker_url:
+            raise HTTPException(status_code=503, detail="Spotify auth broker not configured")
+        callback_url = _broker_callback_url()
+        payload = {
+            "callback_url": callback_url,
+            "source_id": spotify_source_id,
         }
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post("https://accounts.spotify.com/api/token", data=data)
+            resp = await client.post(
+                f"{spotify_auth_broker_url.rstrip('/')}/authorize",
+                json=payload,
+            )
         if resp.status_code >= 400:
-            raise HTTPException(status_code=400, detail="Failed to exchange code")
-        token = resp.json()
+            detail = resp.text
+            raise HTTPException(status_code=resp.status_code, detail=f"Auth broker error: {detail}")
+        data = resp.json()
+        if not isinstance(data, dict) or not data.get("url"):
+            raise HTTPException(status_code=502, detail="Auth broker did not return a URL")
+        return {"url": data["url"]}
+
+    @router.post("/api/spotify/broker/callback", name="spotify_broker_callback")
+    async def spotify_broker_callback(
+        payload: SpotifyBrokerCallback,
+        _: None = Depends(require_spotify_provider_dep),
+    ) -> dict:
+        spotify_source_id = resolve_spotify_source_id(payload.source_id)
+        if spotify_source_id is None:
+            raise HTTPException(status_code=400, detail="Invalid source")
+        token = payload.token or {}
+        if "access_token" not in token:
+            raise HTTPException(status_code=400, detail="Invalid token payload")
         save_token(token, spotify_source_id)
-        return Response(content="Spotify linked. You can close this tab.", media_type="text/plain")
+        try:
+            profile = await _fetch_spotify_profile(token.get("access_token"))
+            username = (profile or {}).get("display_name") or (profile or {}).get("id")
+            if isinstance(username, str) and username.strip():
+                _store_spotify_username(spotify_source_id, username.strip())
+        except Exception:
+            pass
+        return {"ok": True}
+
+    @router.post("/api/spotify/logout")
+    async def spotify_logout(
+        channel_id: Optional[str] = Query(default=None),
+        source_id: Optional[str] = Query(default=None),
+        _: None = Depends(require_spotify_provider_dep),
+    ) -> dict:
+        resolved_channel = resolve_channel_id(channel_id)
+        target = source_id if source_id else resolved_channel
+        spotify_source_id = resolve_spotify_source_id(target)
+        if spotify_source_id is None:
+            raise HTTPException(status_code=400, detail="Spotify source not configured")
+        delete_token(spotify_source_id)
+        return {"ok": True}
 
     @router.get("/api/spotify/player/status")
     async def spotify_player_status(

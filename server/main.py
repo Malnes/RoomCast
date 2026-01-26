@@ -23,7 +23,7 @@ import websockets
 from fastapi import Body, Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Request, Query
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from itsdangerous import URLSafeSerializer, URLSafeTimedSerializer, BadSignature
+from itsdangerous import URLSafeTimedSerializer, BadSignature
 from pydantic import BaseModel, Field
 from webrtc import WebAudioRelay
 from local_agent import (
@@ -90,11 +90,11 @@ AGENT_PORT = int(os.getenv("AGENT_PORT", "9700"))
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 SPOTIFY_REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8000/api/spotify/callback")
+SPOTIFY_AUTH_BROKER_URL = os.getenv("SPOTIFY_AUTH_BROKER_URL", "").strip()
 SPOTIFY_TOKEN_PATH = Path(os.getenv("SPOTIFY_TOKEN_PATH", "/config/spotify-token.json"))
 SPOTIFY_REFRESH_CHECK_INTERVAL = int(os.getenv("SPOTIFY_REFRESH_CHECK_INTERVAL", "60"))
 SPOTIFY_REFRESH_LEEWAY = int(os.getenv("SPOTIFY_REFRESH_LEEWAY", "180"))
 SPOTIFY_REFRESH_FAILURE_BACKOFF = int(os.getenv("SPOTIFY_REFRESH_FAILURE_BACKOFF", "120"))
-TOKEN_SIGNER = URLSafeSerializer(os.getenv("SPOTIFY_STATE_SECRET", "changeme"))
 NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
@@ -296,6 +296,9 @@ def _resolve_public_controller_host() -> str:
 
 ROOMCAST_PUBLIC_HOST = _resolve_public_controller_host()
 ROOMCAST_PUBLIC_PORT = int(os.getenv("ROOMCAST_PUBLIC_PORT", "8000"))
+ROOMCAST_PUBLIC_BASE_URL = os.getenv("ROOMCAST_PUBLIC_BASE_URL", "").strip()
+if not ROOMCAST_PUBLIC_BASE_URL:
+    ROOMCAST_PUBLIC_BASE_URL = f"http://{ROOMCAST_PUBLIC_HOST}:{ROOMCAST_PUBLIC_PORT}"
 
 
 def _detect_sonos_discovery_networks(node_discovery_service: NodeDiscoveryService, public_host: str) -> list[str]:
@@ -1145,6 +1148,7 @@ PUBLIC_API_PATHS = {
     "/api/auth/initialize",
     "/api/health",
     "/api/spotify/callback",
+    "/api/spotify/broker/callback",
 }
 
 PUBLIC_API_PREFIXES = (
@@ -1333,7 +1337,7 @@ channel_idle_service = ChannelIdleService(
             spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
                 token,
                 identifier,
-                current_spotify_creds=current_spotify_creds,
+                spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
                 save_token=spotify_config.save_token,
             ),
             **kwargs,
@@ -1646,6 +1650,21 @@ def _providers() -> Dict[str, ProviderState]:
     return providers_by_id
 
 
+def _delete_spotify_tokens() -> None:
+    for source_id, source in list(sources_by_id.items()):
+        if not source or source.get("kind") != "spotify":
+            continue
+        try:
+            spotify_config.delete_token(source_id)
+        except HTTPException:
+            pass
+    for token_path in ("/config/spotify-token.json", "/config/spotify-token-ch2.json"):
+        try:
+            Path(token_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 app.include_router(
     create_providers_router(
         available_providers=AVAILABLE_PROVIDERS,
@@ -1657,6 +1676,7 @@ app.include_router(
         spotify_provider=spotify_provider,
         apply_spotify_provider=provider_runtime_service.apply_spotify_provider,
         disable_spotify_provider=provider_runtime_service.disable_spotify_provider,
+        delete_spotify_tokens=_delete_spotify_tokens,
         apply_radio_provider=provider_runtime_service.apply_radio_provider,
         disable_radio_provider=provider_runtime_service.disable_radio_provider,
         apply_audiobookshelf_provider=provider_runtime_service.apply_audiobookshelf_provider,
@@ -1858,7 +1878,7 @@ app.include_router(
                 spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
                     token,
                     identifier,
-                    current_spotify_creds=current_spotify_creds,
+                    spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
                     save_token=spotify_config.save_token,
                 ),
                 **kwargs,
@@ -1878,10 +1898,10 @@ app.include_router(
         resolve_spotify_source_id=lambda identifier: _resolve_spotify_source_id(identifier),
         read_spotify_config=lambda identifier: spotify_config.read_spotify_config(identifier),
         get_spotify_source=lambda source_id: get_spotify_source(source_id),
-        spotify_redirect_uri=SPOTIFY_REDIRECT_URI,
-        current_spotify_creds=lambda source_id: current_spotify_creds(source_id),
-        token_signer=TOKEN_SIGNER,
+        spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
+        public_base_url=ROOMCAST_PUBLIC_BASE_URL,
         save_token=lambda token, source_id: spotify_config.save_token(token, source_id),
+        delete_token=lambda source_id: spotify_config.delete_token(source_id),
         ensure_spotify_token=lambda identifier=None: _ensure_spotify_token(identifier),
         load_token=lambda channel_id=None: spotify_config.load_token(channel_id),
         spotify_request=lambda method, path, token, identifier=None, **kwargs: spotify_api.spotify_request(
@@ -1892,7 +1912,7 @@ app.include_router(
             spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
                 token,
                 identifier,
-                current_spotify_creds=current_spotify_creds,
+                spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
                 save_token=spotify_config.save_token,
             ),
             **kwargs,
@@ -2059,7 +2079,7 @@ async def _find_roomcast_device(token: dict, channel_id: Optional[str] = None) -
         spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
             token,
             identifier,
-            current_spotify_creds=current_spotify_creds,
+            spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
             save_token=spotify_config.save_token,
         ),
     )
@@ -2396,7 +2416,7 @@ async def _spotify_refresh_loop() -> None:
                     await spotify_api.spotify_refresh(
                         token,
                         source_id,
-                        current_spotify_creds=current_spotify_creds,
+                        spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
                         save_token=spotify_config.save_token,
                     )
                 except HTTPException as exc:

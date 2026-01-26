@@ -30,6 +30,8 @@ services:
       ROOMCAST_PUBLIC_HOST: ${ROOMCAST_PUBLIC_HOST:-192.168.68.139}
       # Sonos will be given absolute stream URLs using this host port.
       ROOMCAST_PUBLIC_PORT: ${ROOMCAST_SONOS_PORT:-18081}
+      # Public base URL for external callbacks (e.g., Spotify auth broker).
+      ROOMCAST_PUBLIC_BASE_URL: ${ROOMCAST_PUBLIC_BASE_URL:-http://${ROOMCAST_PUBLIC_HOST:-192.168.68.139}:${ROOMCAST_UI_PORT:-18080}}
       # When running in Docker bridge mode, multicast discovery may fail and
       # the controller will fall back to scanning DISCOVERY_CIDR for devices (Sonos, node agents).
       # Not hardcoded: set at runtime, e.g. `DISCOVERY_CIDR=192.168.68.0/24 docker compose up -d`.
@@ -38,9 +40,11 @@ services:
       ROOMCAST_RADIO_WORKER_IMAGE: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
       ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE: ${ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE:-ghcr.io/malnes/roomcast-audiobookshelf-worker:latest}
       CONFIG_PATH: /config/spotify.json
+      # Auth broker handles OAuth; no client secrets are stored on devices.
+      SPOTIFY_AUTH_BROKER_URL: ${SPOTIFY_AUTH_BROKER_URL:-https://sfauth.jepp.xyz}
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
-      # If you use Spotify auth, ensure the registered redirect URI matches this externally reachable URL.
+      # Legacy redirect (not used when auth broker is configured).
       SPOTIFY_REDIRECT_URI: ${SPOTIFY_REDIRECT_URI:-http://localhost:${ROOMCAST_UI_PORT:-18080}/api/spotify/callback}
       RADIO_WORKER_TOKEN: ${RADIO_WORKER_TOKEN:-}
       AUDIOBOOKSHELF_WORKER_TOKEN: ${AUDIOBOOKSHELF_WORKER_TOKEN:-}

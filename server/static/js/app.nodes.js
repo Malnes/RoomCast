@@ -46,7 +46,12 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
     if (spotifyLinkStatus) {
       spotifyLinkStatus.textContent = 'No Spotify source selected';
       spotifyLinkStatus.className = 'status-pill warn';
+      spotifyLinkStatus.style.display = 'inline-flex';
     }
+    spotifyAuthLinked = false;
+    if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.textContent = 'Sign in to Spotify';
+    if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.classList.remove('danger-btn');
+    if (spotifyAccountInfo) spotifyAccountInfo.style.display = 'none';
     return;
   }
   try {
@@ -55,7 +60,12 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
       if (spotifyLinkStatus) {
         spotifyLinkStatus.textContent = 'Spotify provider not installed';
         spotifyLinkStatus.className = 'status-pill warn';
+        spotifyLinkStatus.style.display = 'inline-flex';
       }
+      spotifyAuthLinked = false;
+      if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.textContent = 'Sign in to Spotify';
+      if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.classList.remove('danger-btn');
+      if (spotifyAccountInfo) spotifyAccountInfo.style.display = 'none';
       return;
     }
     await ensureOk(res);
@@ -65,20 +75,30 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
     spInitVol.value = cfg.initial_volume ?? 75;
     setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100);
     spNormalise.checked = cfg.normalisation ?? true;
-    spClientId.value = cfg.client_id || '';
-    spRedirect.value = cfg.redirect_uri || '';
-    if (cfg.has_client_secret) spClientSecret.placeholder = '••••••••';
-    else spClientSecret.placeholder = 'client secret';
-    if (spotifyLinkStatus) {
-      if (cfg.has_oauth_token) {
-        spotifyLinkStatus.textContent = 'Spotify account linked via OAuth';
-        spotifyLinkStatus.className = 'status-pill ok';
+    spotifyAuthLinked = !!cfg.has_oauth_token;
+    if (spotifyLinkWizardOpenBtn) {
+      spotifyLinkWizardOpenBtn.textContent = spotifyAuthLinked ? 'Sign out' : 'Sign in to Spotify';
+      spotifyLinkWizardOpenBtn.classList.toggle('danger-btn', spotifyAuthLinked);
+    }
+    if (spotifyAccountInfo) {
+      const username = (cfg.username || '').trim();
+      if (spotifyAuthLinked && username) {
+        spotifyAccountInfo.textContent = `Signed in as ${username}`;
+        spotifyAccountInfo.style.display = 'block';
       } else {
-        spotifyLinkStatus.textContent = 'Spotify account not linked';
-        spotifyLinkStatus.className = 'status-pill warn';
+        spotifyAccountInfo.style.display = 'none';
       }
     }
+    if (spotifyLinkStatus) {
+      spotifyLinkStatus.style.display = 'none';
+    }
   } catch (err) {
+    if (spotifyLinkStatus) {
+      spotifyLinkStatus.textContent = `Spotify error: ${err.message}`;
+      spotifyLinkStatus.className = 'status-pill warn';
+      spotifyLinkStatus.style.display = 'inline-flex';
+    }
+    if (spotifyAccountInfo) spotifyAccountInfo.style.display = 'none';
     showError(`Failed to load Spotify config: ${err.message}`);
   }
 }
