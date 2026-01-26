@@ -36,14 +36,14 @@ function getRadioOverlayChannel() {
 function openRadioOverlay(options = {}) {
   const channel = options.channel || getActiveChannel();
   if (!channel || !isRadioChannel(channel)) {
-    showError('Switch to a radio channel to browse stations.');
+    showError('Switch to a radio provider to browse stations.');
     return;
   }
   radioActiveChannelId = channel.id;
   radioActiveTab = RADIO_TABS.includes(options.tab) ? options.tab : (radioActiveTab || 'genres');
   if (radioModalChannelName) radioModalChannelName.textContent = channel.name || channel.id;
   if (radioModalSubtitle) {
-    radioModalSubtitle.textContent = `Assign a station to ${channel.name || 'this channel'}.`;
+    radioModalSubtitle.textContent = `Assign a station to ${channel.name || 'this provider'}.`;
   }
   setRadioOverlayOpen(true);
   setRadioActiveTab(radioActiveTab, { focusSearch: options.tab === 'search' || options.focusSearch });
@@ -2521,13 +2521,13 @@ function createNodeChannelSelector(node, options = {}) {
   wrapper.appendChild(dot);
   const select = document.createElement('select');
   select.className = 'node-channel-select';
-  select.setAttribute('aria-label', `Channel for ${node.name || 'node'}`);
+  select.setAttribute('aria-label', `Provider for ${node.name || 'node'}`);
   const playableChannels = getPlayerChannels();
   const hasPlayable = playableChannels.length > 0;
   const resolvedId = resolveNodeChannelId(node) || '';
   const unassignedOption = document.createElement('option');
   unassignedOption.value = '';
-  unassignedOption.textContent = hasPlayable ? 'Unassigned' : 'No channels';
+  unassignedOption.textContent = hasPlayable ? 'Unassigned' : 'No providers';
   if (!hasPlayable) {
     unassignedOption.disabled = true;
   }

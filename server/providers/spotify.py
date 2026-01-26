@@ -40,7 +40,7 @@ def desired_source_entries(
         {
             "id": "spotify:a",
             "kind": "spotify",
-            "name": "Spotify A",
+            "name": "Spotify 1",
             "snap_stream": "Spotify_CH1",
             "config_path": config_path_a,
             "token_path": token_path_a,
@@ -51,7 +51,7 @@ def desired_source_entries(
         entries.append({
             "id": "spotify:b",
             "kind": "spotify",
-            "name": "Spotify B",
+            "name": "Spotify 2",
             "snap_stream": "Spotify_CH2",
             "config_path": config_path_b,
             "token_path": token_path_b,

@@ -531,7 +531,24 @@ def create_spotify_router(
         resolved = resolve_channel_id(channel_id)
         params = {"device_id": device_id} if device_id else None
         body = payload or None
-        return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
+        try:
+            return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
+        except HTTPException as exc:
+            detail = str(exc.detail or "")
+            if exc.status_code not in {403, 404}:
+                raise
+            if "restricted" not in detail.lower() and "no active device" not in detail.lower():
+                raise
+            token = ensure_spotify_token(resolved)
+            device = await find_roomcast_device(token, resolved)
+            if not device or not device.get("id"):
+                raise HTTPException(status_code=404, detail="RoomCast device is not available")
+            transfer_body = {"device_ids": [device["id"]], "play": False}
+            resp = await spotify_request("PUT", "/me/player", token, resolved, json=transfer_body)
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            params = {"device_id": device["id"]}
+            return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
 
     @router.post("/api/spotify/player/pause")
     async def spotify_pause(

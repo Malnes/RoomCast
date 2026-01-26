@@ -21,7 +21,7 @@ function resetChannelUiState() {
   }
   if (playerPlay) playerPlay.dataset.radioChannelId = '';
   renderPlayerCarousel();
-  setPlayerIdleState('Create a channel to control playback', { forceClear: true });
+  setPlayerIdleState('Create a provider to control playback', { forceClear: true });
   refreshNodeVolumeAccents();
   applyChannelTheme(null);
 }
@@ -61,14 +61,14 @@ async function refreshChannels(options = {}) {
       }
       refreshNodeVolumeAccents();
       if (!channelsCache.length) {
-        setPlayerIdleState('Create a channel to control playback', { forceClear: true });
+        setPlayerIdleState('Create a provider to control playback', { forceClear: true });
       }
       if (activeChannelId && previousActive !== activeChannelId) {
         onActiveChannelChanged(previousActive, activeChannelId);
       } else if (!previousActive && activeChannelId) {
         onActiveChannelChanged(null, activeChannelId);
       } else if (!activeChannelId) {
-        setPlayerIdleState('Select a channel to control playback', { forceClear: true });
+        setPlayerIdleState('Select a provider to control playback', { forceClear: true });
       }
       return channelsCache;
     } catch (err) {

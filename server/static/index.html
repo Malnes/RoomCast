@@ -88,8 +88,8 @@
     <button id="takeover-button" class="small-btn" type="button">Take over session</button>
   </div>
 
-  <div id="player-panel" tabindex="0" role="region" aria-label="Channel player">
-    <div id="player-carousel-indicators" class="player-carousel-indicators" aria-label="Channel pages"></div>
+  <div id="player-panel" tabindex="0" role="region" aria-label="Provider player">
+    <div id="player-carousel-indicators" class="player-carousel-indicators" aria-label="Provider pages"></div>
     <div class="player-carousel-stage" aria-hidden="true">
       <div id="player-carousel-track" class="player-carousel-track"></div>
     </div>
@@ -224,7 +224,7 @@
       <div class="stream-info-header">
         <div>
           <div class="section-title" id="stream-info-title">Stream diagnostics</div>
-          <div class="muted" id="stream-info-channel">Active channel</div>
+          <div class="muted" id="stream-info-channel">Active provider</div>
         </div>
         <button id="stream-info-close" class="icon-btn small-btn" type="button" aria-label="Close stream diagnostics">✕</button>
       </div>
@@ -288,7 +288,7 @@
       <div class="radio-header">
         <div>
           <div class="section-title" id="radio-modal-title">Discover radio</div>
-          <div class="muted" id="radio-modal-subtitle">Assign a station to <span id="radio-modal-channel-name">this channel</span>.</div>
+          <div class="muted" id="radio-modal-subtitle">Assign a station to <span id="radio-modal-channel-name">this provider</span>.</div>
         </div>
         <button id="radio-close" class="icon-btn small-btn" type="button" aria-label="Close radio browser">✕</button>
       </div>
@@ -300,7 +300,7 @@
         <button type="button" class="radio-tab" data-radio-tab="search" aria-selected="false">Search</button>
       </div>
       <div class="radio-pane" data-radio-pane="favorites" hidden>
-        <div class="muted" style="padding: 8px 2px; font-size: 13px;">Your saved stations. Tune a favorite to assign it to the current channel.</div>
+        <div class="muted" style="padding: 8px 2px; font-size: 13px;">Your saved stations. Tune a favorite to assign it to the current provider.</div>
       </div>
       <div class="radio-pane" data-radio-pane="genres">
         <div class="radio-chip-list" id="radio-genre-list"></div>
@@ -419,27 +419,6 @@
 
       <div class="panel collapsible-panel" data-collapsible>
         <button class="collapsible-header" type="button" aria-expanded="false">
-          <span class="section-title" style="margin:0;">Channels</span>
-          <span class="collapsible-icon" aria-hidden="true">▾</span>
-        </button>
-        <div class="collapsible-content" aria-hidden="true">
-          <div style="display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; margin-bottom:12px;">
-            <div style="min-width:220px;">
-              <label for="channels-count">Number of channels</label>
-              <select id="channels-count">
-                <option value="1">1</option>
-              </select>
-            </div>
-          </div>
-          <div class="muted" style="margin-bottom:12px; font-size:13px;">
-            Set up channel names, accent colours, and sources.
-          </div>
-          <div id="channels-panel" class="channels-settings"></div>
-        </div>
-      </div>
-
-      <div class="panel collapsible-panel" data-collapsible>
-        <button class="collapsible-header" type="button" aria-expanded="false">
           <span class="section-title" style="margin:0;">Music providers</span>
           <span class="collapsible-icon" aria-hidden="true">▾</span>
         </button>
@@ -450,10 +429,14 @@
 
           <div id="provider-settings-spotify" hidden aria-hidden="true" style="margin-top:14px;">
             <div class="label" style="margin-bottom:6px;">Spotify settings</div>
-            <div class="spotify-channel-select">
-              <label for="spotify-channel-select">Account</label>
-                <div class="muted" style="font-size:12px; margin-bottom:6px;">Choose Account A or Account B.</div>
-              <select id="spotify-channel-select"></select>
+            <div class="provider-display-row" style="margin-bottom:12px;">
+              <div class="provider-display-name">
+                <label>Display name</label>
+                <input id="sp-provider-name" placeholder="Spotify 1">
+              </div>
+              <div class="provider-display-color">
+                <input id="sp-provider-color" type="color" value="#22c55e" aria-label="Display color">
+              </div>
             </div>
               <div id="spotify-link-status" class="status-pill warn" style="margin-bottom:12px; display:none;">Account link status: unknown</div>
             <div class="grid">
@@ -488,6 +471,15 @@
 
           <div id="provider-settings-radio" hidden aria-hidden="true" style="margin-top:14px;">
             <div class="label" style="margin-bottom:6px;">Radio settings</div>
+            <div class="provider-display-row" style="margin-bottom:12px;">
+              <div class="provider-display-name">
+                <label>Display name</label>
+                <input id="radio-provider-name" placeholder="Radio 1">
+              </div>
+              <div class="provider-display-color">
+                <input id="radio-provider-color" type="color" value="#f97316" aria-label="Display color">
+              </div>
+            </div>
             <div class="muted" id="radio-slot-count" style="font-size:12px;">Radio slots: —</div>
             <div class="grid" style="margin-top:10px;">
               <div>
@@ -502,6 +494,15 @@
 
           <div id="provider-settings-audiobookshelf" hidden aria-hidden="true" style="margin-top:14px;">
             <div class="label" style="margin-bottom:6px;">Audiobookshelf settings</div>
+            <div class="provider-display-row" style="margin-bottom:12px;">
+              <div class="provider-display-name">
+                <label>Display name</label>
+                <input id="abs-provider-name" placeholder="Audiobookshelf 1">
+              </div>
+              <div class="provider-display-color">
+                <input id="abs-provider-color" type="color" value="#38bdf8" aria-label="Display color">
+              </div>
+            </div>
             <div class="grid">
               <div>
                 <label>Audiobookshelf base URL</label>

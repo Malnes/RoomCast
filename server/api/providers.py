@@ -27,6 +27,7 @@ def create_providers_router(
     apply_spotify_provider: Callable[[int], None],
     disable_spotify_provider: Callable[[], None],
     delete_spotify_tokens: Callable[[], None],
+    delete_spotify_token: Callable[[str], None],
     apply_radio_provider: Callable[[], None],
     disable_radio_provider: Callable[[], None],
     apply_audiobookshelf_provider: Callable[[], None],
@@ -85,16 +86,20 @@ def create_providers_router(
         else:
             defaults = {}
             if pid == "spotify":
-                defaults = {"instances": 2}
+                defaults = {"instances": 1}
+            if pid == "radio":
+                defaults = {"max_slots": 1}
             state = provider_state_cls(id=pid, enabled=True, settings=defaults)
             current[pid] = state
 
         save_providers_state()
 
         if pid == "spotify":
-            state.settings = {**(state.settings or {}), "instances": 2}
+            instances = int((state.settings or {}).get("instances") or 1)
+            instances = max(1, min(2, instances))
+            state.settings = {**(state.settings or {}), "instances": instances}
             save_providers_state()
-            apply_spotify_provider(2)
+            apply_spotify_provider(instances)
         elif pid == "radio":
             apply_radio_provider()
         elif pid == "audiobookshelf":
@@ -114,6 +119,7 @@ def create_providers_router(
         if not state:
             raise HTTPException(status_code=404, detail="Provider not installed")
 
+        previous_instances = int((state.settings or {}).get("instances") or 1) if pid == "spotify" else 0
         updates = payload.model_dump(exclude_unset=True)
         if "enabled" in updates and updates["enabled"] is not None:
             state.enabled = bool(updates["enabled"])
@@ -125,9 +131,13 @@ def create_providers_router(
 
         if pid == "spotify":
             if state.enabled:
-                state.settings = {**(state.settings or {}), "instances": 2}
+                instances = int((state.settings or {}).get("instances") or 1)
+                instances = max(1, min(2, instances))
+                state.settings = {**(state.settings or {}), "instances": instances}
                 save_providers_state()
-                apply_spotify_provider(2)
+                apply_spotify_provider(instances)
+                if previous_instances >= 2 and instances < 2:
+                    delete_spotify_token("spotify:b")
             else:
                 disable_spotify_provider()
         elif pid == "radio":

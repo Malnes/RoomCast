@@ -279,7 +279,7 @@ async function setNodeChannel(nodeId, channelId, selectEl, dotEl) {
       body: JSON.stringify({ channel_id: normalized || null }),
     });
     await ensureOk(res);
-    showSuccess('Channel updated');
+    showSuccess('Provider updated');
     if (selectEl) {
       selectEl.dataset.previousChannel = normalized;
     }

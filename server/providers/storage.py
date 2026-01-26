@@ -86,7 +86,7 @@ def infer_providers(
         except json.JSONDecodeError:
             data = []
         if isinstance(data, list) and any(isinstance(item, dict) and str(item.get("kind") or "").lower() == "spotify" for item in data):
-            inferred["spotify"] = ProviderState(id="spotify", enabled=True, settings={"instances": 2})
+            inferred["spotify"] = ProviderState(id="spotify", enabled=True, settings={"instances": 1})
 
     if channels_path.exists():
         try:

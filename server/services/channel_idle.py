@@ -22,6 +22,7 @@ class ChannelIdleService:
         mark_radio_assignments_dirty: Callable[[], None],
         radio_runtime_status: dict[str, dict],
         spotify_pause: Callable[[str], Awaitable[None]],
+        spotify_is_playing_elsewhere: Callable[[str], Awaitable[bool]],
         parse_spotify_error: Callable[[object], dict],
         idle_timeout: float,
         poll_interval: float,
@@ -37,6 +38,7 @@ class ChannelIdleService:
         self._mark_radio_assignments_dirty = mark_radio_assignments_dirty
         self._radio_runtime_status = radio_runtime_status
         self._spotify_pause = spotify_pause
+        self._spotify_is_playing_elsewhere = spotify_is_playing_elsewhere
         self._parse_spotify_error = parse_spotify_error
         self._idle_timeout = float(idle_timeout)
         self._poll_interval = float(poll_interval)
@@ -178,6 +180,13 @@ class ChannelIdleService:
             listeners = counts.get(cid, 0)
             if listeners <= 0 and self._channel_has_active_hardware_listeners(cid):
                 listeners = 1
+            source = (channel.get("source") or "spotify").lower()
+            if listeners <= 0 and source == "spotify":
+                try:
+                    if await self._spotify_is_playing_elsewhere(cid):
+                        listeners = 1
+                except Exception:
+                    self._log.exception("Channel idle monitor: failed to check Spotify playback for %s", cid)
             state = self._state.setdefault(cid, {"idle_since": None, "stopped": False})
             if listeners > 0:
                 state["idle_since"] = None

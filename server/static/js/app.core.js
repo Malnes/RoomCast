@@ -2119,40 +2119,6 @@ async function refreshSpotifySources() {
   return spotifySourcesFetchPromise;
 }
 
-function populateSpotifyChannelSelect() {
-  // Historical name; now selects Spotify source instances (A/B).
-  if (!spotifyChannelSelect) return;
-  spotifyChannelSelect.innerHTML = '';
-
-  const sources = Array.isArray(spotifySourcesCache) ? spotifySourcesCache : [];
-  if (!sources.length) {
-    const option = document.createElement('option');
-    option.value = '';
-    option.textContent = spotifySourcesLoaded ? 'No Spotify sources installed' : 'Loading sources…';
-    spotifyChannelSelect.appendChild(option);
-    spotifyChannelSelect.disabled = true;
-    if (!spotifySourcesLoaded) {
-      // Fire and forget; caller may call populate again later.
-      refreshSpotifySources().then(() => populateSpotifyChannelSelect()).catch(() => {});
-    }
-    return;
-  }
-
-  spotifyChannelSelect.disabled = false;
-  sources.forEach(source => {
-    if (!source?.id) return;
-    const option = document.createElement('option');
-    option.value = source.id;
-    if (source.id === 'spotify:a') option.textContent = 'Account A';
-    else if (source.id === 'spotify:b') option.textContent = 'Account B';
-    else option.textContent = source.name || source.id;
-    spotifyChannelSelect.appendChild(option);
-  });
-
-  const resolved = getSettingsChannelId();
-  if (resolved) spotifyChannelSelect.value = resolved;
-}
-
 function getSettingsChannelId() {
   // Historical name; returns selected Spotify source id.
   const sources = Array.isArray(spotifySourcesCache) ? spotifySourcesCache : [];
@@ -2160,10 +2126,11 @@ function getSettingsChannelId() {
     return spotifySettingsSourceId;
   }
   spotifySettingsSourceId = sources[0]?.id || 'spotify:a';
-  if (spotifyChannelSelect && spotifySettingsSourceId) {
-    spotifyChannelSelect.value = spotifySettingsSourceId;
-  }
   return spotifySettingsSourceId;
+}
+
+function populateSpotifyChannelSelect() {
+  // No UI selector when providers represent instances.
 }
 
 function renderChannelsPanel() {

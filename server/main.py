@@ -190,7 +190,7 @@ def radio_max_slots_configured() -> int:
     try:
         desired = int(raw)
     except (TypeError, ValueError):
-        desired = radio_max_slots_supported()
+        desired = 1
     desired = max(1, min(desired, radio_max_slots_supported()))
     return desired
 
@@ -396,7 +396,12 @@ def get_provider_settings(provider_id: str) -> dict:
 
 
 def spotify_instance_count() -> int:
-    return 2
+    settings = get_provider_settings("spotify")
+    try:
+        instances = int((settings or {}).get("instances") or 0)
+    except (TypeError, ValueError):
+        instances = 0
+    return max(0, min(2, instances))
 
 
 def require_spotify_provider() -> None:
@@ -452,7 +457,7 @@ def _sanitize_channel_color(value: Optional[str]) -> Optional[str]:
 
 def _normalize_channel_id(value: Optional[str], fallback: str) -> str:
     candidate = (value or "").strip().lower()
-    cleaned = "".join(ch for ch in candidate if ch.isalnum() or ch in {"-", "_"})
+    cleaned = "".join(ch for ch in candidate if ch.isalnum() or ch in {"-", "_", ":"})
     return cleaned or fallback
 
 
@@ -603,9 +608,10 @@ def _normalize_channel_entry(entry: dict, fallback_order: int) -> dict:
     source_ref: Optional[str] = None
     if source == "spotify":
         source_ref = _normalize_spotify_source_id(source_ref_raw)
+        if not source_ref and _is_spotify_source_id(channel_id):
+            source_ref = channel_id
         if not source_ref:
-            # Backwards-compatible mapping: ch2 defaults to Spotify B, everything else to A.
-            source_ref = "spotify:b" if channel_id == f"{CHANNEL_ID_PREFIX}2" else "spotify:a"
+            source_ref = "spotify:a"
     elif source == "radio":
         source_ref = "radio"
     elif source == "audiobookshelf":
@@ -893,6 +899,79 @@ def _default_source_entries(*, instances: int) -> list[dict]:
     return entries
 
 
+def _spotify_fifo_path(source_id: str) -> str:
+    return "/tmp/snapfifo-ch2" if source_id.endswith(":b") else "/tmp/snapfifo-ch1"
+
+
+def _build_provider_channels(existing: Dict[str, dict]) -> list[dict]:
+    entries: list[dict] = []
+    order = 1
+    # Spotify instances
+    if is_provider_enabled("spotify"):
+        for sid, source in sorted(sources_by_id.items(), key=lambda item: item[0]):
+            if source.get("kind") != "spotify":
+                continue
+            previous = existing.get(sid) if isinstance(existing.get(sid), dict) else {}
+            entry = {
+                "id": sid,
+                "name": previous.get("name") or source.get("name") or sid,
+                "order": order,
+                "snap_stream": source.get("snap_stream"),
+                "fifo_path": _spotify_fifo_path(sid),
+                "config_path": source.get("config_path"),
+                "token_path": source.get("token_path"),
+                "status_path": source.get("status_path"),
+                "color": previous.get("color") or "#22c55e",
+                "enabled": True,
+                "source": "spotify",
+                "source_ref": sid,
+            }
+            entries.append(_normalize_channel_entry(entry, fallback_order=order))
+            order += 1
+
+    # Radio slots
+    if is_provider_enabled("radio"):
+        for idx, slot in enumerate(radio_channel_slots_active(), start=1):
+            cid = f"radio:{idx}"
+            previous = existing.get(cid) if isinstance(existing.get(cid), dict) else {}
+            entry = {
+                "id": cid,
+                "name": previous.get("name") or slot.get("label") or f"Radio {idx}",
+                "order": order,
+                "snap_stream": slot.get("snap_stream"),
+                "fifo_path": slot.get("fifo_path"),
+                "color": previous.get("color") or slot.get("color") or "#f97316",
+                "enabled": True,
+                "source": "radio",
+                "source_ref": "radio",
+                "radio_state": previous.get("radio_state"),
+            }
+            entries.append(_normalize_channel_entry(entry, fallback_order=order))
+            order += 1
+
+    # Audiobookshelf slots
+    if is_provider_enabled("audiobookshelf"):
+        for idx, slot in enumerate(ABS_CHANNEL_SLOTS, start=1):
+            cid = f"audiobookshelf:{idx}"
+            previous = existing.get(cid) if isinstance(existing.get(cid), dict) else {}
+            entry = {
+                "id": cid,
+                "name": previous.get("name") or slot.get("label") or f"Audiobookshelf {idx}",
+                "order": order,
+                "snap_stream": slot.get("snap_stream"),
+                "fifo_path": slot.get("fifo_path"),
+                "color": previous.get("color") or "#38bdf8",
+                "enabled": True,
+                "source": "audiobookshelf",
+                "source_ref": "audiobookshelf",
+                "abs_state": previous.get("abs_state"),
+            }
+            entries.append(_normalize_channel_entry(entry, fallback_order=order))
+            order += 1
+
+    return entries
+
+
 def load_sources() -> None:
     global sources_by_id
     entries: list[Any] = []
@@ -904,7 +983,8 @@ def load_sources() -> None:
             entries = []
     if not entries:
         if is_provider_enabled("spotify"):
-            entries = _default_source_entries(instances=spotify_instance_count())
+            desired_instances = max(1, spotify_instance_count())
+            entries = _default_source_entries(instances=desired_instances)
             _write_sources_file(entries)
         else:
             sources_by_id = {}
@@ -971,34 +1051,38 @@ def get_spotify_source(source_id: Optional[str]) -> dict:
 
 def resolve_channel_spotify_source_id(channel_id: Optional[str]) -> Optional[str]:
     channel = get_channel(channel_id)
+    cid = (channel.get("id") or "").strip().lower()
+    if _is_spotify_source_id(cid):
+        return cid if cid in sources_by_id else None
     ref = (channel.get("source_ref") or "").strip().lower()
     sid = _normalize_spotify_source_id(ref)
     if sid:
         return sid if sid in sources_by_id else None
-    if (channel.get("source") or "spotify").strip().lower() != "spotify":
+    if (channel.get("source") or "").strip().lower() != "spotify":
         return None
-    # Backwards-compatible mapping for existing installs.
-    if channel.get("id") == f"{CHANNEL_ID_PREFIX}2":
-        return "spotify:b"
-    return "spotify:a"
+    return "spotify:a" if "spotify:a" in sources_by_id else None
 
 
 def load_channels() -> None:
     global channels_by_id, channel_order
-    entries: list[Any] = []
+    existing_entries: list[Any] = []
     if CHANNELS_PATH.exists():
         try:
-            entries = json.loads(CHANNELS_PATH.read_text()) or []
+            existing_entries = json.loads(CHANNELS_PATH.read_text()) or []
         except json.JSONDecodeError:
             log.warning("channels.json is invalid; regenerating defaults")
-    # Radio no longer creates dedicated channel entries; it is a per-channel source.
-    normalized = _hydrate_channels(entries, ensure_radio=False)
-    channels_by_id = {entry["id"]: entry for entry in normalized}
-    channel_order = [entry["id"] for entry in normalized]
-    for entry in normalized:
+            existing_entries = []
+    existing_by_id = {
+        (entry.get("id") or "").strip().lower(): entry
+        for entry in existing_entries
+        if isinstance(entry, dict)
+    }
+    generated = _build_provider_channels(existing_by_id)
+    channels_by_id = {entry["id"]: entry for entry in generated}
+    channel_order = [entry["id"] for entry in generated]
+    for entry in generated:
         _ensure_channel_paths(entry)
-    if not CHANNELS_PATH.exists() or not entries:
-        _write_channels_file(normalized)
+    _write_channels_file(generated)
     _resequence_channel_order()
 
 
@@ -1061,8 +1145,8 @@ def channels_public() -> list[dict]:
 
 
 load_providers_state()
-load_channels()
 load_sources()
+load_channels()
 
 
 def channel_detail(channel_id: str) -> dict:
@@ -1314,6 +1398,38 @@ provider_runtime_service = ProviderRuntimeService(
 )
 
 
+async def _spotify_is_playing_elsewhere(channel_id: str) -> bool:
+    try:
+        token = _ensure_spotify_token(channel_id)
+        resp = await spotify_api.spotify_request(
+            "GET",
+            "/me/player",
+            token,
+            channel_id,
+            spotify_refresh_func=lambda token, identifier: spotify_api.spotify_refresh(
+                token,
+                identifier,
+                spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
+                save_token=spotify_config.save_token,
+            ),
+        )
+    except HTTPException:
+        return False
+    if resp.status_code == 204:
+        return False
+    if resp.status_code >= 400:
+        return False
+    data = resp.json()
+    if not data.get("is_playing"):
+        return False
+    device = data.get("device") or {}
+    device_name = (device.get("name") or "").strip().lower()
+    if not device_name:
+        return False
+    preferred = [name.lower() for name in _preferred_roomcast_device_names(channel_id)]
+    return device_name not in preferred
+
+
 channel_idle_service = ChannelIdleService(
     channel_order=channel_order,
     channels_by_id=channels_by_id,
@@ -1343,6 +1459,7 @@ channel_idle_service = ChannelIdleService(
             **kwargs,
         ),
     ),
+    spotify_is_playing_elsewhere=_spotify_is_playing_elsewhere,
     parse_spotify_error=lambda detail: spotify_api.parse_spotify_error(detail),
     idle_timeout=CHANNEL_IDLE_TIMEOUT,
     poll_interval=CHANNEL_IDLE_POLL_INTERVAL,
@@ -1665,6 +1782,13 @@ def _delete_spotify_tokens() -> None:
             pass
 
 
+def _delete_spotify_token(source_id: str) -> None:
+    try:
+        spotify_config.delete_token(source_id)
+    except HTTPException:
+        pass
+
+
 app.include_router(
     create_providers_router(
         available_providers=AVAILABLE_PROVIDERS,
@@ -1677,6 +1801,7 @@ app.include_router(
         apply_spotify_provider=provider_runtime_service.apply_spotify_provider,
         disable_spotify_provider=provider_runtime_service.disable_spotify_provider,
         delete_spotify_tokens=_delete_spotify_tokens,
+        delete_spotify_token=_delete_spotify_token,
         apply_radio_provider=provider_runtime_service.apply_radio_provider,
         disable_radio_provider=provider_runtime_service.disable_radio_provider,
         apply_audiobookshelf_provider=provider_runtime_service.apply_audiobookshelf_provider,

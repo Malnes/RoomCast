@@ -1026,6 +1026,7 @@ async function saveSpotify() {
       body: JSON.stringify(payload),
     });
     await ensureOk(res);
+    await saveProviderDisplaySettings(sourceId, spProviderNameInput, spProviderColorInput);
     showSuccess('Spotify config saved. Librespot will reload and connect.');
     await pollLibrespotStatus(sourceId);
   } catch (err) {
@@ -1255,6 +1256,12 @@ const providersInstalledList = document.getElementById('providers-installed-list
 const providerSettingsSpotify = document.getElementById('provider-settings-spotify');
 const providerSettingsRadio = document.getElementById('provider-settings-radio');
 const providerSettingsAudiobookshelf = document.getElementById('provider-settings-audiobookshelf');
+const spProviderNameInput = document.getElementById('sp-provider-name');
+const spProviderColorInput = document.getElementById('sp-provider-color');
+const radioProviderNameInput = document.getElementById('radio-provider-name');
+const radioProviderColorInput = document.getElementById('radio-provider-color');
+const absProviderNameInput = document.getElementById('abs-provider-name');
+const absProviderColorInput = document.getElementById('abs-provider-color');
 const radioSlotCountEl = document.getElementById('radio-slot-count');
 const radioMaxSlotsInput = document.getElementById('radio-max-slots');
 const radioSlotsSaveBtn = document.getElementById('radio-slots-save');
@@ -1353,10 +1360,80 @@ function hideProviderRemoveOverlay(delayMs = 0) {
 
 function providerIconSrc(providerIdRaw) {
   const pid = (providerIdRaw || '').trim().toLowerCase();
-  if (pid === 'spotify') return '/static/icons/providers/spotify.svg';
-  if (pid === 'radio') return '/static/icons/providers/radio.svg';
-  if (pid === 'audiobookshelf') return '/static/icons/providers/audiobookshelf.svg';
+  const base = pid.split(':')[0];
+  if (base === 'spotify') return '/static/icons/providers/spotify.svg';
+  if (base === 'radio') return '/static/icons/providers/radio.svg';
+  if (base === 'audiobookshelf') return '/static/icons/providers/audiobookshelf.svg';
   return '/static/icons/providers/generic.svg';
+}
+
+function normalizeProviderBaseId(providerIdRaw) {
+  const pid = (providerIdRaw || '').trim().toLowerCase();
+  return pid.split(':')[0] || '';
+}
+
+function spotifyInstanceId(instance) {
+  return instance === 2 ? 'spotify:b' : 'spotify:a';
+}
+
+function spotifyInstanceLabel(instance) {
+  return instance === 2 ? 'Spotify 2' : 'Spotify 1';
+}
+
+function spotifyInstancesInstalled() {
+  const installed = getInstalledProvider('spotify');
+  const count = Number(installed?.settings?.instances || 0);
+  return Number.isFinite(count) ? Math.max(0, Math.min(2, count)) : 0;
+}
+
+function radioInstancesInstalled() {
+  const installed = getInstalledProvider('radio');
+  if (!installed) return 0;
+  const maxSlots = Number(radioSlotsCache?.maxSlots);
+  if (Number.isFinite(maxSlots) && maxSlots > 0) return Math.min(maxSlots, 2);
+  return 1;
+}
+
+function absInstancesInstalled() {
+  const installed = getInstalledProvider('audiobookshelf');
+  return installed ? 2 : 0;
+}
+
+function providerInstanceLabel(baseId, index) {
+  if (baseId === 'spotify') return spotifyInstanceLabel(index);
+  if (baseId === 'radio') return `Radio ${index}`;
+  if (baseId === 'audiobookshelf') return `Audiobookshelf ${index}`;
+  return baseId;
+}
+
+function providerInstanceId(baseId, index) {
+  if (baseId === 'spotify') return spotifyInstanceId(index);
+  return `${baseId}:${index}`;
+}
+
+function getProviderChannel(providerId) {
+  if (!providerId) return null;
+  if (typeof getChannelById === 'function') {
+    return getChannelById(providerId);
+  }
+  return null;
+}
+
+async function saveProviderDisplaySettings(providerId, nameInput, colorInput) {
+  if (!providerId) return;
+  const name = (nameInput?.value || '').trim();
+  const color = (colorInput?.value || '').trim();
+  if (!name && !color) return;
+  const payload = {};
+  if (name) payload.name = name;
+  if (color) payload.color = color;
+  const res = await fetch(`/api/channels/${encodeURIComponent(providerId)}`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  await ensureOk(res);
+  await refreshChannels({ force: true });
 }
 
 function createProviderIconEl(provider) {
@@ -1431,6 +1508,9 @@ async function saveRadioSlots() {
         radioMaxSlotsInput.value = String(maxSlots);
       }
       showSuccess('Radio slots saved');
+    }
+    if (providerSettingsModalProviderId?.startsWith('radio:')) {
+      await saveProviderDisplaySettings(providerSettingsModalProviderId, radioProviderNameInput, radioProviderColorInput);
     }
   } catch (err) {
     showError(`Failed to save radio slots: ${err.message}`);
@@ -1538,6 +1618,7 @@ function renderProviderAddModal() {
     .sort((a, b) => (a?.name || a?.id || '').localeCompare(b?.name || b?.id || ''))
     .forEach(provider => {
       if (!provider?.id) return;
+      const baseId = normalizeProviderBaseId(provider.id);
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'provider-option-btn';
@@ -1551,8 +1632,24 @@ function renderProviderAddModal() {
       const meta = document.createElement('span');
       meta.className = 'provider-option-meta';
       const installed = !!provider.installed;
-      meta.textContent = installed ? 'Installed' : '';
-      if (installed) btn.disabled = true;
+      if (baseId === 'spotify') {
+        const installedCount = spotifyInstancesInstalled();
+        meta.textContent = `${installedCount}/2`;
+        if (installedCount >= 2) {
+          meta.textContent = '2/2 installed';
+          btn.disabled = true;
+        }
+      } else if (baseId === 'radio') {
+        const installedCount = radioInstancesInstalled();
+        meta.textContent = `${installedCount}/2`;
+        if (installedCount >= 2) {
+          meta.textContent = '2/2 installed';
+          btn.disabled = true;
+        }
+      } else {
+        meta.textContent = installed ? 'Installed' : '';
+        if (installed) btn.disabled = true;
+      }
       btn.appendChild(meta);
 
       btn.addEventListener('click', async () => {
@@ -1565,17 +1662,18 @@ function renderProviderAddModal() {
 
 function openProviderSettingsModal(providerId) {
   const pid = (providerId || '').trim().toLowerCase();
+  const baseId = normalizeProviderBaseId(pid);
   if (!pid) return;
-  const installed = getInstalledProvider(pid);
+  const installed = getInstalledProvider(baseId);
   if (!installed) {
     showError('Provider is not installed.');
     return;
   }
 
   let panelEl = null;
-  if (pid === 'spotify') panelEl = providerSettingsSpotify;
-  else if (pid === 'radio') panelEl = providerSettingsRadio;
-  else if (pid === 'audiobookshelf') panelEl = providerSettingsAudiobookshelf;
+  if (baseId === 'spotify') panelEl = providerSettingsSpotify;
+  else if (baseId === 'radio') panelEl = providerSettingsRadio;
+  else if (baseId === 'audiobookshelf') panelEl = providerSettingsAudiobookshelf;
 
   if (!panelEl) {
     showError('This provider has no settings UI.');
@@ -1618,7 +1716,10 @@ function openProviderSettingsModal(providerId) {
     document.body.appendChild(providerSettingsModal);
   }
 
-  providerSettingsModalTitle.textContent = `Provider settings – ${installed.name || installed.id || pid}`;
+  const label = baseId === 'spotify'
+    ? spotifyInstanceLabel(pid === 'spotify:b' ? 2 : 1)
+    : providerInstanceLabel(baseId, Number(pid.split(':')[1]) || 1);
+  providerSettingsModalTitle.textContent = `Provider settings – ${label}`;
   if (providerSettingsModalContent) providerSettingsModalContent.innerHTML = '';
 
   // Move the existing settings panel into the modal so existing handlers/IDs keep working.
@@ -1630,7 +1731,27 @@ function openProviderSettingsModal(providerId) {
   if (providerSettingsModalContent) providerSettingsModalContent.appendChild(panelEl);
   setProviderSettingsVisible(panelEl, true);
 
-  if (pid === 'radio') {
+  if (baseId === 'spotify') {
+    spotifySettingsSourceId = pid.startsWith('spotify:') ? pid : spotifyInstanceId(1);
+    fetchSpotifyConfig(spotifySettingsSourceId);
+    fetchLibrespotStatus(spotifySettingsSourceId);
+  }
+
+  const currentChannel = getProviderChannel(pid);
+  if (baseId === 'spotify') {
+    if (spProviderNameInput) spProviderNameInput.value = currentChannel?.name || label;
+    if (spProviderColorInput && currentChannel?.color) spProviderColorInput.value = currentChannel.color;
+  }
+  if (baseId === 'radio') {
+    if (radioProviderNameInput) radioProviderNameInput.value = currentChannel?.name || label;
+    if (radioProviderColorInput && currentChannel?.color) radioProviderColorInput.value = currentChannel.color;
+  }
+  if (baseId === 'audiobookshelf') {
+    if (absProviderNameInput) absProviderNameInput.value = currentChannel?.name || label;
+    if (absProviderColorInput && currentChannel?.color) absProviderColorInput.value = currentChannel.color;
+  }
+
+  if (baseId === 'radio') {
     fetchRadioSlots();
   }
 
@@ -1655,8 +1776,8 @@ function openProviderSettingsModal(providerId) {
 }
 
 function getInstalledProvider(providerId) {
-  const pid = (providerId || '').trim().toLowerCase();
-  return (Array.isArray(providersInstalledCache) ? providersInstalledCache : []).find(p => (p?.id || '').toLowerCase() === pid) || null;
+  const pid = normalizeProviderBaseId(providerId);
+  return (Array.isArray(providersInstalledCache) ? providersInstalledCache : []).find(p => normalizeProviderBaseId(p?.id) === pid) || null;
 }
 
 function setProviderSettingsVisible(el, visible) {
@@ -1670,18 +1791,19 @@ function syncProviderSettingsPanels() {
   const spotifyInstalled = !!getInstalledProvider('spotify');
   const radioInstalled = !!getInstalledProvider('radio');
   const absInstalled = !!getInstalledProvider('audiobookshelf');
-  const modalPid = providerSettingsModalProviderId;
+  const modalPid = normalizeProviderBaseId(providerSettingsModalProviderId);
+  const openPid = normalizeProviderBaseId(providerSettingsOpenId);
   setProviderSettingsVisible(
     providerSettingsSpotify,
-    spotifyInstalled && (providerSettingsOpenId === 'spotify' || modalPid === 'spotify'),
+    spotifyInstalled && (openPid === 'spotify' || modalPid === 'spotify'),
   );
   setProviderSettingsVisible(
     providerSettingsRadio,
-    radioInstalled && (providerSettingsOpenId === 'radio' || modalPid === 'radio'),
+    radioInstalled && (openPid === 'radio' || modalPid === 'radio'),
   );
   setProviderSettingsVisible(
     providerSettingsAudiobookshelf,
-    absInstalled && (providerSettingsOpenId === 'audiobookshelf' || modalPid === 'audiobookshelf'),
+    absInstalled && (openPid === 'audiobookshelf' || modalPid === 'audiobookshelf'),
   );
 
   const absProvider = getInstalledProvider('audiobookshelf');
@@ -1694,16 +1816,64 @@ function syncProviderSettingsPanels() {
 function renderInstalledProviders() {
   if (!providersInstalledList) return;
   const installed = Array.isArray(providersInstalledCache) ? providersInstalledCache : [];
+  const expanded = [];
+  installed.forEach(provider => {
+    if (!provider?.id) return;
+    const pid = normalizeProviderBaseId(provider.id);
+    if (pid === 'spotify') {
+      const instances = spotifyInstancesInstalled();
+      const count = Math.max(1, instances || 1);
+      for (let i = 1; i <= count; i += 1) {
+        const instanceId = spotifyInstanceId(i);
+        const channel = getProviderChannel(instanceId);
+        expanded.push({
+          ...provider,
+          id: instanceId,
+          name: channel?.name || spotifyInstanceLabel(i),
+          base_id: 'spotify',
+          instance_index: i,
+        });
+      }
+    } else if (pid === 'radio') {
+      const count = Math.max(1, radioInstancesInstalled());
+      for (let i = 1; i <= count; i += 1) {
+        const instanceId = providerInstanceId('radio', i);
+        const channel = getProviderChannel(instanceId);
+        expanded.push({
+          ...provider,
+          id: instanceId,
+          name: channel?.name || providerInstanceLabel('radio', i),
+          base_id: 'radio',
+          instance_index: i,
+        });
+      }
+    } else if (pid === 'audiobookshelf') {
+      const count = Math.max(1, absInstancesInstalled());
+      for (let i = 1; i <= count; i += 1) {
+        const instanceId = providerInstanceId('audiobookshelf', i);
+        const channel = getProviderChannel(instanceId);
+        expanded.push({
+          ...provider,
+          id: instanceId,
+          name: channel?.name || providerInstanceLabel('audiobookshelf', i),
+          base_id: 'audiobookshelf',
+          instance_index: i,
+        });
+      }
+    } else {
+      expanded.push(provider);
+    }
+  });
   providersInstalledList.innerHTML = '';
 
-  if (!installed.length) {
+  if (!expanded.length) {
     providersInstalledList.innerHTML = '';
     providerSettingsOpenId = null;
     syncProviderSettingsPanels();
     return;
   }
 
-  installed
+  expanded
     .slice()
     .sort((a, b) => (a?.name || a?.id || '').localeCompare(b?.name || b?.id || ''))
     .forEach(provider => {
@@ -1774,12 +1944,15 @@ async function refreshProvidersState() {
     providersInstalledCache = [];
     showError(`Failed to load providers: ${err.message}`);
   }
+  if (getInstalledProvider('radio')) {
+    await fetchRadioSlots();
+  }
   renderInstalledProviders();
   if (radioSlotCountEl) {
     if (radioSlotsCache?.maxSlots) {
       radioSlotCountEl.textContent = `Radio slots: ${radioSlotsCache.maxSlots}`;
     } else if (getInstalledProvider('radio')) {
-      fetchRadioSlots();
+      radioSlotCountEl.textContent = 'Radio slots: —';
     } else {
       radioSlotCountEl.textContent = 'Radio slots: —';
       if (radioMaxSlotsInput) radioMaxSlotsInput.value = '';
@@ -1803,29 +1976,72 @@ async function installProviderById(providerIdRaw) {
     showError('Choose a provider to install.');
     return;
   }
+  const baseId = normalizeProviderBaseId(providerId);
   if (!isAdminUser()) {
     showError('Only admins can install providers.');
     return;
   }
   try {
     if (providerAddOpenBtn) providerAddOpenBtn.disabled = true;
-    const res = await fetch('/api/providers/install', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ id: providerId }),
-    });
+    let res;
+    if (baseId === 'spotify') {
+      const installedCount = spotifyInstancesInstalled();
+      const desired = Math.min(installedCount + 1, 2);
+      if (installedCount <= 0) {
+        res = await fetch('/api/providers/install', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: baseId }),
+        });
+      } else {
+        res = await fetch(`/api/providers/${encodeURIComponent(baseId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ settings: { instances: desired } }),
+        });
+      }
+    } else if (baseId === 'radio') {
+      const installedCount = radioInstancesInstalled();
+      if (installedCount <= 0) {
+        res = await fetch('/api/providers/install', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: baseId }),
+        });
+      } else if (installedCount < 2) {
+        res = await fetch('/api/radio/slots', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ max_slots: installedCount + 1 }),
+        });
+      } else {
+        showError('Radio already has 2 providers.');
+        return;
+      }
+    } else {
+      res = await fetch('/api/providers/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: baseId }),
+      });
+    }
     await ensureOk(res);
     showSuccess('Provider installed.');
     closeProviderAddModal();
     await refreshChannels({ force: true });
     await refreshProvidersState();
     await refreshSpotifySources();
-    populateSpotifyChannelSelect();
-    if (providerId === 'spotify') {
+    if (baseId === 'spotify') {
       providerSettingsOpenId = null;
       syncProviderSettingsPanels();
-      fetchSpotifyConfig();
-      fetchLibrespotStatus();
+      spotifySettingsSourceId = spotifyInstanceId(1);
+      fetchSpotifyConfig(spotifySettingsSourceId);
+      fetchLibrespotStatus(spotifySettingsSourceId);
+    }
+    if (baseId === 'radio') {
+      await fetchRadioSlots();
+      providerSettingsOpenId = null;
+      syncProviderSettingsPanels();
     }
   } catch (err) {
     showError(`Failed to install provider: ${err.message}`);
@@ -1836,28 +2052,54 @@ async function installProviderById(providerIdRaw) {
 
 async function removeProviderById(providerIdRaw, btn) {
   const providerId = (providerIdRaw || '').trim().toLowerCase();
+  const baseId = normalizeProviderBaseId(providerId);
   if (!providerId) return;
   if (!isAdminUser()) {
     showError('Only admins can remove providers.');
     return;
   }
   const targetBtn = btn;
-  const showSpinner = providerId === 'spotify';
+  const showSpinner = baseId === 'spotify';
   try {
     if (showSpinner) {
       showProviderRemoveOverlay('Removing Spotify provider. Please wait');
     }
     if (targetBtn) targetBtn.disabled = true;
-    const res = await fetch(`/api/providers/${encodeURIComponent(providerId)}`, {
-      method: 'DELETE',
-    });
+
+    let res;
+    if (baseId === 'spotify' && providerId.startsWith('spotify:')) {
+      const installedCount = spotifyInstancesInstalled();
+      if (installedCount >= 2 && providerId === 'spotify:b') {
+        await fetch(`/api/spotify/logout?source_id=${encodeURIComponent('spotify:b')}`, { method: 'POST' });
+        res = await fetch(`/api/providers/${encodeURIComponent(baseId)}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ settings: { instances: 1 } }),
+        });
+      } else {
+        res = await fetch(`/api/providers/${encodeURIComponent(baseId)}`, { method: 'DELETE' });
+      }
+    } else if (baseId === 'radio' && providerId.startsWith('radio:')) {
+      const installedCount = radioInstancesInstalled();
+      if (installedCount >= 2 && providerId.endsWith(':2')) {
+        res = await fetch('/api/radio/slots', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ max_slots: 1 }),
+        });
+      } else {
+        res = await fetch(`/api/providers/${encodeURIComponent(baseId)}`, { method: 'DELETE' });
+      }
+    } else {
+      res = await fetch(`/api/providers/${encodeURIComponent(baseId)}`, { method: 'DELETE' });
+    }
+
     await ensureOk(res);
     showSuccess('Provider removed.');
     closeProviderSettingsModal();
     await refreshChannels({ force: true });
     await refreshProvidersState();
     await refreshSpotifySources();
-    populateSpotifyChannelSelect();
     if (showSpinner) {
       showProviderRemoveOverlay('Successfully removed', false);
       hideProviderRemoveOverlay(2000);
@@ -1896,6 +2138,9 @@ async function saveAudiobookshelfProviderSettings() {
     });
     await ensureOk(res);
     showSuccess('Audiobookshelf provider updated.');
+    if (providerSettingsModalProviderId?.startsWith('audiobookshelf:')) {
+      await saveProviderDisplaySettings(providerSettingsModalProviderId, absProviderNameInput, absProviderColorInput);
+    }
     await refreshProvidersState();
   } catch (err) {
     showError(`Failed to update Audiobookshelf provider: ${err.message}`);
@@ -1917,11 +2162,11 @@ async function openSettings() {
 
   const spotifyProvider = getInstalledProvider('spotify');
   if (spotifyProvider && spotifyProvider.enabled) {
-    spotifySettingsSourceId = 'spotify:a';
     await refreshSpotifySources();
-    populateSpotifyChannelSelect();
-    fetchSpotifyConfig();
-    fetchLibrespotStatus();
+    const sources = Array.isArray(spotifySourcesCache) ? spotifySourcesCache : [];
+    spotifySettingsSourceId = sources[0]?.id || spotifyInstanceId(1);
+    fetchSpotifyConfig(spotifySettingsSourceId);
+    fetchLibrespotStatus(spotifySettingsSourceId);
   } else {
     spotifySettingsSourceId = null;
     if (librespotStatus) librespotStatus.innerText = 'Status: Spotify provider not installed';
@@ -1932,6 +2177,7 @@ async function openSettings() {
     }
     spotifyAuthLinked = false;
     if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.textContent = 'Sign in to Spotify';
+    if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.classList.remove('danger-btn');
   }
   fetchStatus();
   fetchUsersList();
@@ -2150,13 +2396,6 @@ if (providerAddOpenBtn) providerAddOpenBtn.addEventListener('click', async () =>
 if (absProviderSaveBtn) absProviderSaveBtn.addEventListener('click', saveAudiobookshelfProviderSettings);
 if (spInitVol) {
   spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
-}
-if (spotifyChannelSelect) {
-  spotifyChannelSelect.addEventListener('change', () => {
-    spotifySettingsSourceId = spotifyChannelSelect.value || null;
-    fetchSpotifyConfig();
-    fetchLibrespotStatus();
-  });
 }
 
 function handleAddNodeOverlayClick(event) {
