@@ -1166,6 +1166,140 @@ function clampValue(val, min, max) {
   return Math.min(max, Math.max(min, val));
 }
 
+function scheduleEqCurveDraw(canvas, bands) {
+  if (!canvas) return;
+  if (canvas._eqCurveRaf) {
+    cancelAnimationFrame(canvas._eqCurveRaf);
+  }
+  canvas._eqCurveRaf = requestAnimationFrame(() => {
+    canvas._eqCurveRaf = null;
+    drawEqCurve(canvas, bands);
+  });
+}
+
+function drawEqCurve(canvas, bands) {
+  if (!canvas) return;
+  const rect = canvas.getBoundingClientRect();
+  if (!rect.width || !rect.height) return;
+  const dpr = window.devicePixelRatio || 1;
+  const width = rect.width;
+  const height = rect.height;
+  canvas.width = Math.max(1, Math.floor(width * dpr));
+  canvas.height = Math.max(1, Math.floor(height * dpr));
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const rootStyles = getComputedStyle(document.documentElement);
+  const accent = (rootStyles.getPropertyValue('--accent') || '').trim() || '#22c55e';
+  const accentRgb = (rootStyles.getPropertyValue('--accent-rgb') || '').trim() || '34,197,94';
+  const grid = 'rgba(255,255,255,0.08)';
+  const gridStrong = 'rgba(255,255,255,0.18)';
+  const label = 'rgba(226,232,240,0.7)';
+
+  const padding = { top: 16, right: 14, bottom: 22, left: 14 };
+  const plotWidth = Math.max(1, width - padding.left - padding.right);
+  const plotHeight = Math.max(1, height - padding.top - padding.bottom);
+
+  const minGain = EQ_GAIN_RANGE?.min ?? -12;
+  const maxGain = EQ_GAIN_RANGE?.max ?? 12;
+  const gainSpan = Math.max(1, maxGain - minGain);
+  const gainToY = gain => {
+    const clamped = clampValue(Number(gain) || 0, minGain, maxGain);
+    const ratio = (clamped - minGain) / gainSpan;
+    return padding.top + (1 - ratio) * plotHeight;
+  };
+  const freqToX = freq => {
+    const safe = clampValue(Number(freq) || 20, 20, 20000);
+    const logF = Math.log10(safe);
+    const ratio = (logF - LOG_FREQ.min) / (LOG_FREQ.max - LOG_FREQ.min);
+    return padding.left + clampValue(ratio, 0, 1) * plotWidth;
+  };
+
+  const zeroY = gainToY(0);
+  ctx.strokeStyle = gridStrong;
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(padding.left, zeroY);
+  ctx.lineTo(padding.left + plotWidth, zeroY);
+  ctx.stroke();
+
+  ctx.strokeStyle = grid;
+  const gainTicks = [minGain, -6, 6, maxGain].filter((value, idx, arr) => arr.indexOf(value) === idx);
+  gainTicks.forEach(gain => {
+    const y = gainToY(gain);
+    ctx.beginPath();
+    ctx.moveTo(padding.left, y);
+    ctx.lineTo(padding.left + plotWidth, y);
+    ctx.stroke();
+  });
+
+  const freqTicks = [20, 60, 250, 1000, 4000, 12000, 20000];
+  ctx.strokeStyle = grid;
+  freqTicks.forEach(freq => {
+    const x = freqToX(freq);
+    ctx.beginPath();
+    ctx.moveTo(x, padding.top);
+    ctx.lineTo(x, padding.top + plotHeight);
+    ctx.stroke();
+  });
+
+  ctx.fillStyle = label;
+  ctx.font = '11px "Inter", system-ui, -apple-system, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  freqTicks.forEach(freq => {
+    const x = freqToX(freq);
+    const text = freq >= 1000 ? `${Math.round(freq / 1000)}k` : `${freq}`;
+    ctx.fillText(text, x, padding.top + plotHeight + 6);
+  });
+
+  const anchors = Array.isArray(bands)
+    ? bands
+      .map(band => ({
+        x: freqToX(band?.freq || 20),
+        gain: clampValue(Number(band?.gain) || 0, minGain, maxGain),
+      }))
+      .sort((a, b) => a.x - b.x)
+    : [];
+  if (anchors.length) {
+    const samples = Math.max(80, Math.floor(plotWidth));
+    const points = [];
+    let idx = 0;
+    for (let i = 0; i <= samples; i += 1) {
+      const x = padding.left + (plotWidth * i) / samples;
+      while (idx < anchors.length - 1 && x > anchors[idx + 1].x) idx += 1;
+      let gain = anchors[idx]?.gain ?? 0;
+      const next = anchors[idx + 1];
+      if (next && next.x !== anchors[idx].x) {
+        const t = (x - anchors[idx].x) / (next.x - anchors[idx].x);
+        gain = anchors[idx].gain + (next.gain - anchors[idx].gain) * t;
+      }
+      points.push({ x, y: gainToY(gain) });
+    }
+
+    ctx.lineWidth = 2;
+    ctx.strokeStyle = `rgba(${accentRgb},0.9)`;
+    ctx.shadowColor = `rgba(${accentRgb},0.35)`;
+    ctx.shadowBlur = 12;
+    ctx.beginPath();
+    points.forEach((pt, i) => {
+      if (i === 0) ctx.moveTo(pt.x, pt.y);
+      else ctx.lineTo(pt.x, pt.y);
+    });
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+
+    ctx.fillStyle = accent;
+    anchors.forEach(anchor => {
+      ctx.beginPath();
+      ctx.arc(anchor.x, gainToY(anchor.gain), 3.2, 0, Math.PI * 2);
+      ctx.fill();
+    });
+  }
+}
+
 function isEqDirty(nodeId) {
   return !!eqDirtyNodes[nodeId];
 }
@@ -1483,6 +1617,23 @@ function renderEqBandsFaders(nodeId, container) {
   const state = getEqState(nodeId);
   const maxBands = getEqMaxBands(nodeId);
   container.innerHTML = '';
+  const curveCard = document.createElement('div');
+  curveCard.className = 'eq-curve-card';
+  const curveHeader = document.createElement('div');
+  curveHeader.className = 'eq-curve-header';
+  curveHeader.textContent = 'EQ Curve';
+  const curveCanvas = document.createElement('canvas');
+  curveCanvas.className = 'eq-curve-canvas';
+  curveCard.appendChild(curveHeader);
+  curveCard.appendChild(curveCanvas);
+  container.appendChild(curveCard);
+  const redrawCurve = () => scheduleEqCurveDraw(curveCanvas, state.bands);
+  if ('ResizeObserver' in window) {
+    const ro = new ResizeObserver(() => redrawCurve());
+    ro.observe(curveCanvas);
+    curveCanvas._eqCurveObserver = ro;
+  }
+  redrawCurve();
   const view = document.createElement('div');
   view.className = 'eq-fader-view';
   state.bands.forEach((band, idx) => {
@@ -1534,6 +1685,7 @@ function renderEqBandsFaders(nodeId, container) {
       band.gain = nextGain;
       gainValue.textContent = `${band.gain.toFixed(1)} dB`;
       updateFaderThumbPosition(sliderWrap, gainSlider, knob);
+      redrawCurve();
       markEqDirty(nodeId);
       scheduleEqPush(nodeId);
       updateEqUsageLabel(nodeId);

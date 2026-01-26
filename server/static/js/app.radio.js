@@ -3418,10 +3418,7 @@ function commitRenderNodes(nodes) {
     wrapper.appendChild(statusRow);
 
     const volRow = document.createElement('div');
-    volRow.style.display = 'grid';
-    volRow.style.gridTemplateColumns = 'auto minmax(0, 1fr) auto';
-    volRow.style.alignItems = 'center';
-    volRow.style.gap = '8px';
+    volRow.className = 'node-volume-row';
     const muteBtn = document.createElement('button');
     muteBtn.className = 'node-mute-btn';
     muteBtn.disabled = disableNodeControls;
@@ -3429,6 +3426,7 @@ function commitRenderNodes(nodes) {
     applyMuteButtonState(muteBtn, n.muted === true);
     volRow.appendChild(muteBtn);
     const volInput = document.createElement('input');
+    volInput.className = 'node-volume-slider';
     volInput.type = 'range';
     volInput.min = 0;
     volInput.max = 100;
