@@ -63,7 +63,8 @@ def desired_source_entries(
 def reconcile_runtime(
     *,
     controller_container_id: str,
-    instances: int,
+    enable_a: bool,
+    enable_b: bool,
     librespot_image: str,
     fifo_path_a: str = "/tmp/snapfifo-ch1",
     fifo_path_b: str = "/tmp/snapfifo-ch2",
@@ -94,17 +95,19 @@ def reconcile_runtime(
             "LIBRESPOT_FALLBACK_NAME": fallback,
         }
 
-    # Instance A is always present when Spotify provider is enabled.
-    ensure_container_running(
-        name="roomcast-provider-spotify-a",
-        image=librespot_image,
-        command=["/app/run.sh"],
-        environment=_env(config_path_a, token_path_a, status_path_a, fifo_path_a, fallback_name_a),
-        volumes=volumes,
-        network=ctx.network_name,
-    )
+    if enable_a:
+        ensure_container_running(
+            name="roomcast-provider-spotify-a",
+            image=librespot_image,
+            command=["/app/run.sh"],
+            environment=_env(config_path_a, token_path_a, status_path_a, fifo_path_a, fallback_name_a),
+            volumes=volumes,
+            network=ctx.network_name,
+        )
+    else:
+        ensure_container_absent("roomcast-provider-spotify-a")
 
-    if instances >= 2:
+    if enable_b:
         ensure_container_running(
             name="roomcast-provider-spotify-b",
             image=librespot_image,

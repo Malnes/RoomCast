@@ -17,7 +17,7 @@ AVAILABLE_PROVIDERS: Dict[str, ProviderSpec] = {
     "spotify": ProviderSpec(
         id="spotify",
         name="Spotify",
-        description="Spotify Connect playback via librespot.",
+        description="",
         has_settings=True,
     ),
     "radio": ProviderSpec(

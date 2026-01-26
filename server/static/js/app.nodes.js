@@ -67,7 +67,7 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
     spNormalise.checked = cfg.normalisation ?? true;
     spClientId.value = cfg.client_id || '';
     spRedirect.value = cfg.redirect_uri || '';
-    if (cfg.has_client_secret) spClientSecret.placeholder = 'stored';
+    if (cfg.has_client_secret) spClientSecret.placeholder = '••••••••';
     else spClientSecret.placeholder = 'client secret';
     if (spotifyLinkStatus) {
       if (cfg.has_oauth_token) {
@@ -84,14 +84,15 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
 }
 
 async function fetchLibrespotStatus(targetSourceId = getSettingsChannelId()) {
+  if (!librespotStatus) return;
   if (!targetSourceId) {
-    if (librespotStatus) librespotStatus.innerText = 'Status: no Spotify source selected';
+    librespotStatus.innerText = 'Status: no Spotify source selected';
     return;
   }
   try {
     const res = await fetch(`/api/librespot/status?source_id=${encodeURIComponent(targetSourceId)}`);
     if (res.status === 503) {
-      if (librespotStatus) librespotStatus.innerText = 'Status: Spotify provider not installed';
+      librespotStatus.innerText = 'Status: Spotify provider not installed';
       return;
     }
     await ensureOk(res);

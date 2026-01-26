@@ -1221,8 +1221,6 @@ const providerSettingsAudiobookshelf = document.getElementById('provider-setting
 const radioSlotCountEl = document.getElementById('radio-slot-count');
 const radioMaxSlotsInput = document.getElementById('radio-max-slots');
 const radioSlotsSaveBtn = document.getElementById('radio-slots-save');
-const spotifyProviderInstances = document.getElementById('spotify-provider-instances');
-const spotifyProviderSaveBtn = document.getElementById('spotify-provider-save');
 
 const absBaseUrlInput = document.getElementById('abs-base-url');
 const absTokenInput = document.getElementById('abs-token');
@@ -1243,6 +1241,78 @@ let providerAddModal = null;
 let providerAddModalList = null;
 
 let radioSlotsCache = null;
+
+let providerRemoveOverlay = null;
+let providerRemoveMessage = null;
+let providerRemoveSpinner = null;
+let providerRemoveTimer = null;
+
+function ensureProviderRemoveOverlay() {
+  if (providerRemoveOverlay) return;
+  providerRemoveOverlay = document.createElement('div');
+  providerRemoveOverlay.className = 'settings-overlay confirm-overlay';
+  providerRemoveOverlay.setAttribute('aria-hidden', 'true');
+  providerRemoveOverlay.hidden = true;
+
+  const card = document.createElement('div');
+  card.className = 'settings-card';
+  card.style.maxWidth = '420px';
+  card.style.width = '100%';
+
+  const content = document.createElement('div');
+  content.className = 'node-settings-content';
+  content.style.display = 'flex';
+  content.style.alignItems = 'center';
+  content.style.gap = '12px';
+
+  providerRemoveSpinner = document.createElement('span');
+  providerRemoveSpinner.className = 'spinner';
+
+  providerRemoveMessage = document.createElement('div');
+  providerRemoveMessage.style.fontWeight = '700';
+
+  content.appendChild(providerRemoveSpinner);
+  content.appendChild(providerRemoveMessage);
+  card.appendChild(content);
+  providerRemoveOverlay.appendChild(card);
+  document.body.appendChild(providerRemoveOverlay);
+}
+
+function showProviderRemoveOverlay(message, showSpinner = true) {
+  ensureProviderRemoveOverlay();
+  if (providerRemoveTimer) {
+    clearTimeout(providerRemoveTimer);
+    providerRemoveTimer = null;
+  }
+  if (providerRemoveMessage) providerRemoveMessage.textContent = message;
+  if (providerRemoveSpinner) providerRemoveSpinner.style.display = showSpinner ? 'inline-block' : 'none';
+  if (providerRemoveOverlay) {
+    providerRemoveOverlay.hidden = false;
+    providerRemoveOverlay.setAttribute('aria-hidden', 'false');
+    providerRemoveOverlay.style.display = 'flex';
+  }
+}
+
+function hideProviderRemoveOverlay(delayMs = 0) {
+  if (!providerRemoveOverlay) return;
+  if (providerRemoveTimer) {
+    clearTimeout(providerRemoveTimer);
+    providerRemoveTimer = null;
+  }
+  if (delayMs > 0) {
+    providerRemoveTimer = setTimeout(() => {
+      if (!providerRemoveOverlay) return;
+      providerRemoveOverlay.style.display = 'none';
+      providerRemoveOverlay.hidden = true;
+      providerRemoveOverlay.setAttribute('aria-hidden', 'true');
+      providerRemoveTimer = null;
+    }, delayMs);
+    return;
+  }
+  providerRemoveOverlay.style.display = 'none';
+  providerRemoveOverlay.hidden = true;
+  providerRemoveOverlay.setAttribute('aria-hidden', 'true');
+}
 
 function providerIconSrc(providerIdRaw) {
   const pid = (providerIdRaw || '').trim().toLowerCase();
@@ -1576,12 +1646,6 @@ function syncProviderSettingsPanels() {
     absInstalled && (providerSettingsOpenId === 'audiobookshelf' || modalPid === 'audiobookshelf'),
   );
 
-  const spotifyProvider = getInstalledProvider('spotify');
-  const instances = spotifyProvider?.settings?.instances;
-  if (spotifyProviderInstances && instances) {
-    spotifyProviderInstances.value = String(instances);
-  }
-
   const absProvider = getInstalledProvider('audiobookshelf');
   const absSettings = absProvider?.settings && typeof absProvider.settings === 'object' ? absProvider.settings : {};
   if (absBaseUrlInput) absBaseUrlInput.value = absSettings?.base_url || '';
@@ -1595,7 +1659,7 @@ function renderInstalledProviders() {
   providersInstalledList.innerHTML = '';
 
   if (!installed.length) {
-    providersInstalledList.innerHTML = '<div class="muted" style="font-size:12px;">No providers installed.</div>';
+    providersInstalledList.innerHTML = '';
     providerSettingsOpenId = null;
     syncProviderSettingsPanels();
     return;
@@ -1674,8 +1738,14 @@ async function refreshProvidersState() {
   }
   renderInstalledProviders();
   if (radioSlotCountEl) {
-    if (radioSlotsCache?.maxSlots) radioSlotCountEl.textContent = `Radio slots: ${radioSlotsCache.maxSlots}`;
-    else fetchRadioSlots();
+    if (radioSlotsCache?.maxSlots) {
+      radioSlotCountEl.textContent = `Radio slots: ${radioSlotsCache.maxSlots}`;
+    } else if (getInstalledProvider('radio')) {
+      fetchRadioSlots();
+    } else {
+      radioSlotCountEl.textContent = 'Radio slots: —';
+      if (radioMaxSlotsInput) radioMaxSlotsInput.value = '';
+    }
   }
 
   // Channels source dropdown depends on providersInstalledCache.
@@ -1714,7 +1784,7 @@ async function installProviderById(providerIdRaw) {
     await refreshSpotifySources();
     populateSpotifyChannelSelect();
     if (providerId === 'spotify') {
-      providerSettingsOpenId = 'spotify';
+      providerSettingsOpenId = null;
       syncProviderSettingsPanels();
       fetchSpotifyConfig();
       fetchLibrespotStatus();
@@ -1734,7 +1804,11 @@ async function removeProviderById(providerIdRaw, btn) {
     return;
   }
   const targetBtn = btn;
+  const showSpinner = providerId === 'spotify';
   try {
+    if (showSpinner) {
+      showProviderRemoveOverlay('Removing Spotify provider. Please wait');
+    }
     if (targetBtn) targetBtn.disabled = true;
     const res = await fetch(`/api/providers/${encodeURIComponent(providerId)}`, {
       method: 'DELETE',
@@ -1746,43 +1820,15 @@ async function removeProviderById(providerIdRaw, btn) {
     await refreshProvidersState();
     await refreshSpotifySources();
     populateSpotifyChannelSelect();
+    if (showSpinner) {
+      showProviderRemoveOverlay('Successfully removed', false);
+      hideProviderRemoveOverlay(2000);
+    }
   } catch (err) {
     showError(`Failed to remove provider: ${err.message}`);
+    if (showSpinner) hideProviderRemoveOverlay();
   } finally {
     if (targetBtn) targetBtn.disabled = false;
-  }
-}
-
-async function saveSpotifyProviderSettings() {
-  if (!spotifyProviderInstances || !spotifyProviderSaveBtn) return;
-  if (!isAdminUser()) {
-    showError('Only admins can update provider settings.');
-    return;
-  }
-  const instances = Number(spotifyProviderInstances.value);
-  if (![1, 2].includes(instances)) {
-    showError('Spotify instances must be 1 or 2.');
-    return;
-  }
-  try {
-    spotifyProviderSaveBtn.disabled = true;
-    const res = await fetch('/api/providers/spotify', {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ settings: { instances } }),
-    });
-    await ensureOk(res);
-    showSuccess('Spotify provider updated.');
-    await refreshChannels({ force: true });
-    await refreshProvidersState();
-    await refreshSpotifySources();
-    populateSpotifyChannelSelect();
-    fetchSpotifyConfig();
-    fetchLibrespotStatus();
-  } catch (err) {
-    showError(`Failed to update Spotify provider: ${err.message}`);
-  } finally {
-    spotifyProviderSaveBtn.disabled = false;
   }
 }
 
@@ -2040,13 +2086,64 @@ function closeDiscover() {
 
 startDiscoverBtn.addEventListener('click', discoverNodes);
 saveSpotifyBtn.addEventListener('click', saveSpotify);
+if (spotifyLinkWizardOpenBtn && spotifyLinkWizard) {
+  const spotifyRedirectCopyBtn = document.getElementById('spotify-redirect-copy');
+  const spotifyRedirectValue = document.getElementById('spotify-redirect-value');
+  const redirectDefault = 'http://172.17.0.1:18080/api/spotify/callback';
+  const showWizardStep = step => {
+    const showStep1 = step === 1;
+    if (spotifyLinkStep1) {
+      spotifyLinkStep1.hidden = !showStep1;
+      spotifyLinkStep1.setAttribute('aria-hidden', showStep1 ? 'false' : 'true');
+    }
+    if (spotifyLinkStep2) {
+      spotifyLinkStep2.hidden = showStep1;
+      spotifyLinkStep2.setAttribute('aria-hidden', showStep1 ? 'true' : 'false');
+    }
+  };
+  const openWizard = () => {
+    spotifyLinkWizard.hidden = false;
+    spotifyLinkWizard.setAttribute('aria-hidden', 'false');
+    spotifyLinkWizard.style.display = 'flex';
+    if (spRedirect) spRedirect.value = redirectDefault;
+    showWizardStep(1);
+  };
+  const closeWizard = () => {
+    spotifyLinkWizard.style.display = 'none';
+    spotifyLinkWizard.hidden = true;
+    spotifyLinkWizard.setAttribute('aria-hidden', 'true');
+  };
+  spotifyLinkWizardOpenBtn.addEventListener('click', openWizard);
+  if (spotifyLinkCloseBtn) spotifyLinkCloseBtn.addEventListener('click', closeWizard);
+  if (spotifyLinkWizard) {
+    spotifyLinkWizard.addEventListener('click', evt => {
+      if (evt.target === spotifyLinkWizard) closeWizard();
+    });
+  }
+  if (spotifyLinkNextBtn) spotifyLinkNextBtn.addEventListener('click', () => showWizardStep(2));
+  if (spotifyLinkBackBtn) spotifyLinkBackBtn.addEventListener('click', () => showWizardStep(1));
+  if (spotifyRedirectCopyBtn && spotifyRedirectValue) {
+    spotifyRedirectCopyBtn.addEventListener('click', async () => {
+      const value = spotifyRedirectValue.textContent || '';
+      if (!value) return;
+      try {
+        await navigator.clipboard.writeText(value);
+        spotifyRedirectCopyBtn.textContent = '✓';
+        setTimeout(() => {
+          spotifyRedirectCopyBtn.textContent = '⧉';
+        }, 1500);
+      } catch (_) {
+        showError('Copy failed. Select the URL and copy it manually.');
+      }
+    });
+  }
+}
 if (providerAddOpenBtn) providerAddOpenBtn.addEventListener('click', async () => {
   if (!providersAvailableCache?.length) {
     await refreshProvidersState();
   }
   openProviderAddModal();
 });
-if (spotifyProviderSaveBtn) spotifyProviderSaveBtn.addEventListener('click', saveSpotifyProviderSettings);
 if (absProviderSaveBtn) absProviderSaveBtn.addEventListener('click', saveAudiobookshelfProviderSettings);
 if (spInitVol) {
   spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
@@ -2563,8 +2660,16 @@ playerRepeatBtn.addEventListener('click', () => {
   if (deviceId) payload.device_id = deviceId;
   playerAction('/api/spotify/player/repeat', payload);
 });
-spotifyAuthBtn.addEventListener('click', startSpotifyAuth);
-spotifyDashboardBtn.addEventListener('click', () => window.open('https://developer.spotify.com/dashboard', '_blank'));
+if (spotifyAuthBtn) {
+  spotifyAuthBtn.addEventListener('click', async () => {
+    try {
+      await saveSpotify();
+      await startSpotifyAuth();
+    } catch (_) {
+      /* saveSpotify already shows error */
+    }
+  });
+}
 if (takeoverButton) takeoverButton.addEventListener('click', handleTakeoverClick);
 
 bootstrapAuth();

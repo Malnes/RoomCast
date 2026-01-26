@@ -393,12 +393,7 @@ def get_provider_settings(provider_id: str) -> dict:
 
 
 def spotify_instance_count() -> int:
-    raw = get_provider_settings("spotify").get("instances", 2)
-    try:
-        value = int(raw)
-    except (TypeError, ValueError):
-        value = 2
-    return 2 if value >= 2 else 1
+    return 2
 
 
 def require_spotify_provider() -> None:
@@ -875,7 +870,7 @@ def _default_source_entries(*, instances: int) -> list[dict]:
         {
             "id": "spotify:a",
             "kind": "spotify",
-            "name": "Spotify A",
+            "name": "Account A",
             "snap_stream": "Spotify_CH1",
             "config_path": str(CONFIG_PATH),
             "token_path": str(SPOTIFY_TOKEN_PATH),
@@ -886,7 +881,7 @@ def _default_source_entries(*, instances: int) -> list[dict]:
         entries.append({
             "id": "spotify:b",
             "kind": "spotify",
-            "name": "Spotify B",
+            "name": "Account B",
             "snap_stream": "Spotify_CH2",
             "config_path": "/config/spotify-ch2.json",
             "token_path": "/config/spotify-token-ch2.json",

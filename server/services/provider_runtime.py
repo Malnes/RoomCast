@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Callable, Dict, List
@@ -51,12 +52,30 @@ class ProviderRuntimeService:
         # In Docker, HOSTNAME is set to the container id (short).
         return (os.getenv("HOSTNAME", "") or "").strip()
 
+    def _spotify_token_ready(self, token_path: Path) -> bool:
+        if not token_path.exists():
+            return False
+        try:
+            data = json.loads(token_path.read_text())
+        except json.JSONDecodeError:
+            return False
+        token = (data or {}).get("access_token")
+        return bool(token)
+
     def reconcile_spotify_runtime(self, instances: int) -> None:
         image = (os.getenv("ROOMCAST_LIBRESPOT_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-librespot:latest"
+        token_a = self._spotify_token_ready(self._spotify_token_path)
+        token_b = self._spotify_token_ready(Path("/config/spotify-token-ch2.json"))
+        enable_a = token_a
+        enable_b = token_b
+        if not (enable_a or enable_b):
+            self._spotify_provider.stop_runtime()
+            return
         try:
             self._spotify_provider.reconcile_runtime(
                 controller_container_id=self.controller_container_id(),
-                instances=instances,
+                enable_a=enable_a,
+                enable_b=enable_b,
                 librespot_image=image,
                 fallback_name_a=self._librespot_fallback_name,
                 fallback_name_b=os.getenv("LIBRESPOT_NAME_CH2", "RoomCast CH2"),

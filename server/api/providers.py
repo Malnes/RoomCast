@@ -84,17 +84,16 @@ def create_providers_router(
         else:
             defaults = {}
             if pid == "spotify":
-                defaults = {"instances": 1}
+                defaults = {"instances": 2}
             state = provider_state_cls(id=pid, enabled=True, settings=defaults)
             current[pid] = state
 
         save_providers_state()
 
         if pid == "spotify":
-            instances = spotify_provider.normalize_instances((state.settings or {}).get("instances"), default=1)
-            state.settings = {**(state.settings or {}), "instances": instances}
+            state.settings = {**(state.settings or {}), "instances": 2}
             save_providers_state()
-            apply_spotify_provider(instances)
+            apply_spotify_provider(2)
         elif pid == "radio":
             apply_radio_provider()
         elif pid == "audiobookshelf":
@@ -125,10 +124,9 @@ def create_providers_router(
 
         if pid == "spotify":
             if state.enabled:
-                instances = spotify_provider.normalize_instances((state.settings or {}).get("instances"), default=1)
-                state.settings = {**(state.settings or {}), "instances": instances}
+                state.settings = {**(state.settings or {}), "instances": 2}
                 save_providers_state()
-                apply_spotify_provider(instances)
+                apply_spotify_provider(2)
             else:
                 disable_spotify_provider()
         elif pid == "radio":
