@@ -1,3 +1,4 @@
+import asyncio
 import json
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
@@ -548,6 +549,13 @@ def create_spotify_router(
             if resp.status_code >= 400:
                 raise HTTPException(status_code=resp.status_code, detail=resp.text)
             params = {"device_id": device["id"]}
+            try:
+                return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
+            except HTTPException as exc2:
+                detail2 = str(exc2.detail or "")
+                if exc2.status_code != 403 or "restricted" not in detail2.lower():
+                    raise
+            await asyncio.sleep(0.6)
             return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
 
     @router.post("/api/spotify/player/pause")

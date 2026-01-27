@@ -105,7 +105,9 @@ def create_nodes_router(
     broadcast_nodes: Callable[[], Awaitable[None]],
     public_node: Callable[[dict], dict],
     public_nodes: Callable[[], list],
+    public_nodes_for_user: Callable[[Optional[dict]], list],
     public_sections: Callable[[], list],
+    get_current_user: Callable[[Request], dict],
     require_admin: Callable,
     require_ws_user: Callable[[WebSocket], Awaitable[Optional[dict]]],
     auth_state: Callable[[], dict],
@@ -159,6 +161,8 @@ def create_nodes_router(
     pending_web_node_snapshots: Callable[[], list],
     pop_pending_web_node_request: Callable[[str], dict],
     establish_web_node_session_for_request: Callable[[dict], Awaitable[dict]],
+    establish_private_web_node_session: Callable[[dict, str, str, str], Awaitable[dict]],
+    remove_private_web_node: Callable[[str], Awaitable[Optional[dict]]],
     web_node_approval_timeout: int,
     # Node discovery helpers
     detect_discovery_networks: Callable[[], list[str]],
@@ -568,8 +572,9 @@ def create_nodes_router(
         return {"ok": True, "removed": node_id}
 
     @router.get("/api/nodes")
-    async def list_nodes() -> dict:
-        return {"sections": public_sections(), "nodes": public_nodes()}
+    async def list_nodes(request: Request) -> dict:
+        user = get_current_user(request)
+        return {"sections": public_sections(), "nodes": public_nodes_for_user(user)}
 
     @router.post("/api/sections")
     async def create_section(payload: CreateSectionPayload) -> dict:
@@ -842,6 +847,18 @@ def create_nodes_router(
             "answer_type": result["answer_type"],
         }
 
+    @router.post("/api/web-nodes/private-session")
+    async def private_web_node_session(payload: WebNodeOffer, request: Request) -> dict:
+        user = get_current_user(request)
+        name = payload.name.strip() or f"{user.get('username') or 'User'} browser"
+        return await establish_private_web_node_session(user, name, payload.sdp, payload.type)
+
+    @router.delete("/api/web-nodes/private-session")
+    async def end_private_web_node_session(request: Request) -> dict:
+        user = get_current_user(request)
+        removed = await remove_private_web_node(user.get("id"))
+        return {"ok": True, "removed": removed.get("id") if removed else None}
+
     @router.get("/api/web-nodes/requests")
     async def list_web_node_requests(_: dict = Depends(require_admin)) -> dict:
         return {"requests": pending_web_node_snapshots()}
@@ -908,16 +925,16 @@ def create_nodes_router(
         if not user:
             return
         node_watchers_set = node_watchers()
-        node_watchers_set.add(ws)
+        node_watchers_set[ws] = user
         try:
-            await ws.send_json({"type": "nodes", "sections": public_sections(), "nodes": public_nodes()})
+            await ws.send_json({"type": "nodes", "sections": public_sections(), "nodes": public_nodes_for_user(user)})
             await ws.send_json({"type": "web_node_requests", "requests": pending_web_node_snapshots()})
             while True:
                 await ws.receive_text()
         except Exception:
             pass
         finally:
-            node_watchers_set.discard(ws)
+            node_watchers_set.pop(ws, None)
 
     @router.websocket("/ws/terminal/{token}")
     async def terminal_ws(ws: WebSocket, token: str):

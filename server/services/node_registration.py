@@ -100,6 +100,7 @@ class NodeRegistrationService:
             "type": node_type,
             "eq": self._default_eq_state(),
             "agent_secret": previous.get("agent_secret"),
+            "owner_id": previous.get("owner_id"),
             "audio_configured": True if node_type in {"browser", "sonos"} else previous.get("audio_configured", False),
             "agent_version": previous.get("agent_version"),
             "volume_percent": self._normalize_percent(previous.get("volume_percent", 75), default=75),

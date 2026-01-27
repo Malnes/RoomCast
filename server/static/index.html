@@ -413,7 +413,16 @@
             <button id="save-server-name" type="button">Save</button>
           </div>
           <div class="muted" style="font-size:12px; margin-bottom:16px;">Shown across the UI and in Spotify when you take over playback.</div>
-          <div class="muted" style="font-size:12px; margin-bottom:8px;">Cover art backgrounds are always on to keep the controller immersive.</div>
+          <div class="settings-toggle-row">
+            <label class="settings-toggle">
+              <input id="browser-node-toggle" type="checkbox">
+              <span class="settings-toggle-pill" aria-hidden="true"></span>
+            </label>
+            <div>
+              <div class="label" style="margin-bottom:4px;">Browser session as node</div>
+              <div class="muted" style="font-size:12px;">Use this browser as a private playback node tied to your account.</div>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -424,6 +433,8 @@
         </button>
         <div class="collapsible-content" aria-hidden="true">
           <button id="provider-add-open" type="button" style="margin-bottom:12px;">Add provider</button>
+
+          <div id="providers-global-limit" class="muted" style="font-size:12px; margin:0 0 8px 0;"></div>
 
           <div id="providers-installed-list"></div>
 

@@ -7,9 +7,9 @@ from fastapi import WebSocket
 
 @dataclass
 class NodeBroadcastService:
-    _watchers: set[WebSocket] = field(default_factory=set)
+    _watchers: dict[WebSocket, dict] = field(default_factory=dict)
 
-    def watchers(self) -> set[WebSocket]:
+    def watchers(self) -> dict[WebSocket, dict]:
         return self._watchers
 
     async def broadcast(self, payload: dict) -> None:
@@ -22,4 +22,4 @@ class NodeBroadcastService:
             except Exception:
                 dead.append(ws)
         for ws in dead:
-            self._watchers.discard(ws)
+            self._watchers.pop(ws, None)

@@ -63,6 +63,7 @@ class AuthService:
             username = (entry.get("username") or "").strip()
             role = entry.get("role") or "member"
             password_hash = entry.get("password_hash")
+            settings = entry.get("settings") if isinstance(entry.get("settings"), dict) else {}
             if not username or not password_hash:
                 continue
             user = {
@@ -70,6 +71,7 @@ class AuthService:
                 "username": username,
                 "role": role,
                 "password_hash": password_hash,
+                "settings": settings,
                 "created_at": entry.get("created_at") or int(time.time()),
                 "updated_at": entry.get("updated_at") or int(time.time()),
             }
@@ -142,6 +144,7 @@ class AuthService:
             "username": normalized,
             "role": role_normalized,
             "password_hash": self._hash_password(password),
+            "settings": {},
             "created_at": now,
             "updated_at": now,
         }
@@ -189,6 +192,22 @@ class AuthService:
                 if not admins:
                     raise HTTPException(status_code=400, detail="Cannot remove the last admin")
             user["role"] = role
+        user["updated_at"] = int(time.time())
+        self._auth_state["users"] = list(self._users_by_id.values())
+        self.save()
+        return user
+
+    def update_user_settings(self, user_id: str, updates: dict) -> dict:
+        user = self._users_by_id.get(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        settings = user.get("settings") if isinstance(user.get("settings"), dict) else {}
+        merged = dict(settings)
+        for key, value in (updates or {}).items():
+            if key is None:
+                continue
+            merged[key] = value
+        user["settings"] = merged
         user["updated_at"] = int(time.time())
         self._auth_state["users"] = list(self._users_by_id.values())
         self.save()

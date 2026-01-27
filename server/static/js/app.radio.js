@@ -2002,6 +2002,10 @@ function syncGeneralSettingsUI() {
   if (saveServerNameBtn) {
     saveServerNameBtn.disabled = !isAdminUser();
   }
+  if (browserNodeToggle && document.activeElement !== browserNodeToggle) {
+    browserNodeToggle.checked = !!authState?.user?.settings?.browser_node_enabled;
+    browserNodeToggle.disabled = !isAuthenticated();
+  }
 }
 
 function applyMuteButtonState(btn, muted) {

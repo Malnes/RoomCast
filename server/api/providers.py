@@ -23,6 +23,8 @@ def create_providers_router(
     provider_state_cls: Any,
     save_providers_state: Callable[[], None],
     require_admin: Callable,
+    provider_instance_limit: Callable[[], int],
+    provider_instance_count: Callable[[], int],
     spotify_provider: Any,
     apply_spotify_provider: Callable[[int], None],
     disable_spotify_provider: Callable[[], None],
@@ -34,6 +36,28 @@ def create_providers_router(
     disable_audiobookshelf_provider: Callable[[], None],
 ) -> APIRouter:
     router = APIRouter(prefix="/api/providers")
+
+    def _provider_instance_count_for(pid: str, state: Any) -> int:
+        if not state or not getattr(state, "enabled", False):
+            return 0
+        settings = state.settings if isinstance(getattr(state, "settings", None), dict) else {}
+        if pid == "spotify":
+            raw = settings.get("instances")
+            try:
+                desired = int(raw)
+            except (TypeError, ValueError):
+                desired = 1
+            return max(1, min(2, desired))
+        if pid == "radio":
+            raw = settings.get("max_slots")
+            try:
+                desired = int(raw)
+            except (TypeError, ValueError):
+                desired = 1
+            return max(1, min(2, desired))
+        if pid == "audiobookshelf":
+            return 2
+        return 1
 
     def _public_provider_state(state: Any) -> dict:
         spec = get_provider_spec(state.id)
@@ -78,6 +102,10 @@ def create_providers_router(
 
         current = providers()
         existing = current.get(pid)
+        previous_enabled = bool(existing.enabled) if existing else False
+        previous_settings = dict(existing.settings or {}) if existing else {}
+        previous_total = provider_instance_count()
+        previous_count = _provider_instance_count_for(pid, existing)
         if existing:
             existing.enabled = True
             if existing.settings is None:
@@ -91,20 +119,35 @@ def create_providers_router(
                 defaults = {"max_slots": 1}
             state = provider_state_cls(id=pid, enabled=True, settings=defaults)
             current[pid] = state
+        desired_count = _provider_instance_count_for(pid, state)
+        if previous_total - previous_count + desired_count > provider_instance_limit():
+            if existing:
+                existing.enabled = previous_enabled
+                existing.settings = previous_settings
+            else:
+                current.pop(pid, None)
+            save_providers_state()
+            raise HTTPException(status_code=409, detail=f"Provider limit reached (max {provider_instance_limit()})")
+        try:
+            if pid == "spotify":
+                instances = int((state.settings or {}).get("instances") or 1)
+                instances = max(1, min(2, instances))
+                state.settings = {**(state.settings or {}), "instances": instances}
+                apply_spotify_provider(instances)
+            elif pid == "radio":
+                apply_radio_provider()
+            elif pid == "audiobookshelf":
+                apply_audiobookshelf_provider()
+        except HTTPException:
+            if existing:
+                existing.enabled = previous_enabled
+                existing.settings = previous_settings
+            else:
+                current.pop(pid, None)
+            save_providers_state()
+            raise
 
         save_providers_state()
-
-        if pid == "spotify":
-            instances = int((state.settings or {}).get("instances") or 1)
-            instances = max(1, min(2, instances))
-            state.settings = {**(state.settings or {}), "instances": instances}
-            save_providers_state()
-            apply_spotify_provider(instances)
-        elif pid == "radio":
-            apply_radio_provider()
-        elif pid == "audiobookshelf":
-            apply_audiobookshelf_provider()
-
         return {"ok": True, "provider": _public_provider_state(state)}
 
     @router.patch("/{provider_id}")
@@ -120,6 +163,10 @@ def create_providers_router(
             raise HTTPException(status_code=404, detail="Provider not installed")
 
         previous_instances = int((state.settings or {}).get("instances") or 1) if pid == "spotify" else 0
+        previous_enabled = bool(state.enabled)
+        previous_settings = dict(state.settings or {})
+        previous_total = provider_instance_count()
+        previous_count = _provider_instance_count_for(pid, state)
         updates = payload.model_dump(exclude_unset=True)
         if "enabled" in updates and updates["enabled"] is not None:
             state.enabled = bool(updates["enabled"])
@@ -127,30 +174,40 @@ def create_providers_router(
             merged = dict(state.settings or {})
             merged.update(updates["settings"])
             state.settings = merged
+        desired_count = _provider_instance_count_for(pid, state)
+        if previous_total - previous_count + desired_count > provider_instance_limit():
+            state.enabled = previous_enabled
+            state.settings = previous_settings
+            save_providers_state()
+            raise HTTPException(status_code=409, detail=f"Provider limit reached (max {provider_instance_limit()})")
+        try:
+            if pid == "spotify":
+                if state.enabled:
+                    instances = int((state.settings or {}).get("instances") or 1)
+                    instances = max(1, min(2, instances))
+                    state.settings = {**(state.settings or {}), "instances": instances}
+                    apply_spotify_provider(instances)
+                    if previous_instances >= 2 and instances < 2:
+                        delete_spotify_token("spotify:b")
+                else:
+                    disable_spotify_provider()
+            elif pid == "radio":
+                if state.enabled:
+                    apply_radio_provider()
+                else:
+                    disable_radio_provider()
+            elif pid == "audiobookshelf":
+                if state.enabled:
+                    apply_audiobookshelf_provider()
+                else:
+                    disable_audiobookshelf_provider()
+        except HTTPException:
+            state.enabled = previous_enabled
+            state.settings = previous_settings
+            save_providers_state()
+            raise
+
         save_providers_state()
-
-        if pid == "spotify":
-            if state.enabled:
-                instances = int((state.settings or {}).get("instances") or 1)
-                instances = max(1, min(2, instances))
-                state.settings = {**(state.settings or {}), "instances": instances}
-                save_providers_state()
-                apply_spotify_provider(instances)
-                if previous_instances >= 2 and instances < 2:
-                    delete_spotify_token("spotify:b")
-            else:
-                disable_spotify_provider()
-        elif pid == "radio":
-            if state.enabled:
-                apply_radio_provider()
-            else:
-                disable_radio_provider()
-        elif pid == "audiobookshelf":
-            if state.enabled:
-                apply_audiobookshelf_provider()
-            else:
-                disable_audiobookshelf_provider()
-
         return {"ok": True, "provider": _public_provider_state(state)}
 
     @router.delete("/{provider_id}")
@@ -165,14 +222,18 @@ def create_providers_router(
         if not state:
             raise HTTPException(status_code=404, detail="Provider not installed")
 
-        # Disable runtime and detach channels/sources as needed.
-        if pid == "spotify":
-            disable_spotify_provider()
-            delete_spotify_tokens()
-        elif pid == "radio":
-            disable_radio_provider()
-        elif pid == "audiobookshelf":
-            disable_audiobookshelf_provider()
+        try:
+            # Disable runtime and detach channels/sources as needed.
+            if pid == "spotify":
+                disable_spotify_provider()
+                delete_spotify_tokens()
+            elif pid == "radio":
+                disable_radio_provider()
+            elif pid == "audiobookshelf":
+                disable_audiobookshelf_provider()
+        except HTTPException:
+            save_providers_state()
+            raise
 
         current.pop(pid, None)
         save_providers_state()

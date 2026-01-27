@@ -34,6 +34,10 @@ class ServerNamePayload(BaseModel):
     server_name: str = Field(min_length=1, max_length=120)
 
 
+class UserSettingsPayload(BaseModel):
+    browser_node_enabled: Optional[bool] = None
+
+
 def create_auth_router(
     *,
     is_initialized: Callable[[], bool],
@@ -48,19 +52,26 @@ def create_auth_router(
     verify_password: Callable[[str, str], bool],
     set_session_cookie: Callable[[JSONResponse, str], None],
     clear_session_cookie: Callable[[JSONResponse], None],
+    require_user: Callable,
     require_admin: Callable,
     server_default_name: str,
+    update_user_settings: Callable[[str, dict], dict],
 ) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/auth/status")
     async def auth_status(request: Request) -> dict:
         user = getattr(request.state, "user", None)
+        public = public_user(user) if user else None
+        if public and isinstance(user, dict):
+            settings = user.get("settings")
+            if isinstance(settings, dict):
+                public["settings"] = settings
         return {
             "initialized": is_initialized(),
             "server_name": get_server_name() or server_default_name,
             "authenticated": bool(user),
-            "user": public_user(user) if user else None,
+            "user": public,
         }
 
     @router.post("/api/auth/initialize")
@@ -132,5 +143,29 @@ def create_auth_router(
         name = payload.server_name.strip() or server_default_name
         set_server_name(name)
         return {"ok": True, "server_name": name}
+
+    @router.get("/api/users/me/settings")
+    async def get_user_settings(request: Request, _: dict = Depends(require_user)) -> dict:
+        user = getattr(request.state, "user", None)
+        settings = user.get("settings") if isinstance(user, dict) else {}
+        if not isinstance(settings, dict):
+            settings = {}
+        return {"settings": settings}
+
+    @router.patch("/api/users/me/settings")
+    async def update_user_settings_api(
+        payload: UserSettingsPayload,
+        request: Request,
+        _: dict = Depends(require_user),
+    ) -> dict:
+        user = getattr(request.state, "user", None)
+        if not user:
+            raise HTTPException(status_code=401, detail="Authentication required")
+        updates = payload.model_dump(exclude_unset=True)
+        updated = update_user_settings(user["id"], updates)
+        settings = updated.get("settings") if isinstance(updated, dict) else {}
+        if not isinstance(settings, dict):
+            settings = {}
+        return {"ok": True, "settings": settings}
 
     return router

@@ -1253,6 +1253,7 @@ async function pollLibrespotStatus(sourceId = getSettingsChannelId()) {
 
 const providerAddOpenBtn = document.getElementById('provider-add-open');
 const providersInstalledList = document.getElementById('providers-installed-list');
+const providersGlobalLimitEl = document.getElementById('providers-global-limit');
 const providerSettingsSpotify = document.getElementById('provider-settings-spotify');
 const providerSettingsRadio = document.getElementById('provider-settings-radio');
 const providerSettingsAudiobookshelf = document.getElementById('provider-settings-audiobookshelf');
@@ -1283,6 +1284,7 @@ let providerSettingsModalParked = null;
 
 let providerAddModal = null;
 let providerAddModalList = null;
+let providerAddModalLimit = null;
 
 let radioSlotsCache = null;
 
@@ -1290,6 +1292,8 @@ let providerRemoveOverlay = null;
 let providerRemoveMessage = null;
 let providerRemoveSpinner = null;
 let providerRemoveTimer = null;
+
+const PROVIDER_INSTANCE_LIMIT = 5;
 
 function ensureProviderRemoveOverlay() {
   if (providerRemoveOverlay) return;
@@ -1397,6 +1401,21 @@ function radioInstancesInstalled() {
 function absInstancesInstalled() {
   const installed = getInstalledProvider('audiobookshelf');
   return installed ? 2 : 0;
+}
+
+function totalInstalledProviderInstances() {
+  let total = 0;
+  total += spotifyInstancesInstalled();
+  total += radioInstancesInstalled();
+  total += absInstancesInstalled();
+  const installed = Array.isArray(providersInstalledCache) ? providersInstalledCache : [];
+  installed.forEach(provider => {
+    const baseId = normalizeProviderBaseId(provider?.id);
+    if (!provider?.enabled) return;
+    if (baseId === 'spotify' || baseId === 'radio' || baseId === 'audiobookshelf') return;
+    total += 1;
+  });
+  return total;
 }
 
 function providerInstanceLabel(baseId, index) {
@@ -1583,6 +1602,11 @@ function openProviderAddModal() {
     card.appendChild(header);
     const content = document.createElement('div');
     content.className = 'node-settings-content';
+    providerAddModalLimit = document.createElement('div');
+    providerAddModalLimit.className = 'muted';
+    providerAddModalLimit.style.fontSize = '12px';
+    providerAddModalLimit.style.marginBottom = '10px';
+    content.appendChild(providerAddModalLimit);
     providerAddModalList = document.createElement('div');
     providerAddModalList.style.display = 'grid';
     providerAddModalList.style.gap = '10px';
@@ -1604,6 +1628,9 @@ function renderProviderAddModal() {
   if (!providerAddModalList) return;
   providerAddModalList.innerHTML = '';
   const available = Array.isArray(providersAvailableCache) ? providersAvailableCache : [];
+  if (providerAddModalLimit) {
+    providerAddModalLimit.textContent = `Providers: ${totalInstalledProviderInstances()} / ${PROVIDER_INSTANCE_LIMIT}`;
+  }
   if (!available.length) {
     const empty = document.createElement('div');
     empty.className = 'muted';
@@ -1619,6 +1646,7 @@ function renderProviderAddModal() {
     .forEach(provider => {
       if (!provider?.id) return;
       const baseId = normalizeProviderBaseId(provider.id);
+      const totalInstances = totalInstalledProviderInstances();
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.className = 'provider-option-btn';
@@ -1632,23 +1660,28 @@ function renderProviderAddModal() {
       const meta = document.createElement('span');
       meta.className = 'provider-option-meta';
       const installed = !!provider.installed;
+      let addCount = 0;
       if (baseId === 'spotify') {
         const installedCount = spotifyInstancesInstalled();
-        meta.textContent = `${installedCount}/2`;
         if (installedCount >= 2) {
-          meta.textContent = '2/2 installed';
           btn.disabled = true;
+        } else {
+          addCount = 1;
         }
       } else if (baseId === 'radio') {
         const installedCount = radioInstancesInstalled();
-        meta.textContent = `${installedCount}/2`;
         if (installedCount >= 2) {
-          meta.textContent = '2/2 installed';
           btn.disabled = true;
+        } else {
+          addCount = 1;
         }
       } else {
         meta.textContent = installed ? 'Installed' : '';
         if (installed) btn.disabled = true;
+        addCount = installed ? 0 : (baseId === 'audiobookshelf' ? 2 : 1);
+      }
+      if (!btn.disabled && addCount > 0 && totalInstances + addCount > PROVIDER_INSTANCE_LIMIT) {
+        btn.disabled = true;
       }
       btn.appendChild(meta);
 
@@ -1816,6 +1849,9 @@ function syncProviderSettingsPanels() {
 function renderInstalledProviders() {
   if (!providersInstalledList) return;
   const installed = Array.isArray(providersInstalledCache) ? providersInstalledCache : [];
+  if (providersGlobalLimitEl) {
+    providersGlobalLimitEl.textContent = `Providers: ${totalInstalledProviderInstances()} / ${PROVIDER_INSTANCE_LIMIT}`;
+  }
   const expanded = [];
   installed.forEach(provider => {
     if (!provider?.id) return;
@@ -1977,6 +2013,7 @@ async function installProviderById(providerIdRaw) {
     return;
   }
   const baseId = normalizeProviderBaseId(providerId);
+  const totalInstances = totalInstalledProviderInstances();
   if (!isAdminUser()) {
     showError('Only admins can install providers.');
     return;
@@ -1987,6 +2024,10 @@ async function installProviderById(providerIdRaw) {
     if (baseId === 'spotify') {
       const installedCount = spotifyInstancesInstalled();
       const desired = Math.min(installedCount + 1, 2);
+      if (totalInstances + 1 > PROVIDER_INSTANCE_LIMIT) {
+        showError(`Provider limit reached (max ${PROVIDER_INSTANCE_LIMIT}).`);
+        return;
+      }
       if (installedCount <= 0) {
         res = await fetch('/api/providers/install', {
           method: 'POST',
@@ -2002,6 +2043,10 @@ async function installProviderById(providerIdRaw) {
       }
     } else if (baseId === 'radio') {
       const installedCount = radioInstancesInstalled();
+      if (totalInstances + 1 > PROVIDER_INSTANCE_LIMIT) {
+        showError(`Provider limit reached (max ${PROVIDER_INSTANCE_LIMIT}).`);
+        return;
+      }
       if (installedCount <= 0) {
         res = await fetch('/api/providers/install', {
           method: 'POST',
@@ -2019,6 +2064,11 @@ async function installProviderById(providerIdRaw) {
         return;
       }
     } else {
+      const addCount = baseId === 'audiobookshelf' ? 2 : 1;
+      if (totalInstances + addCount > PROVIDER_INSTANCE_LIMIT) {
+        showError(`Provider limit reached (max ${PROVIDER_INSTANCE_LIMIT}).`);
+        return;
+      }
       res = await fetch('/api/providers/install', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

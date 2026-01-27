@@ -404,6 +404,32 @@ def spotify_instance_count() -> int:
     return max(0, min(2, instances))
 
 
+PROVIDER_INSTANCE_LIMIT = max(1, int(os.getenv("PROVIDER_INSTANCE_LIMIT", "5")))
+
+
+def provider_instance_limit() -> int:
+    return PROVIDER_INSTANCE_LIMIT
+
+
+def provider_instance_count() -> int:
+    total = 0
+    spotify_state = providers_by_id.get("spotify")
+    if spotify_state and spotify_state.enabled:
+        total += spotify_instance_count() or 1
+    radio_state = providers_by_id.get("radio")
+    if radio_state and radio_state.enabled:
+        total += radio_max_slots_configured()
+    abs_state = providers_by_id.get("audiobookshelf")
+    if abs_state and abs_state.enabled:
+        total += len(ABS_CHANNEL_SLOTS)
+    for pid, state in providers_by_id.items():
+        if pid in {"spotify", "radio", "audiobookshelf"}:
+            continue
+        if state and state.enabled:
+            total += 1
+    return total
+
+
 def require_spotify_provider() -> None:
     if not is_provider_enabled("spotify"):
         raise HTTPException(status_code=503, detail="Spotify provider is not installed")
@@ -1666,6 +1692,15 @@ def public_node(node: dict) -> dict:
     return data
 
 
+def _node_visible_to_user(node: dict, user: Optional[dict]) -> bool:
+    owner_id = node.get("owner_id")
+    if not owner_id:
+        return True
+    if not user:
+        return False
+    return user.get("id") == owner_id or user.get("role") == "admin"
+
+
 def public_nodes() -> list[dict]:
     section_rank = {section.get("id"): idx for idx, section in enumerate(sections) if section.get("id")}
 
@@ -1686,6 +1721,28 @@ def public_nodes() -> list[dict]:
 
     ordered = sorted(nodes.values(), key=_node_key)
     return [public_node(node) for node in ordered]
+
+
+def public_nodes_for_user(user: Optional[dict]) -> list[dict]:
+    section_rank = {section.get("id"): idx for idx, section in enumerate(sections) if section.get("id")}
+
+    def _node_key(entry: dict) -> tuple:
+        sid = entry.get("section_id")
+        if not sid:
+            rank = -1
+        else:
+            rank = section_rank.get(sid, 10**9)
+        order = entry.get("section_order")
+        try:
+            order_val = int(order)
+        except (TypeError, ValueError):
+            order_val = 10**9
+        name_val = (entry.get("name") or "").lower()
+        return (rank, order_val, name_val)
+
+    ordered = sorted(nodes.values(), key=_node_key)
+    visible = [node for node in ordered if _node_visible_to_user(node, user)]
+    return [public_node(node) for node in visible]
 
 
 def _normalize_percent(value, *, default: int) -> int:
@@ -1740,6 +1797,10 @@ def _auth_list_users() -> list[dict]:
     return auth_service.list_users()
 
 
+def _auth_update_user_settings(user_id: str, updates: dict) -> dict:
+    return auth_service.update_user_settings(user_id, updates)
+
+
 app.include_router(create_health_router())
 
 
@@ -1757,8 +1818,10 @@ app.include_router(
         verify_password=auth_service.verify_password,
         set_session_cookie=auth_service.set_session_cookie,
         clear_session_cookie=auth_service.clear_session_cookie,
+        require_user=get_current_user,
         require_admin=require_admin,
         server_default_name=SERVER_DEFAULT_NAME,
+        update_user_settings=_auth_update_user_settings,
     )
 )
 
@@ -1797,6 +1860,8 @@ app.include_router(
         provider_state_cls=ProviderState,
         save_providers_state=save_providers_state,
         require_admin=require_admin,
+        provider_instance_limit=provider_instance_limit,
+        provider_instance_count=provider_instance_count,
         spotify_provider=spotify_provider,
         apply_spotify_provider=provider_runtime_service.apply_spotify_provider,
         disable_spotify_provider=provider_runtime_service.disable_spotify_provider,
@@ -1831,7 +1896,7 @@ def _browser_ws() -> dict:
     return browser_ws
 
 
-def _node_watchers() -> set:
+def _node_watchers() -> dict:
     return node_broadcast_service.watchers()
 
 
@@ -1852,7 +1917,9 @@ app.include_router(
         broadcast_nodes=lambda: broadcast_nodes(),
         public_node=lambda node: public_node(node),
         public_nodes=lambda: public_nodes(),
+        public_nodes_for_user=lambda user: public_nodes_for_user(user),
         public_sections=lambda: public_sections(),
+        get_current_user=get_current_user,
         require_admin=require_admin,
         require_ws_user=_require_ws_user,
         auth_state=_auth_state,
@@ -1904,6 +1971,8 @@ app.include_router(
         pending_web_node_snapshots=web_node_approval_service.pending_snapshots,
         pop_pending_web_node_request=web_node_approval_service.pop_pending_request,
         establish_web_node_session_for_request=web_node_approval_service.establish_session_for_request,
+        establish_private_web_node_session=lambda *args, **kwargs: _establish_private_web_node_session(*args, **kwargs),
+        remove_private_web_node=lambda *args, **kwargs: _remove_private_browser_node(*args, **kwargs),
         web_node_approval_timeout=WEB_NODE_APPROVAL_TIMEOUT,
         detect_discovery_networks=node_discovery_service.detect_discovery_networks,
         hosts_for_networks=lambda networks, limit=DISCOVERY_MAX_HOSTS: node_discovery_service.hosts_for_networks(networks, limit=limit),
@@ -2076,6 +2145,8 @@ app.include_router(
         radio_max_slots_configured=radio_max_slots_configured,
         radio_max_slots_supported=radio_max_slots_supported,
         radio_channel_slots_active=radio_channel_slots_active,
+        provider_instance_limit=provider_instance_limit,
+        provider_instance_count=provider_instance_count,
         get_providers_by_id=lambda: providers_by_id,
         save_providers_state=save_providers_state,
         get_channels_by_id=lambda: channels_by_id,
@@ -2351,11 +2422,23 @@ def _map_spotify_search_bucket(payload: Optional[dict], mapper: Callable[[dict],
 
 
 async def broadcast_nodes() -> None:
-    await node_broadcast_service.broadcast({
-        "type": "nodes",
-        "sections": public_sections(),
-        "nodes": public_nodes(),
-    })
+    watchers = node_broadcast_service.watchers()
+    if not watchers:
+        return
+    dead: list[WebSocket] = []
+    for ws, user in list(watchers.items()):
+        try:
+            await ws.send_json(
+                {
+                    "type": "nodes",
+                    "sections": public_sections(),
+                    "nodes": public_nodes_for_user(user),
+                }
+            )
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        watchers.pop(ws, None)
 
 
 def _normalize_node_url(raw: str) -> str:
@@ -2398,9 +2481,73 @@ def _register_node_internal(
     )
 
 
-def create_browser_node(name: str) -> dict:
+def create_browser_node(name: str, *, owner_id: Optional[str] = None) -> dict:
     reg = NodeRegistration(id=str(uuid.uuid4()), name=name, url=f"browser:{uuid.uuid4()}")
-    return public_node(_register_node_internal(reg))
+    node = _register_node_internal(reg)
+    if owner_id:
+        node["owner_id"] = owner_id
+        node["channel_id"] = None
+        node["section_id"] = None
+        save_nodes()
+    return public_node(node)
+
+
+def _find_private_browser_node(owner_id: str) -> Optional[dict]:
+    if not owner_id:
+        return None
+    for node in nodes.values():
+        if node.get("type") == "browser" and node.get("owner_id") == owner_id:
+            return node
+    return None
+
+
+async def _establish_private_web_node_session(user: dict, name: str, sdp: str, sdp_type: str) -> dict:
+    relay = webrtc_relay
+    if not WEBRTC_ENABLED or not relay:
+        raise HTTPException(status_code=503, detail="Web nodes are disabled")
+    owner_id = user.get("id")
+    node = _find_private_browser_node(owner_id)
+    if not node:
+        create_browser_node(name, owner_id=owner_id)
+        node = _find_private_browser_node(owner_id)
+    if not node:
+        raise HTTPException(status_code=500, detail="Failed to create browser node")
+    if name and node.get("name") != name:
+        node["name"] = name
+        save_nodes()
+
+    channel_id = resolve_node_channel_id(node)
+    channel = get_channel(channel_id) if channel_id else None
+    stream_id = channel.get("snap_stream") if channel else None
+    if channel_id and (not channel or not stream_id):
+        await teardown_browser_node(node["id"])
+        raise HTTPException(status_code=500, detail="Channel is missing snap_stream mapping")
+
+    try:
+        session = await relay.create_session(
+            node["id"],
+            channel_id,
+            stream_id,
+            stereo_mode=_normalize_stereo_mode(node.get("stereo_mode")),
+        )
+        answer = await session.accept(sdp, sdp_type)
+    except Exception as exc:
+        await teardown_browser_node(node["id"])
+        raise HTTPException(status_code=500, detail=f"Failed to start WebRTC session: {exc}")
+
+    await broadcast_nodes()
+    return {"node": public_node(node), "answer": answer.sdp, "answer_type": answer.type}
+
+
+async def _remove_private_browser_node(owner_id: str) -> Optional[dict]:
+    node = _find_private_browser_node(owner_id)
+    if not node:
+        return None
+    if webrtc_relay:
+        await webrtc_relay.drop_session(node["id"])
+    else:
+        await teardown_browser_node(node["id"])
+    return node
 
 
 def _controller_node() -> Optional[dict]:

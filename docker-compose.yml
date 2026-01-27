@@ -38,7 +38,7 @@ services:
       DISCOVERY_CIDR: ${DISCOVERY_CIDR:-}
       ROOMCAST_LIBRESPOT_IMAGE: ${ROOMCAST_LIBRESPOT_IMAGE:-ghcr.io/malnes/roomcast-librespot:latest}
       ROOMCAST_RADIO_WORKER_IMAGE: ${ROOMCAST_RADIO_WORKER_IMAGE:-ghcr.io/malnes/roomcast-radio-worker:latest}
-      ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE: ${ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE:-ghcr.io/malnes/roomcast-audiobookshelf-worker:latest}
+      ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE: ${ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE:-roomcast-audiobookshelf-worker:local}
       CONFIG_PATH: /config/spotify.json
       # Auth broker handles OAuth; no client secrets are stored on devices.
       SPOTIFY_AUTH_BROKER_URL: ${SPOTIFY_AUTH_BROKER_URL:-https://sfauth.jepp.xyz}
@@ -118,7 +118,7 @@ services:
       - snapfifo:/tmp
 
   audiobookshelf_worker:
-    image: ${ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE:-ghcr.io/malnes/roomcast-audiobookshelf-worker:latest}
+    image: ${ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE:-roomcast-audiobookshelf-worker:local}
     build: ./audiobookshelf-worker
     profiles: ["providers"]
     depends_on:

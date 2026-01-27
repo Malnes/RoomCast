@@ -83,6 +83,9 @@
     let eqNodes = [];
     let pendingEq = null;
 
+    audio.muted = true;
+    audio.playsInline = true;
+
     function setStatus(message) {
       statusEl.textContent = message;
     }
@@ -108,6 +111,18 @@
         }
         connection.addEventListener('icegatheringstatechange', check);
       });
+    }
+
+    function requestAudioUnlock() {
+      if (audio.dataset.unlocked === 'true') return;
+      const unlock = () => {
+        audio.muted = false;
+        audio.play().catch(() => {});
+        audio.dataset.unlocked = 'true';
+      };
+      const onceOpts = { once: true, capture: true };
+      document.addEventListener('pointerdown', unlock, onceOpts);
+      document.addEventListener('keydown', unlock, onceOpts);
     }
 
     async function startWebNode() {
@@ -189,6 +204,7 @@
       rebuildEqGraph(pendingEq);
       audio.srcObject = streamDestNode.stream;
       audio.play().catch(() => {});
+      requestAudioUnlock();
     }
 
     function teardownAudioGraph() {

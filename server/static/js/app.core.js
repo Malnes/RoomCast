@@ -361,6 +361,7 @@ const serverNameDisplay = document.getElementById('server-name-display');
 const queueServerName = document.getElementById('queue-server-name');
 const serverNameInput = document.getElementById('server-name-input');
 const saveServerNameBtn = document.getElementById('save-server-name');
+const browserNodeToggle = document.getElementById('browser-node-toggle');
 const userStatusEl = document.getElementById('user-status');
 const currentUserNameEl = document.getElementById('current-user-name');
 const currentUserRoleEl = document.getElementById('current-user-role');
@@ -377,6 +378,13 @@ let nodePollTimer = null;
 let playerPollTimer = null;
 let usersCache = [];
 let usersLoaded = false;
+const privateBrowserNodeState = {
+  pc: null,
+  ws: null,
+  nodeId: null,
+  audio: null,
+  starting: null,
+};
 const NODE_POLL_INTERVAL_MS = 4000;
 let nodesSocket = null;
 let nodesSocketConnected = false;
@@ -449,6 +457,10 @@ function updateUserStatusUI() {
   if (currentUserRoleEl) currentUserRoleEl.textContent = (authState.user.role || 'member').replace(/^./, ch => ch.toUpperCase());
 }
 
+if (browserNodeToggle) {
+  browserNodeToggle.addEventListener('change', handleBrowserNodeToggle);
+}
+
 function showAuthLoading() {
   if (authShell) authShell.hidden = false;
   if (appShell) appShell.hidden = true;
@@ -496,6 +508,218 @@ function stopDataPolling() {
   stopNodeSocket();
   setWebNodeRequests([]);
   resetChannelUiState();
+  stopPrivateBrowserNodeSession({ unregister: false, silent: true });
+}
+
+function ensurePrivateBrowserAudio() {
+  if (privateBrowserNodeState.audio) return privateBrowserNodeState.audio;
+  const audio = document.createElement('audio');
+  audio.autoplay = true;
+  audio.muted = true;
+  audio.controls = false;
+  audio.playsInline = true;
+  audio.style.display = 'none';
+  audio.id = 'private-browser-node-audio';
+  document.body.appendChild(audio);
+  privateBrowserNodeState.audio = audio;
+  return audio;
+}
+
+function requestPrivateBrowserAudioUnlock() {
+  const audio = privateBrowserNodeState.audio;
+  if (!audio) return;
+  if (audio.dataset.unlocked === 'true') return;
+  const unlock = () => {
+    audio.muted = false;
+    audio.play().catch(() => {});
+    audio.dataset.unlocked = 'true';
+  };
+  const onceOpts = { once: true, capture: true };
+  document.addEventListener('pointerdown', unlock, onceOpts);
+  document.addEventListener('keydown', unlock, onceOpts);
+}
+
+async function waitForIce(connection, timeoutMs = 2500) {
+  if (connection.iceGatheringState === 'complete') return;
+  await new Promise(resolve => {
+    const timer = setTimeout(() => {
+      connection.removeEventListener('icegatheringstatechange', check);
+      resolve();
+    }, timeoutMs);
+    function check() {
+      if (connection.iceGatheringState === 'complete') {
+        clearTimeout(timer);
+        connection.removeEventListener('icegatheringstatechange', check);
+        resolve();
+      }
+    }
+    connection.addEventListener('icegatheringstatechange', check);
+  });
+}
+
+function privateBrowserWsUrl(nodeId) {
+  const proto = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+  return `${proto}${window.location.host}/ws/web-node?node_id=${encodeURIComponent(nodeId)}`;
+}
+
+function handlePrivateBrowserControlMessage(msg) {
+  const audio = privateBrowserNodeState.audio;
+  if (!audio || !msg) return;
+  if (msg.type === 'volume') {
+    const percent = Math.max(0, Math.min(100, Number(msg.percent ?? 0)));
+    audio.volume = percent / 100;
+  } else if (msg.type === 'mute') {
+    audio.muted = !!msg.muted;
+  } else if (msg.type === 'session' && msg.state === 'ended') {
+    stopPrivateBrowserNodeSession({ unregister: false, silent: true });
+  }
+}
+
+function connectPrivateBrowserSocket(nodeId) {
+  if (!nodeId) return;
+  const ws = new WebSocket(privateBrowserWsUrl(nodeId));
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      handlePrivateBrowserControlMessage(msg);
+    } catch (err) {
+      console.warn('Invalid browser node control message', err);
+    }
+  };
+  ws.onclose = () => {
+    if (privateBrowserNodeState.nodeId) {
+      stopPrivateBrowserNodeSession({ unregister: false, silent: true });
+    }
+  };
+  privateBrowserNodeState.ws = ws;
+}
+
+async function startPrivateBrowserNodeSession({ silent = false } = {}) {
+  if (!authState?.user) return;
+  if (privateBrowserNodeState.pc || privateBrowserNodeState.starting) return privateBrowserNodeState.starting;
+  privateBrowserNodeState.starting = (async () => {
+    try {
+      const audio = ensurePrivateBrowserAudio();
+      const name = `${authState.user.username || 'User'} browser`;
+      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+      privateBrowserNodeState.pc = pc;
+      pc.ontrack = (event) => {
+        const [stream] = event.streams;
+        if (stream) {
+          audio.srcObject = stream;
+          audio.play().catch(() => {});
+          requestPrivateBrowserAudioUnlock();
+        }
+      };
+      pc.onconnectionstatechange = () => {
+        if (!privateBrowserNodeState.pc) return;
+        if (['disconnected', 'failed'].includes(pc.connectionState)) {
+          stopPrivateBrowserNodeSession({ unregister: false, silent: true });
+        }
+      };
+
+      const rawOffer = await pc.createOffer({ offerToReceiveAudio: true });
+      await pc.setLocalDescription(rawOffer);
+      await waitForIce(pc);
+
+      const res = await fetch('/api/web-nodes/private-session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name,
+          sdp: pc.localDescription?.sdp,
+          type: pc.localDescription?.type,
+        }),
+      });
+      await ensureOk(res);
+      const data = await res.json();
+      privateBrowserNodeState.nodeId = data?.node?.id || null;
+      await pc.setRemoteDescription({ type: data.answer_type, sdp: data.answer });
+      if (privateBrowserNodeState.nodeId) {
+        connectPrivateBrowserSocket(privateBrowserNodeState.nodeId);
+      }
+      requestPrivateBrowserAudioUnlock();
+      if (!silent) showSuccess('Browser node connected.');
+    } catch (err) {
+      stopPrivateBrowserNodeSession({ unregister: false, silent: true });
+      if (!silent) showError(`Failed to start browser node: ${err.message}`);
+      throw err;
+    } finally {
+      privateBrowserNodeState.starting = null;
+    }
+  })();
+  return privateBrowserNodeState.starting;
+}
+
+async function stopPrivateBrowserNodeSession({ unregister = true, silent = false } = {}) {
+  const nodeId = privateBrowserNodeState.nodeId;
+  if (privateBrowserNodeState.ws) {
+    privateBrowserNodeState.ws.onclose = null;
+    try { privateBrowserNodeState.ws.close(); } catch (_) {}
+    privateBrowserNodeState.ws = null;
+  }
+  if (privateBrowserNodeState.pc) {
+    try { privateBrowserNodeState.pc.close(); } catch (_) {}
+    privateBrowserNodeState.pc = null;
+  }
+  privateBrowserNodeState.nodeId = null;
+  if (unregister && nodeId) {
+    try {
+      const res = await fetch('/api/web-nodes/private-session', { method: 'DELETE' });
+      await ensureOk(res);
+    } catch (err) {
+      if (!silent) console.warn('Failed to unregister browser node', err);
+    }
+  }
+}
+
+async function updateUserSettings(updates) {
+  const res = await fetch('/api/users/me/settings', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(updates || {}),
+  });
+  await ensureOk(res);
+  const data = await res.json();
+  if (authState?.user) {
+    authState.user.settings = data?.settings || {};
+  }
+  return data;
+}
+
+async function syncPrivateBrowserNodePreference() {
+  if (!authState?.user) return;
+  const enabled = !!authState.user.settings?.browser_node_enabled;
+  if (enabled) {
+    await startPrivateBrowserNodeSession({ silent: true });
+  } else {
+    await stopPrivateBrowserNodeSession({ unregister: true, silent: true });
+  }
+}
+
+async function handleBrowserNodeToggle(evt) {
+  if (!browserNodeToggle) return;
+  const desired = browserNodeToggle.checked;
+  browserNodeToggle.disabled = true;
+  try {
+    await updateUserSettings({ browser_node_enabled: desired });
+    if (desired) {
+      await startPrivateBrowserNodeSession();
+    } else {
+      await stopPrivateBrowserNodeSession({ unregister: true });
+    }
+  } catch (err) {
+    browserNodeToggle.checked = !desired;
+    try {
+      await updateUserSettings({ browser_node_enabled: !desired });
+    } catch (_) {
+      /* ignore rollback */
+    }
+    showError(err.message);
+  } finally {
+    browserNodeToggle.disabled = false;
+    syncGeneralSettingsUI();
+  }
 }
 
 function startDataPolling() {
@@ -534,6 +758,7 @@ function enterAppShell() {
   setServerBranding(authState.server_name);
   updateUserStatusUI();
   syncGeneralSettingsUI();
+  syncPrivateBrowserNodePreference();
   renderUsersList();
   refreshChannels().catch(() => {
     /* errors surfaced via toast */

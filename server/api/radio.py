@@ -239,6 +239,8 @@ def create_radio_router(
     radio_max_slots_configured: Callable[[], int],
     radio_max_slots_supported: Callable[[], int],
     radio_channel_slots_active: Callable[[], List[dict]],
+    provider_instance_limit: Callable[[], int],
+    provider_instance_count: Callable[[], int],
     get_providers_by_id: Callable[[], Dict[str, Any]],
     save_providers_state: Callable[[], None],
     get_channels_by_id: Callable[[], Dict[str, dict]],
@@ -492,6 +494,11 @@ def create_radio_router(
         desired = int(payload.max_slots)
         if desired < 1 or desired > supported:
             raise HTTPException(status_code=400, detail=f"max_slots must be between 1 and {supported}")
+
+        previous_total = provider_instance_count()
+        current_radio = radio_max_slots_configured()
+        if previous_total - current_radio + desired > provider_instance_limit():
+            raise HTTPException(status_code=409, detail=f"Provider limit reached (max {provider_instance_limit()})")
 
         providers_by_id = get_providers_by_id()
         state = providers_by_id.get("radio")
