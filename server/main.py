@@ -25,7 +25,10 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 from itsdangerous import URLSafeTimedSerializer, BadSignature
 from pydantic import BaseModel, Field
-from webrtc import WebAudioRelay
+try:
+    from webrtc import WebAudioRelay
+except Exception:  # pragma: no cover - optional dependency
+    WebAudioRelay = None
 from local_agent import (
     ensure_local_agent_running,
     local_agent_url,
@@ -36,9 +39,22 @@ import bcrypt
 from providers.registry import AVAILABLE_PROVIDERS, get_provider_spec
 from providers.storage import ProviderState, infer_providers, load_providers as _load_providers_file, save_providers as _save_providers_file
 from providers.docker_runtime import DockerUnavailable, detect_docker_context, ensure_container_absent, ensure_container_running
-from providers import spotify as spotify_provider
-from providers import radio as radio_provider
-from providers import audiobookshelf as audiobookshelf_provider
+try:
+    from providers import spotify as spotify_provider
+except Exception:  # pragma: no cover - optional dependency
+    spotify_provider = None
+try:
+    from providers import radio as radio_provider
+except Exception:  # pragma: no cover - optional dependency
+    radio_provider = None
+try:
+    from providers import audiobookshelf as audiobookshelf_provider
+except Exception:  # pragma: no cover - optional dependency
+    audiobookshelf_provider = None
+
+SPOTIFY_PROVIDER_AVAILABLE = spotify_provider is not None
+RADIO_PROVIDER_AVAILABLE = radio_provider is not None
+ABS_PROVIDER_AVAILABLE = audiobookshelf_provider is not None
 
 from api.auth import create_auth_router
 from api.channels import create_channels_router
@@ -47,7 +63,14 @@ from api.providers import create_providers_router
 from api.spotify import create_spotify_router
 from api.radio import create_radio_router
 from api.snapcast import create_snapcast_router
-from api.sonos import create_sonos_router
+try:
+    from api.sonos import create_sonos_router
+except Exception:  # pragma: no cover - optional dependency
+    create_sonos_router = None
+try:
+    from api.cast import create_cast_router
+except Exception:  # pragma: no cover - optional dependency
+    create_cast_router = None
 from api.streams import create_streams_router
 from api.audiobookshelf import create_audiobookshelf_router
 from api.health import create_health_router
@@ -69,7 +92,15 @@ from services.snapcast_service import SnapcastService
 from services.web_node_approval import WebNodeApprovalService
 from services.auth_service import AuthService
 from services.node_broadcast import NodeBroadcastService
-from services.sonos import SonosService
+try:
+    from services.sonos import SonosService
+except Exception:  # pragma: no cover - optional dependency
+    SonosService = None
+try:
+    from services.cast import CastService
+except Exception:  # pragma: no cover - optional dependency
+    CastService = None
+from services.optional import NullCastService, NullProvider, NullSonosService
 from services.spotify_config import SpotifyConfigService
 
 
@@ -97,6 +128,8 @@ SPOTIFY_REFRESH_LEEWAY = int(os.getenv("SPOTIFY_REFRESH_LEEWAY", "180"))
 SPOTIFY_REFRESH_FAILURE_BACKOFF = int(os.getenv("SPOTIFY_REFRESH_FAILURE_BACKOFF", "120"))
 NODES_PATH = Path(os.getenv("NODES_PATH", "/config/nodes.json"))
 WEBRTC_ENABLED = os.getenv("WEBRTC_ENABLED", "1").lower() not in {"0", "false", "no"}
+if WebAudioRelay is None:
+    WEBRTC_ENABLED = False
 WEBRTC_LATENCY_MS = int(os.getenv("WEBRTC_LATENCY_MS", "150"))
 WEBRTC_SAMPLE_RATE = int(os.getenv("WEBRTC_SAMPLE_RATE", "44100"))
 SENSITIVE_NODE_FIELDS = {"agent_secret"}
@@ -334,6 +367,7 @@ SONOS_HTTP_USER_AGENT = os.getenv("SONOS_HTTP_USER_AGENT", "RoomCast/Sonos").str
 SONOS_DISCOVERY_TIMEOUT = float(os.getenv("SONOS_DISCOVERY_TIMEOUT", "2.0"))
 SONOS_CONTROL_TIMEOUT = float(os.getenv("SONOS_CONTROL_TIMEOUT", "8.0"))
 SONOS_STREAM_BITRATE_KBPS = int(os.getenv("SONOS_STREAM_BITRATE_KBPS", "192"))
+CAST_STREAM_BITRATE_KBPS = int(os.getenv("CAST_STREAM_BITRATE_KBPS", "192"))
 
 # Sonos link health monitoring + reconnection.
 SONOS_CONNECTION_POLL_INTERVAL = float(os.getenv("SONOS_CONNECTION_POLL_INTERVAL", "5.0"))
@@ -431,17 +465,17 @@ def provider_instance_count() -> int:
 
 
 def require_spotify_provider() -> None:
-    if not is_provider_enabled("spotify"):
+    if not SPOTIFY_PROVIDER_AVAILABLE or not is_provider_enabled("spotify"):
         raise HTTPException(status_code=503, detail="Spotify provider is not installed")
 
 
 def require_radio_provider() -> None:
-    if not is_provider_enabled("radio"):
+    if not RADIO_PROVIDER_AVAILABLE or not is_provider_enabled("radio"):
         raise HTTPException(status_code=503, detail="Radio provider is not installed")
 
 
 def require_audiobookshelf_provider() -> None:
-    if not is_provider_enabled("audiobookshelf"):
+    if not ABS_PROVIDER_AVAILABLE or not is_provider_enabled("audiobookshelf"):
         raise HTTPException(status_code=503, detail="Audiobookshelf provider is not installed")
 
 
@@ -1228,12 +1262,28 @@ async def _apply_channel_routing(channel_id: str) -> None:
                 await webrtc_relay.update_session_channel(node["id"], cid, stream_id or None)
             except Exception as exc:
                 log.warning("Channel routing: failed to update WebRTC node %s: %s", node.get("id"), exc)
+        elif node.get("type") == "cast":
+            if not getattr(cast_service, "enabled", False):
+                log.warning("Channel routing: cast support disabled; skipping node %s", node.get("id"))
+                continue
+            ip = cast_service.ip_from_url(node.get("url"))
+            if not ip:
+                continue
+            try:
+                await cast_service.play_stream(ip, cid, title=f"RoomCast - {channel.get('name') or cid}")
+                node["connection_state"] = "playing"
+                node["connection_error"] = None
+            except Exception as exc:
+                node["connection_state"] = "error"
+                node["connection_error"] = str(exc)
+                log.warning("Channel routing: failed to update Cast node %s: %s", node.get("id"), exc)
 
     # Sonos uses HTTP pull; force coordinator refresh by reconciling.
-    try:
-        await sonos_service.reconcile_groups()
-    except Exception as exc:
-        log.warning("Channel routing: Sonos reconcile failed: %s", exc)
+    if getattr(sonos_service, "enabled", False):
+        try:
+            await sonos_service.reconcile_groups()
+        except Exception as exc:
+            log.warning("Channel routing: Sonos reconcile failed: %s", exc)
 
     save_nodes()
 
@@ -1361,33 +1411,47 @@ web_node_approval_service = WebNodeApprovalService(
 )
 
 
-sonos_service = SonosService(
-    nodes=nodes,
-    get_channels_by_id=lambda: channels_by_id,
-    resolve_channel_id=resolve_channel_id,
-    resolve_node_channel_id=lambda node: resolve_node_channel_id(node),
-    broadcast_nodes=lambda: broadcast_nodes(),
-    save_nodes=lambda: save_nodes(),
-    detect_primary_ipv4_host=lambda: _detect_primary_ipv4_host(),
-    public_host=ROOMCAST_PUBLIC_HOST,
-    public_port=ROOMCAST_PUBLIC_PORT,
-    http_user_agent=SONOS_HTTP_USER_AGENT,
-    control_timeout=SONOS_CONTROL_TIMEOUT,
-    device_type=SONOS_DEVICE_TYPE,
-    ssdp_addr=SONOS_SSDP_ADDR,
-    reconcile_lock=sonos_reconcile_lock,
-    connect_grace_seconds=SONOS_CONNECT_GRACE_SECONDS,
-    stream_stale_seconds=SONOS_STREAM_STALE_SECONDS,
-    reconnect_attempts=SONOS_RECONNECT_ATTEMPTS,
-    reconnect_wait_for_stream_seconds=SONOS_RECONNECT_WAIT_FOR_STREAM_SECONDS,
-    connection_poll_interval=SONOS_CONNECTION_POLL_INTERVAL,
-    discovery_timeout=SONOS_DISCOVERY_TIMEOUT,
-    scan_max_hosts=SONOS_SCAN_MAX_HOSTS,
-    scan_concurrency=SONOS_SCAN_CONCURRENCY,
-    scan_http_timeout=SONOS_SCAN_HTTP_TIMEOUT,
-    detect_discovery_networks=lambda: _detect_sonos_discovery_networks(node_discovery_service, ROOMCAST_PUBLIC_HOST),
-    hosts_for_networks=lambda networks, limit: node_discovery_service.hosts_for_networks(networks, limit=limit),
-)
+if SonosService:
+    sonos_service = SonosService(
+        nodes=nodes,
+        get_channels_by_id=lambda: channels_by_id,
+        resolve_channel_id=resolve_channel_id,
+        resolve_node_channel_id=lambda node: resolve_node_channel_id(node),
+        broadcast_nodes=lambda: broadcast_nodes(),
+        save_nodes=lambda: save_nodes(),
+        detect_primary_ipv4_host=lambda: _detect_primary_ipv4_host(),
+        public_host=ROOMCAST_PUBLIC_HOST,
+        public_port=ROOMCAST_PUBLIC_PORT,
+        http_user_agent=SONOS_HTTP_USER_AGENT,
+        control_timeout=SONOS_CONTROL_TIMEOUT,
+        device_type=SONOS_DEVICE_TYPE,
+        ssdp_addr=SONOS_SSDP_ADDR,
+        reconcile_lock=sonos_reconcile_lock,
+        connect_grace_seconds=SONOS_CONNECT_GRACE_SECONDS,
+        stream_stale_seconds=SONOS_STREAM_STALE_SECONDS,
+        reconnect_attempts=SONOS_RECONNECT_ATTEMPTS,
+        reconnect_wait_for_stream_seconds=SONOS_RECONNECT_WAIT_FOR_STREAM_SECONDS,
+        connection_poll_interval=SONOS_CONNECTION_POLL_INTERVAL,
+        discovery_timeout=SONOS_DISCOVERY_TIMEOUT,
+        scan_max_hosts=SONOS_SCAN_MAX_HOSTS,
+        scan_concurrency=SONOS_SCAN_CONCURRENCY,
+        scan_http_timeout=SONOS_SCAN_HTTP_TIMEOUT,
+        detect_discovery_networks=lambda: _detect_sonos_discovery_networks(node_discovery_service, ROOMCAST_PUBLIC_HOST),
+        hosts_for_networks=lambda networks, limit: node_discovery_service.hosts_for_networks(networks, limit=limit),
+    )
+    sonos_service.enabled = True
+else:
+    sonos_service = NullSonosService()
+
+if CastService:
+    cast_service = CastService(
+        public_host=ROOMCAST_PUBLIC_HOST,
+        public_port=ROOMCAST_PUBLIC_PORT,
+        detect_primary_ipv4_host=lambda: _detect_primary_ipv4_host(),
+    )
+    cast_service.enabled = True
+else:
+    cast_service = NullCastService()
 
 
 node_health_service = NodeHealthService(
@@ -1405,9 +1469,9 @@ node_health_service = NodeHealthService(
 
 
 provider_runtime_service = ProviderRuntimeService(
-    spotify_provider=spotify_provider,
-    radio_provider=radio_provider,
-    audiobookshelf_provider=audiobookshelf_provider,
+    spotify_provider=spotify_provider or NullProvider("Spotify"),
+    radio_provider=radio_provider or NullProvider("Radio"),
+    audiobookshelf_provider=audiobookshelf_provider or NullProvider("Audiobookshelf"),
     write_sources_file=_write_sources_file,
     load_sources=load_sources,
     save_sources=save_sources,
@@ -1654,7 +1718,7 @@ channels_service = ChannelsService(
 def public_node(node: dict) -> dict:
     data = {k: v for k, v in node.items() if k not in SENSITIVE_NODE_FIELDS}
     data["paired"] = bool(node.get("agent_secret"))
-    if node.get("type") in {"browser", "sonos"}:
+    if node.get("type") in {"browser", "sonos", "cast"}:
         data["configured"] = True
     else:
         data["configured"] = bool(node.get("audio_configured"))
@@ -1663,10 +1727,10 @@ def public_node(node: dict) -> dict:
     data["volume_percent"] = int(node.get("volume_percent", 75))
     data["muted"] = bool(node.get("muted"))
     data["updating"] = bool(node.get("updating"))
-    data["online"] = node.get("online", node.get("type") == "browser")
+    data["online"] = node.get("online", node.get("type") in {"browser", "cast"})
     data["last_seen"] = node.get("last_seen")
     data["offline_since"] = node.get("offline_since")
-    if node.get("type") in {"browser", "sonos"}:
+    if node.get("type") in {"browser", "sonos", "cast"}:
         data["update_available"] = False
     elif AGENT_LATEST_VERSION:
         data["update_available"] = (node.get("agent_version") or "") != AGENT_LATEST_VERSION
@@ -1688,6 +1752,9 @@ def public_node(node: dict) -> dict:
         data["connection_error"] = node.get("connection_error")
         data["sonos_connecting_since"] = node.get("sonos_connecting_since")
         data["sonos_network"] = node.get("sonos_network")
+    if node.get("type") == "cast":
+        data["connection_state"] = node.get("connection_state")
+        data["connection_error"] = node.get("connection_error")
     data["is_controller"] = bool(node.get("is_controller"))
     return data
 
@@ -1945,6 +2012,9 @@ app.include_router(
         sonos_set_mute=lambda ip, muted: sonos_service.set_mute(ip, muted),
         sonos_set_eq=lambda ip, eq_type, value: sonos_service.set_eq(ip, eq_type=eq_type, value=value),
         normalize_sonos_eq=lambda value: sonos_service.normalize_eq(value),
+        cast_ip_from_url=lambda url: cast_service.ip_from_url(url),
+        cast_set_volume=lambda ip, percent: cast_service.set_volume(ip, percent),
+        cast_set_mute=lambda ip, muted: cast_service.set_mute(ip, muted),
         request_agent_secret=lambda node, force=False, recovery_code=None: request_agent_secret(node, force=force, recovery_code=recovery_code),
         configure_agent_audio=lambda node: configure_agent_audio(node),
         set_node_channel=lambda node, channel_id: _set_node_channel(node, channel_id),
@@ -1978,6 +2048,7 @@ app.include_router(
         hosts_for_networks=lambda networks, limit=DISCOVERY_MAX_HOSTS: node_discovery_service.hosts_for_networks(networks, limit=limit),
         stream_host_probes=node_discovery_service.stream_host_probes,
         sonos_ssdp_discover=lambda: sonos_service.ssdp_discover(),
+        cast_discover=lambda: cast_service.discover(),
         discovery_max_hosts=DISCOVERY_MAX_HOSTS,
         sonos_discovery_timeout=SONOS_DISCOVERY_TIMEOUT,
     )
@@ -2171,37 +2242,68 @@ app.include_router(
     )
 )
 
-app.include_router(
-    create_sonos_router(
-        get_current_user=get_current_user,
-        resolve_channel_id=resolve_channel_id,
-        get_channels_by_id=lambda: channels_by_id,
-        get_nodes=_nodes,
-        resolve_node_channel_id=resolve_node_channel_id,
-        sonos_attempt_reconnect=lambda channel_id, members: sonos_service.attempt_reconnect(channel_id, members),
-        sonos_discover=lambda: sonos_service.discover(),
-        sonos_client_allows_stream=lambda resolved_channel_id, client_ip: sonos_service.client_allows_stream(
-            resolved_channel_id,
-            client_ip,
-        ),
-        sonos_mark_stream_activity=lambda channel_id, client_ip, kind: sonos_service.mark_stream_activity(
-            channel_id,
-            client_ip,
-            kind,
-        ),
-        sonos_mark_stream_end=lambda client_ip: sonos_service.mark_stream_end(client_ip),
-        sonos_find_node_by_ip=lambda ip: sonos_service.find_node_by_ip(ip),
-        normalize_stereo_mode=lambda mode: _normalize_stereo_mode(mode),
-        ffmpeg_pan_filter_for_stereo_mode=lambda mode: _ffmpeg_pan_filter_for_stereo_mode(mode),
-        snapcast_client=snapcast,
-        snapserver_agent_host=SNAPSERVER_AGENT_HOST,
-        snapclient_port=SNAPCLIENT_PORT,
-        webrtc_latency_ms=WEBRTC_LATENCY_MS,
-        webrtc_sample_rate=WEBRTC_SAMPLE_RATE,
-        sonos_stream_bitrate_kbps=SONOS_STREAM_BITRATE_KBPS,
-        server_default_name=SERVER_DEFAULT_NAME,
+if create_sonos_router and getattr(sonos_service, "enabled", False):
+    app.include_router(
+        create_sonos_router(
+            get_current_user=get_current_user,
+            resolve_channel_id=resolve_channel_id,
+            get_channels_by_id=lambda: channels_by_id,
+            get_nodes=_nodes,
+            resolve_node_channel_id=resolve_node_channel_id,
+            sonos_attempt_reconnect=lambda channel_id, members: sonos_service.attempt_reconnect(channel_id, members),
+            sonos_discover=lambda: sonos_service.discover(),
+            sonos_client_allows_stream=lambda resolved_channel_id, client_ip: sonos_service.client_allows_stream(
+                resolved_channel_id,
+                client_ip,
+            ),
+            sonos_mark_stream_activity=lambda channel_id, client_ip, kind: sonos_service.mark_stream_activity(
+                channel_id,
+                client_ip,
+                kind,
+            ),
+            sonos_mark_stream_end=lambda client_ip: sonos_service.mark_stream_end(client_ip),
+            sonos_find_node_by_ip=lambda ip: sonos_service.find_node_by_ip(ip),
+            normalize_stereo_mode=lambda mode: _normalize_stereo_mode(mode),
+            ffmpeg_pan_filter_for_stereo_mode=lambda mode: _ffmpeg_pan_filter_for_stereo_mode(mode),
+            snapcast_client=snapcast,
+            snapserver_agent_host=SNAPSERVER_AGENT_HOST,
+            snapclient_port=SNAPCLIENT_PORT,
+            webrtc_latency_ms=WEBRTC_LATENCY_MS,
+            webrtc_sample_rate=WEBRTC_SAMPLE_RATE,
+            sonos_stream_bitrate_kbps=SONOS_STREAM_BITRATE_KBPS,
+            server_default_name=SERVER_DEFAULT_NAME,
+        )
     )
-)
+
+if create_cast_router and getattr(cast_service, "enabled", False):
+    app.include_router(
+        create_cast_router(
+            get_current_user=get_current_user,
+            resolve_channel_id=resolve_channel_id,
+            get_channels_by_id=lambda: channels_by_id,
+            cast_find_node_by_ip=lambda ip: _cast_find_node_by_ip(ip),
+            cast_client_allows_stream=lambda resolved_channel_id, client_ip: _cast_client_allows_stream(
+                resolved_channel_id,
+                client_ip,
+            ),
+            cast_mark_stream_activity=lambda channel_id, client_ip, kind: _cast_mark_stream_activity(
+                channel_id,
+                client_ip,
+                kind,
+            ),
+            cast_mark_stream_end=lambda client_ip: _cast_mark_stream_end(client_ip),
+            cast_discover=lambda: cast_service.discover(),
+            normalize_stereo_mode=lambda mode: _normalize_stereo_mode(mode),
+            ffmpeg_pan_filter_for_stereo_mode=lambda mode: _ffmpeg_pan_filter_for_stereo_mode(mode),
+            snapcast_client=snapcast,
+            snapserver_agent_host=SNAPSERVER_AGENT_HOST,
+            snapclient_port=SNAPCLIENT_PORT,
+            webrtc_latency_ms=WEBRTC_LATENCY_MS,
+            webrtc_sample_rate=WEBRTC_SAMPLE_RATE,
+            cast_stream_bitrate_kbps=CAST_STREAM_BITRATE_KBPS,
+            server_default_name=SERVER_DEFAULT_NAME,
+        )
+    )
 
 
 async def _send_browser_volume(node: dict, requested_percent: int) -> None:
@@ -2210,6 +2312,45 @@ async def _send_browser_volume(node: dict, requested_percent: int) -> None:
         return
     effective = _apply_volume_limit(node, requested_percent)
     await ws.send_json({"type": "volume", "percent": effective})
+
+
+def _cast_find_node_by_ip(ip: Optional[str]) -> Optional[dict]:
+    if not ip:
+        return None
+    for node in nodes.values():
+        if node.get("type") != "cast":
+            continue
+        if cast_service.ip_from_url(node.get("url")) == ip:
+            return node
+    return None
+
+
+def _cast_client_allows_stream(channel_id: str, client_ip: Optional[str]) -> bool:
+    if not client_ip:
+        return False
+    for node in nodes.values():
+        if node.get("type") != "cast":
+            continue
+        if resolve_node_channel_id(node) != channel_id:
+            continue
+        if cast_service.ip_from_url(node.get("url")) == client_ip:
+            return True
+    return False
+
+
+def _cast_mark_stream_activity(channel_id: str, client_ip: Optional[str], kind: str) -> None:
+    node = _cast_find_node_by_ip(client_ip)
+    if not node:
+        return
+    node["connection_state"] = "streaming"
+    node["connection_error"] = None
+
+
+def _cast_mark_stream_end(client_ip: Optional[str]) -> None:
+    node = _cast_find_node_by_ip(client_ip)
+    if not node:
+        return
+    node["connection_state"] = None
 
 
 async def _sync_node_max_volume(node: dict, *, percent: Optional[int] = None) -> None:
@@ -2449,6 +2590,8 @@ def _normalize_node_url(raw: str) -> str:
         return value.rstrip("/")
     if value.startswith("sonos://"):
         return value.rstrip("/")
+    if value.startswith("cast://"):
+        return value.rstrip("/")
     if "://" not in value:
         value = f"http://{value}"
     return value.rstrip("/")
@@ -2579,7 +2722,7 @@ def _mark_node_online(node: dict, *, timestamp: Optional[float] = None) -> bool:
 
 
 def _mark_node_offline(node: dict, *, timestamp: Optional[float] = None) -> bool:
-    if node.get("type") == "browser":
+    if node.get("type") in {"browser", "cast", "sonos"}:
         return False
     now = timestamp or time.time()
     was_online = bool(node.get("online", False))
@@ -2663,6 +2806,7 @@ node_registration_service = NodeRegistrationService(
     broadcast_nodes=broadcast_nodes,
     public_node=public_node,
     sonos_service=sonos_service,
+    cast_service=cast_service,
 )
 
 
@@ -2711,16 +2855,17 @@ async def _startup_events() -> None:
             provider_runtime_service.reconcile_spotify_runtime(spotify_instance_count())
         else:
             # Best-effort cleanup (do not mutate config/channels).
-            try:
-                spotify_provider.stop_runtime()
-            except DockerUnavailable:
-                pass
+            if getattr(spotify_provider, "stop_runtime", None):
+                try:
+                    spotify_provider.stop_runtime()
+                except DockerUnavailable:
+                    pass
         provider_runtime_service.reconcile_radio_runtime(is_provider_enabled("radio"))
     except HTTPException as exc:
         log.warning("Provider runtime reconcile skipped: %s", exc.detail)
     except Exception:  # pragma: no cover - defensive
         log.exception("Provider runtime reconcile crashed")
-    if WEBRTC_ENABLED:
+    if WEBRTC_ENABLED and WebAudioRelay is not None:
         webrtc_relay = WebAudioRelay(
             snap_host=SNAPSERVER_HOST,
             snap_port=SNAPCLIENT_PORT,
@@ -2742,7 +2887,7 @@ async def _startup_events() -> None:
         )
         channel_idle_task = asyncio.create_task(channel_idle_service.loop())
 
-    if sonos_connection_task is None:
+    if sonos_connection_task is None and getattr(sonos_service, "enabled", False):
         sonos_connection_task = asyncio.create_task(sonos_service.connection_loop())
 
 
@@ -2820,6 +2965,15 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
             node["connection_state"] = None
             node["connection_error"] = None
             node["sonos_connecting_since"] = None
+        if node.get("type") == "cast":
+            ip = cast_service.ip_from_url(node.get("url"))
+            if ip:
+                try:
+                    await cast_service.stop(ip)
+                except Exception:
+                    pass
+            node["connection_state"] = None
+            node["connection_error"] = None
         node["channel_id"] = None
         return
     channel = channels_by_id[resolved]
@@ -2827,6 +2981,8 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
     if not stream_id:
         raise HTTPException(status_code=400, detail="Channel is missing snap_stream mapping")
     if node.get("type") == "sonos":
+        if not getattr(sonos_service, "enabled", False):
+            raise HTTPException(status_code=503, detail="Sonos support not installed")
         ip = sonos_service.ip_from_url(node.get("url"))
         if not ip:
             raise HTTPException(status_code=400, detail="Invalid Sonos node")
@@ -2836,6 +2992,23 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
         node["channel_id"] = resolved
         # Reconcile grouping based on updated desired assignments.
         await sonos_service.reconcile_groups()
+        return
+    if node.get("type") == "cast":
+        if not getattr(cast_service, "enabled", False):
+            raise HTTPException(status_code=503, detail="Google Cast support not installed")
+        ip = cast_service.ip_from_url(node.get("url"))
+        if not ip:
+            raise HTTPException(status_code=400, detail="Invalid Cast node")
+        node["connection_state"] = "connecting"
+        node["connection_error"] = None
+        try:
+            await cast_service.play_stream(ip, resolved, title=f"RoomCast - {channel.get('name') or resolved}")
+        except Exception as exc:
+            node["connection_state"] = "error"
+            node["connection_error"] = str(exc)
+            raise HTTPException(status_code=502, detail=f"Failed to start Cast playback: {exc}") from exc
+        node["connection_state"] = "playing"
+        node["channel_id"] = resolved
         return
     if node.get("type") == "agent":
         client_id = await snapcast_service.ensure_snapclient_stream(node, channel)

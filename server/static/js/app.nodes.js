@@ -816,16 +816,17 @@ function renderNodeSettingsContent() {
 
   const isBrowser = node.type === 'browser';
   const isSonos = node.type === 'sonos';
-  const paired = isSonos ? true : !!node.paired;
-  const configured = (isBrowser || isSonos) ? true : !!node.configured;
-  const online = isBrowser ? true : node.online !== false;
+  const isCast = node.type === 'cast';
+  const paired = (isSonos || isCast) ? true : !!node.paired;
+  const configured = (isBrowser || isSonos || isCast) ? true : !!node.configured;
+  const online = (isBrowser || isCast) ? true : node.online !== false;
   const restarting = !!node.restarting;
   const updating = !!node.updating;
   const updateAvailable = hasAgentUpdate(node);
   const outputs = node.outputs || {};
   const outputOptions = Array.isArray(outputs.options) ? outputs.options : [];
   const selectedOutput = outputs.selected || node.playback_device || '';
-  const disableOutputs = !isBrowser && !isSonos && (!paired || !configured || restarting || !online || updating);
+  const disableOutputs = !isBrowser && !isSonos && !isCast && (!paired || !configured || restarting || !online || updating);
 
   const detailsPanel = document.createElement('div');
   detailsPanel.className = 'panel';
@@ -833,7 +834,7 @@ function renderNodeSettingsContent() {
   detailsTitle.className = 'section-title';
   detailsTitle.textContent = 'Details';
   detailsPanel.appendChild(detailsTitle);
-  detailsPanel.appendChild(createMetaRow('Node type', isBrowser ? 'Browser node' : (isSonos ? 'Sonos speaker' : 'Hardware node')));
+  detailsPanel.appendChild(createMetaRow('Node type', isBrowser ? 'Browser node' : (isSonos ? 'Sonos speaker' : (isCast ? 'Google Cast' : 'Hardware node'))));
   if (node.url) {
     detailsPanel.appendChild(createMetaRow('Endpoint', node.url));
   }

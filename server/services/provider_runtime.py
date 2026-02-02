@@ -63,6 +63,8 @@ class ProviderRuntimeService:
         return bool(token)
 
     def reconcile_spotify_runtime(self, instances: int) -> None:
+        if not getattr(self._spotify_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Spotify provider not installed")
         image = (os.getenv("ROOMCAST_LIBRESPOT_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-librespot:latest"
         token_a = self._spotify_token_ready(self._spotify_token_path)
         token_b = self._spotify_token_ready(Path("/config/spotify-token-ch2.json"))
@@ -84,6 +86,8 @@ class ProviderRuntimeService:
             raise HTTPException(status_code=503, detail=str(exc))
 
     def reconcile_radio_runtime(self, enabled: bool) -> None:
+        if not getattr(self._radio_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Radio provider not installed")
         image = (os.getenv("ROOMCAST_RADIO_WORKER_IMAGE") or "").strip() or "ghcr.io/malnes/roomcast-radio-worker:latest"
         try:
             self._radio_provider.reconcile_runtime(
@@ -98,6 +102,8 @@ class ProviderRuntimeService:
             raise HTTPException(status_code=503, detail=str(exc))
 
     def reconcile_audiobookshelf_runtime(self, enabled: bool) -> None:
+        if not getattr(self._audiobookshelf_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Audiobookshelf provider not installed")
         image = (
             (os.getenv("ROOMCAST_AUDIOBOOKSHELF_WORKER_IMAGE") or "").strip()
             or "ghcr.io/malnes/roomcast-audiobookshelf-worker:latest"
@@ -115,6 +121,8 @@ class ProviderRuntimeService:
             raise HTTPException(status_code=503, detail=str(exc))
 
     def apply_spotify_provider(self, instances: int) -> None:
+        if not getattr(self._spotify_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Spotify provider not installed")
         instances = 2 if instances >= 2 else 1
         sources_entries = self._spotify_provider.desired_source_entries(
             instances=instances,
@@ -130,6 +138,8 @@ class ProviderRuntimeService:
         self.reconcile_spotify_runtime(instances)
 
     def disable_spotify_provider(self) -> None:
+        if not getattr(self._spotify_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Spotify provider not installed")
         # Remove spotify sources and detach channels.
         self._sources_by_id.pop("spotify:a", None)
         self._sources_by_id.pop("spotify:b", None)
@@ -146,10 +156,14 @@ class ProviderRuntimeService:
         self._spotify_provider.stop_runtime()
 
     def apply_radio_provider(self) -> None:
+        if not getattr(self._radio_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Radio provider not installed")
         # Radio is a per-channel source; do not auto-create channels.
         self.reconcile_radio_runtime(True)
 
     def disable_radio_provider(self) -> None:
+        if not getattr(self._radio_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Radio provider not installed")
         # Detach radio channels.
         for channel in self._channels_by_id.values():
             if (channel.get("source") or "").strip().lower() == "radio":
@@ -162,10 +176,14 @@ class ProviderRuntimeService:
         self.reconcile_radio_runtime(False)
 
     def apply_audiobookshelf_provider(self) -> None:
+        if not getattr(self._audiobookshelf_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Audiobookshelf provider not installed")
         # Audiobookshelf is a per-channel source; do not auto-create channels.
         self.reconcile_audiobookshelf_runtime(True)
 
     def disable_audiobookshelf_provider(self) -> None:
+        if not getattr(self._audiobookshelf_provider, "enabled", True):
+            raise HTTPException(status_code=503, detail="Audiobookshelf provider not installed")
         # Detach Audiobookshelf channels.
         for channel in self._channels_by_id.values():
             if (channel.get("source") or "").strip().lower() == "audiobookshelf":

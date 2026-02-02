@@ -3590,11 +3590,12 @@ function appendDiscovered(items) {
   list.forEach(item => {
     if (!item || !item.url) return;
     const isSonos = typeof item.url === 'string' && item.url.startsWith('sonos://');
+    const isCast = typeof item.url === 'string' && item.url.startsWith('cast://');
     const row = document.createElement('div');
     row.className = 'panel discover-row';
     row.style.marginBottom = '8px';
     const title = document.createElement('div');
-    const versionLabel = isSonos ? 'Sonos speaker' : (item.version ? `Agent ${item.version}` : 'Version unknown');
+    const versionLabel = isSonos ? 'Sonos speaker' : (isCast ? 'Google Cast' : (item.version ? `Agent ${item.version}` : 'Version unknown'));
     title.innerHTML = `<strong>${item.host}</strong> <span class="muted">${item.url}</span><div class="label">${versionLabel}</div>`;
     const nameInput = document.createElement('input');
     const existing = findNodeByFingerprint(item.fingerprint);
@@ -3602,7 +3603,13 @@ function appendDiscovered(items) {
       nameInput.value = existing.name || existing.id || `Node ${item.host}`;
       nameInput.disabled = true;
     } else {
-      nameInput.value = isSonos ? (item.host || 'Sonos speaker') : `Node ${item.host}`;
+      if (isSonos) {
+        nameInput.value = item.host || 'Sonos speaker';
+      } else if (isCast) {
+        nameInput.value = item.host || 'Google Cast';
+      } else {
+        nameInput.value = `Node ${item.host}`;
+      }
     }
     nameInput.style.marginTop = '6px';
     const btn = document.createElement('button');

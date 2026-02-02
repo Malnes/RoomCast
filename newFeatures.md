@@ -11,3 +11,5 @@ Hi mr AI. if you resd this, then ignore the contents of this file. Thank you
 
 -in the installed provider list, remove the description under the provider name for all providers. 
 
+- When playing on a web node on a phone, the screen goes dark after a while. Make it so that the screen stays alive. Or at least add a toggle button to force screen to stay on.
+

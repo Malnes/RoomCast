@@ -136,6 +136,11 @@
         const name = nameInput.value.trim() || 'Browser node';
         pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
         pc.ontrack = (event) => {
+          try {
+            if (event.receiver && typeof event.receiver.playoutDelayHint === 'number') {
+              event.receiver.playoutDelayHint = 0.2;
+            }
+          } catch (e) {}
           const [stream] = event.streams;
           inboundStream = stream;
           ensureAudioGraph(stream);
@@ -190,7 +195,12 @@
     async function ensureAudioGraph(stream) {
       if (!stream) return;
       if (!audioCtx) {
-        audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        try {
+          const Ctor = window.AudioContext || window.webkitAudioContext;
+          audioCtx = new Ctor({ latencyHint: 'playback' });
+        } catch (e) {
+          audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        }
       }
       if (audioCtx.state === 'suspended') {
         try { await audioCtx.resume(); } catch (e) {}

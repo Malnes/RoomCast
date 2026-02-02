@@ -29,6 +29,7 @@ class NodeRegistrationService:
         broadcast_nodes: Callable[[], Awaitable[None]],
         public_node: Callable[[dict], dict],
         sonos_service: Any,
+        cast_service: Any,
     ) -> None:
         self._get_nodes = get_nodes
         self._normalize_node_url = normalize_node_url
@@ -45,6 +46,7 @@ class NodeRegistrationService:
         self._broadcast_nodes = broadcast_nodes
         self._public_node = public_node
         self._sonos_service = sonos_service
+        self._cast_service = cast_service
 
     def register_node_internal(
         self,
@@ -89,6 +91,8 @@ class NodeRegistrationService:
             node_type = "browser"
         elif normalized.startswith("sonos://"):
             node_type = "sonos"
+        elif normalized.startswith("cast://"):
+            node_type = "cast"
         else:
             node_type = "agent"
 
@@ -101,7 +105,7 @@ class NodeRegistrationService:
             "eq": self._default_eq_state(),
             "agent_secret": previous.get("agent_secret"),
             "owner_id": previous.get("owner_id"),
-            "audio_configured": True if node_type in {"browser", "sonos"} else previous.get("audio_configured", False),
+            "audio_configured": True if node_type in {"browser", "sonos", "cast"} else previous.get("audio_configured", False),
             "agent_version": previous.get("agent_version"),
             "volume_percent": self._normalize_percent(previous.get("volume_percent", 75), default=75),
             "max_volume_percent": self._normalize_percent(previous.get("max_volume_percent", 100), default=100),
@@ -124,7 +128,7 @@ class NodeRegistrationService:
 
     async def fetch_agent_fingerprint(self, url: str) -> Optional[str]:
         normalized = self._normalize_node_url(url)
-        if not normalized or normalized.startswith("browser:") or normalized.startswith("sonos://"):
+        if not normalized or normalized.startswith("browser:") or normalized.startswith("sonos://") or normalized.startswith("cast://"):
             return None
         try:
             data = await self._agent_client.get({"url": normalized}, "/health", require_secret=False)
@@ -180,6 +184,8 @@ class NodeRegistrationService:
         desc: Optional[dict] = None
 
         if normalized_url.startswith("sonos://"):
+            if not getattr(self._sonos_service, "enabled", True):
+                raise HTTPException(status_code=503, detail="Sonos support not installed")
             ip = self._sonos_service.ip_from_url(normalized_url)
             if not ip:
                 raise HTTPException(status_code=400, detail="Invalid Sonos URL")
@@ -187,6 +193,16 @@ class NodeRegistrationService:
             if not desc:
                 raise HTTPException(status_code=502, detail="Failed to read Sonos device description")
             fingerprint = fingerprint or desc.get("udn")
+        elif normalized_url.startswith("cast://"):
+            if not getattr(self._cast_service, "enabled", True):
+                raise HTTPException(status_code=503, detail="Google Cast support not installed")
+            ip = self._cast_service.ip_from_url(normalized_url)
+            if not ip:
+                raise HTTPException(status_code=400, detail="Invalid Cast URL")
+            cast_info = await self._cast_service.fetch_device(ip)
+            if not cast_info:
+                raise HTTPException(status_code=502, detail="Failed to read Cast device information")
+            fingerprint = fingerprint or cast_info.uuid
         else:
             fingerprint = fingerprint or await self.fetch_agent_fingerprint(normalized_url)
 
@@ -226,6 +242,33 @@ class NodeRegistrationService:
 
             if not name_is_custom and sonos_app_name:
                 node["name"] = sonos_app_name
+            node["audio_configured"] = True
+            node["agent_secret"] = None
+            self._save_nodes()
+            await self._broadcast_nodes()
+            return self._public_node(node)
+
+        if node.get("type") == "cast":
+            ip = self._cast_service.ip_from_url(node.get("url"))
+            if not ip:
+                raise HTTPException(status_code=400, detail="Invalid Cast node URL")
+            cast_info = await self._cast_service.fetch_device(ip)
+            if not cast_info:
+                raise HTTPException(status_code=502, detail="Failed to read Cast device information")
+            node["cast_uuid"] = cast_info.uuid
+            node["cast_model"] = cast_info.model
+            node["cast_manufacturer"] = cast_info.manufacturer
+            node["cast_friendly_name"] = cast_info.name
+            name_is_custom = node.get("name_is_custom")
+            if not isinstance(name_is_custom, bool):
+                current_name = (node.get("name") or "").strip()
+                inferred_custom = False
+                if current_name and cast_info.name and current_name != cast_info.name:
+                    inferred_custom = True
+                node["name_is_custom"] = inferred_custom
+                name_is_custom = inferred_custom
+            if not name_is_custom and cast_info.name:
+                node["name"] = cast_info.name
             node["audio_configured"] = True
             node["agent_secret"] = None
             self._save_nodes()

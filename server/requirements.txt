@@ -8,3 +8,4 @@ av==12.2.0
 asyncssh==2.14.2
 bcrypt==4.2.0
 docker==7.1.0
+pychromecast==14.0.5

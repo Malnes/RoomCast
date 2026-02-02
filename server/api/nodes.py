@@ -133,6 +133,9 @@ def create_nodes_router(
     sonos_set_mute: Callable[..., Awaitable[None]],
     sonos_set_eq: Callable[..., Awaitable[None]],
     normalize_sonos_eq: Callable[[Any], dict],
+    cast_ip_from_url: Callable[[Optional[str]], Optional[str]],
+    cast_set_volume: Callable[..., Awaitable[None]],
+    cast_set_mute: Callable[..., Awaitable[None]],
     request_agent_secret: Callable[..., Awaitable[str]],
     configure_agent_audio: Callable[..., Awaitable[dict]],
     set_node_channel: Callable[[dict, Optional[str]], Awaitable[None]],
@@ -169,6 +172,7 @@ def create_nodes_router(
     hosts_for_networks: Callable[..., list[str]],
     stream_host_probes: Callable[[list[str]], AsyncIterator[dict]],
     sonos_ssdp_discover: Callable[[], Awaitable[list[dict]]],
+    cast_discover: Callable[[], Awaitable[list[dict]]],
     discovery_max_hosts: int,
     sonos_discovery_timeout: float,
 ) -> APIRouter:
@@ -221,6 +225,13 @@ def create_nodes_router(
             effective = apply_volume_limit(node, requested)
             await sonos_set_volume(ip, effective)
             result = {"sonos": True, "effective": effective}
+        elif node.get("type") == "cast":
+            ip = cast_ip_from_url(node.get("url"))
+            if not ip:
+                raise HTTPException(status_code=400, detail="Invalid Cast node")
+            effective = apply_volume_limit(node, requested)
+            await cast_set_volume(ip, effective)
+            result = {"cast": True, "effective": effective}
         else:
             result = await call_agent(node, "/volume", {"percent": requested})
         node["volume_percent"] = requested
@@ -246,6 +257,14 @@ def create_nodes_router(
                 try:
                     effective = apply_volume_limit(node, int(node.get("volume_percent", 75)))
                     await sonos_set_volume(ip, effective)
+                except Exception:
+                    pass
+        if node.get("type") == "cast":
+            ip = cast_ip_from_url(node.get("url"))
+            if ip:
+                try:
+                    effective = apply_volume_limit(node, int(node.get("volume_percent", 75)))
+                    await cast_set_volume(ip, effective)
                 except Exception:
                     pass
         await broadcast_nodes()
@@ -333,6 +352,12 @@ def create_nodes_router(
                 raise HTTPException(status_code=400, detail="Invalid Sonos node")
             await sonos_set_mute(ip, bool(muted))
             result = {"sonos": True}
+        elif node.get("type") == "cast":
+            ip = cast_ip_from_url(node.get("url"))
+            if not ip:
+                raise HTTPException(status_code=400, detail="Invalid Cast node")
+            await cast_set_mute(ip, bool(muted))
+            result = {"cast": True}
         else:
             result = await call_agent(node, "/mute", {"muted": bool(muted)})
         node["muted"] = bool(muted)
@@ -382,6 +407,8 @@ def create_nodes_router(
             result = {"sent": True}
         elif node.get("type") == "sonos":
             result = {"sonos_stream": True}
+        elif node.get("type") == "cast":
+            result = {"cast_stream": True}
         else:
             result = await call_agent(node, "/eq", eq_data)
         await broadcast_nodes()
@@ -396,6 +423,8 @@ def create_nodes_router(
             raise HTTPException(status_code=400, detail="Browser nodes do not support pairing")
         if node.get("type") == "sonos":
             raise HTTPException(status_code=400, detail="Sonos nodes do not support pairing")
+        if node.get("type") == "cast":
+            raise HTTPException(status_code=400, detail="Cast nodes do not support pairing")
         force = True if payload is None else bool(payload.get("force", False))
         recovery_code = None if payload is None else payload.get("recovery_code")
         secret = await request_agent_secret(node, force=force, recovery_code=recovery_code)
@@ -438,6 +467,8 @@ def create_nodes_router(
             raise HTTPException(status_code=400, detail="Browser nodes do not require configuration")
         if node.get("type") == "sonos":
             raise HTTPException(status_code=400, detail="Sonos nodes do not require configuration")
+        if node.get("type") == "cast":
+            raise HTTPException(status_code=400, detail="Cast nodes do not require configuration")
         result = await configure_agent_audio(node)
         await sync_node_max_volume(node)
         await broadcast_nodes()
@@ -452,6 +483,8 @@ def create_nodes_router(
             raise HTTPException(status_code=400, detail="Browser nodes do not support hardware outputs")
         if node.get("type") == "sonos":
             raise HTTPException(status_code=400, detail="Sonos nodes do not support hardware outputs")
+        if node.get("type") == "cast":
+            raise HTTPException(status_code=400, detail="Cast nodes do not support hardware outputs")
         result = await call_agent(node, "/outputs", payload.model_dump())
         outputs = result.get("outputs") if isinstance(result, dict) else None
         if isinstance(outputs, dict):
@@ -759,9 +792,12 @@ def create_nodes_router(
                 + "\n"
             )
             sonos_task: Optional[asyncio.Task[list[dict]]] = None
+            cast_task: Optional[asyncio.Task[list[dict]]] = None
             sonos_emitted = False
+            cast_emitted = False
             try:
                 sonos_task = asyncio.create_task(sonos_ssdp_discover())
+                cast_task = asyncio.create_task(cast_discover())
                 async for result in stream_host_probes(hosts):
                     found += 1
                     yield json.dumps({"type": "discovered", "data": result}) + "\n"
@@ -774,7 +810,17 @@ def create_nodes_router(
                         for item in sonos_items:
                             found += 1
                             yield json.dumps({"type": "discovered", "data": item}) + "\n"
+                    if cast_task and not cast_emitted and cast_task.done():
+                        cast_emitted = True
+                        try:
+                            cast_items = cast_task.result() or []
+                        except Exception:
+                            cast_items = []
+                        for item in cast_items:
+                            found += 1
+                            yield json.dumps({"type": "discovered", "data": item}) + "\n"
                 sonos_items: list[dict] = []
+                cast_items: list[dict] = []
                 if sonos_task:
                     try:
                         sonos_items = await asyncio.wait_for(
@@ -783,8 +829,17 @@ def create_nodes_router(
                         )
                     except Exception:
                         sonos_items = []
+                if cast_task:
+                    try:
+                        cast_items = await asyncio.wait_for(cast_task, timeout=5.0)
+                    except Exception:
+                        cast_items = []
                 if not sonos_emitted:
                     for item in sonos_items or []:
+                        found += 1
+                        yield json.dumps({"type": "discovered", "data": item}) + "\n"
+                if not cast_emitted:
+                    for item in cast_items or []:
                         found += 1
                         yield json.dumps({"type": "discovered", "data": item}) + "\n"
             except asyncio.CancelledError:
@@ -797,6 +852,8 @@ def create_nodes_router(
             finally:
                 if sonos_task and not sonos_task.done():
                     sonos_task.cancel()
+                if cast_task and not cast_task.done():
+                    cast_task.cancel()
 
         return StreamingResponse(_event_stream(), media_type="application/x-ndjson")
 
