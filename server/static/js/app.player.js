@@ -48,6 +48,7 @@ function setPlayerIdleState(message = 'Player unavailable', options = {}) {
   setShuffleActive(false);
   setRepeatMode('off');
   setTakeoverBannerVisible(false);
+  syncPlayerVolumePopover(playerStatus);
 }
 
 const playerSaveServerNameBtn =
@@ -239,6 +240,7 @@ function renderAudiobookshelfPlayer(channel, payload, options = {}) {
     setRepeatMode('off');
   }
   setTakeoverBannerVisible(false);
+  syncPlayerVolumePopover(playerStatus);
 }
 
 function describeRadioRuntimeState(state) {
@@ -358,6 +360,7 @@ function renderRadioPlayer(channel, payload, options = {}) {
     setRepeatMode('off');
   }
   setTakeoverBannerVisible(false);
+  syncPlayerVolumePopover(playerStatus);
   radioPlaybackState = {
     channelId: channel?.id || null,
     playbackEnabled,
@@ -402,6 +405,64 @@ function applyLocalBrowserPause(paused) {
     audio.muted = !!state.wasMuted;
   }
   audio.play().catch(() => {});
+}
+
+function setVolumePercentLabel(labelEl, value) {
+  if (!labelEl) return;
+  labelEl.textContent = `${normalizePercent(value, 0)}%`;
+}
+
+function getActiveSpotifySourceId() {
+  const channel = getActiveChannel();
+  if (!isSpotifyChannel(channel)) return null;
+  const sourceRef = String(channel?.source_ref || '').trim().toLowerCase();
+  if (sourceRef.startsWith('spotify:')) return sourceRef;
+  return 'spotify:a';
+}
+
+function syncPlayerVolumePopover(status = playerStatus) {
+  const channel = getActiveChannel();
+  const spotifyChannel = isSpotifyChannel(channel);
+  const sourceId = spotifyChannel ? getActiveSpotifySourceId() : null;
+  const showOutputVolume = !spotifyChannel || spotifyShowOutputVolumeSlider(sourceId);
+
+  if (playerSpotifyVolumeControl) {
+    playerSpotifyVolumeControl.hidden = !spotifyChannel;
+  }
+  if (playerMasterVolumeControl) {
+    playerMasterVolumeControl.hidden = spotifyChannel && !showOutputVolume;
+  }
+
+  if (masterVolume && masterVolumeValue) {
+    setVolumePercentLabel(masterVolumeValue, masterVolume.value);
+  }
+
+  if (spotifySourceVolume) {
+    spotifySourceVolume.disabled = !spotifyChannel;
+    if (spotifyChannel) {
+      const reportedVolume = Number(status?.device?.volume_percent);
+      if (Number.isFinite(reportedVolume)) {
+        const normalized = normalizePercent(reportedVolume, Number(spotifySourceVolume.value) || 75);
+        spotifySourceVolume.value = normalized;
+        setRangeProgress(spotifySourceVolume, normalized, spotifySourceVolume.max || 100);
+      }
+    }
+    if (spotifySourceVolumeValue) {
+      setVolumePercentLabel(spotifySourceVolumeValue, spotifySourceVolume.value);
+    }
+  }
+
+  if (
+    spotifyChannel
+    && sourceId
+    && !spotifyPlayerUiConfigBySource.has(sourceId)
+    && !spotifyPlayerUiConfigFetchBySource.has(sourceId)
+  ) {
+    ensureSpotifyPlayerUiConfig(sourceId).then(() => {
+      if (sourceId !== getActiveSpotifySourceId()) return;
+      syncPlayerVolumePopover(playerStatus);
+    }).catch(() => {});
+  }
 }
 
 function cancelPlayerHoldToStop(options = {}) {
@@ -614,6 +675,7 @@ function renderPlayer(status) {
       playerTimeTotal.textContent = msToTime(dur);
     }, 1000);
   }
+  syncPlayerVolumePopover(status);
 }
 
 const PLAYER_ART_LONG_PRESS_MS = 650;
@@ -1093,6 +1155,7 @@ async function saveSpotify() {
       bitrate: Number(spBitrate.value) || 320,
       initial_volume: Number(spInitVol.value) || 75,
       normalisation: spNormalise.checked,
+      show_output_volume_slider: spShowOutputVolume ? spShowOutputVolume.checked : true,
     };
     const res = await fetch(`/api/config/spotify?source_id=${encodeURIComponent(sourceId)}`, {
       method: 'POST',
@@ -1100,6 +1163,9 @@ async function saveSpotify() {
       body: JSON.stringify(payload),
     });
     await ensureOk(res);
+    const data = await res.json();
+    rememberSpotifyPlayerUiConfig(sourceId, data?.config || payload);
+    syncPlayerVolumePopover(playerStatus);
     await saveProviderDisplaySettings(sourceId, spProviderNameInput, spProviderColorInput);
     showSuccess('Spotify config saved. Librespot will reload and connect.');
     await pollLibrespotStatus(sourceId);
@@ -2971,16 +3037,44 @@ if (masterVolume) {
       clearTimeout(masterVolumeCommitTimer);
       masterVolumeCommitTimer = null;
     }
+    setVolumePercentLabel(masterVolumeValue, masterVolume.value);
     setMasterVolume(masterVolume.value);
   };
   masterVolume.addEventListener('input', () => {
     setRangeProgress(masterVolume, masterVolume.value, masterVolume.max || 100);
+    setVolumePercentLabel(masterVolumeValue, masterVolume.value);
     if (masterVolumeCommitTimer) clearTimeout(masterVolumeCommitTimer);
     masterVolumeCommitTimer = setTimeout(commitMasterVolume, 200);
   });
   masterVolume.addEventListener('change', commitMasterVolume);
   masterVolume.addEventListener('keydown', handleVolumeKey);
 }
+if (spotifySourceVolume) {
+  let spotifySourceVolumeCommitTimer = null;
+  const commitSpotifySourceVolume = async () => {
+    if (spotifySourceVolumeCommitTimer) {
+      clearTimeout(spotifySourceVolumeCommitTimer);
+      spotifySourceVolumeCommitTimer = null;
+    }
+    const channel = getActiveChannel();
+    if (!isSpotifyChannel(channel)) return;
+    const value = normalizePercent(spotifySourceVolume.value, 75);
+    setVolumePercentLabel(spotifySourceVolumeValue, value);
+    const ok = await playerAction('/api/spotify/player/volume', { percent: value });
+    if (ok && playerStatus?.device) {
+      playerStatus.device.volume_percent = value;
+    }
+  };
+  spotifySourceVolume.addEventListener('input', () => {
+    setRangeProgress(spotifySourceVolume, spotifySourceVolume.value, spotifySourceVolume.max || 100);
+    setVolumePercentLabel(spotifySourceVolumeValue, spotifySourceVolume.value);
+    if (spotifySourceVolumeCommitTimer) clearTimeout(spotifySourceVolumeCommitTimer);
+    spotifySourceVolumeCommitTimer = setTimeout(commitSpotifySourceVolume, 200);
+  });
+  spotifySourceVolume.addEventListener('change', commitSpotifySourceVolume);
+  spotifySourceVolume.addEventListener('keydown', handleVolumeKey);
+}
+syncPlayerVolumePopover(playerStatus);
 document.addEventListener('click', evt => {
   if (playerVolumeInline && !playerVolumeInline.contains(evt.target)) {
     setVolumeSliderOpen(false);

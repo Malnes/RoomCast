@@ -1,6 +1,54 @@
 let fetchNodesInFlight = false;
 const FETCH_NODES_TIMEOUT_MS = 8000;
 
+function normalizeSpotifySourceIdForUi(sourceId) {
+  const value = String(sourceId || '').trim().toLowerCase();
+  if (!value.startsWith('spotify:')) return '';
+  return value;
+}
+
+function rememberSpotifyPlayerUiConfig(sourceId, cfg = {}) {
+  const normalized = normalizeSpotifySourceIdForUi(sourceId);
+  if (!normalized) return;
+  spotifyPlayerUiConfigBySource.set(normalized, {
+    show_output_volume_slider: cfg?.show_output_volume_slider !== false,
+  });
+}
+
+function spotifyShowOutputVolumeSlider(sourceId) {
+  const normalized = normalizeSpotifySourceIdForUi(sourceId);
+  if (!normalized) return true;
+  const cfg = spotifyPlayerUiConfigBySource.get(normalized);
+  if (!cfg || typeof cfg.show_output_volume_slider !== 'boolean') return true;
+  return cfg.show_output_volume_slider;
+}
+
+async function ensureSpotifyPlayerUiConfig(sourceId) {
+  const normalized = normalizeSpotifySourceIdForUi(sourceId);
+  if (!normalized) return null;
+  if (spotifyPlayerUiConfigBySource.has(normalized)) {
+    return spotifyPlayerUiConfigBySource.get(normalized);
+  }
+  if (spotifyPlayerUiConfigFetchBySource.has(normalized)) {
+    return spotifyPlayerUiConfigFetchBySource.get(normalized);
+  }
+  const task = (async () => {
+    try {
+      const res = await fetch(`/api/config/spotify?source_id=${encodeURIComponent(normalized)}`);
+      if (!res.ok) return null;
+      const cfg = await res.json();
+      rememberSpotifyPlayerUiConfig(normalized, cfg);
+      return spotifyPlayerUiConfigBySource.get(normalized) || null;
+    } catch (_) {
+      return null;
+    } finally {
+      spotifyPlayerUiConfigFetchBySource.delete(normalized);
+    }
+  })();
+  spotifyPlayerUiConfigFetchBySource.set(normalized, task);
+  return task;
+}
+
 async function fetchNodes(options = {}) {
   if (!isAuthenticated()) return;
   if (fetchNodesInFlight) return;
@@ -52,6 +100,7 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
     if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.textContent = 'Sign in to Spotify';
     if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.classList.remove('danger-btn');
     if (spotifyAccountInfo) spotifyAccountInfo.style.display = 'none';
+    if (spShowOutputVolume) spShowOutputVolume.checked = true;
     return;
   }
   try {
@@ -66,6 +115,7 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
       if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.textContent = 'Sign in to Spotify';
       if (spotifyLinkWizardOpenBtn) spotifyLinkWizardOpenBtn.classList.remove('danger-btn');
       if (spotifyAccountInfo) spotifyAccountInfo.style.display = 'none';
+      if (spShowOutputVolume) spShowOutputVolume.checked = true;
       return;
     }
     await ensureOk(res);
@@ -75,6 +125,13 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
     spInitVol.value = cfg.initial_volume ?? 75;
     setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100);
     spNormalise.checked = cfg.normalisation ?? true;
+    if (spShowOutputVolume) {
+      spShowOutputVolume.checked = cfg.show_output_volume_slider !== false;
+    }
+    rememberSpotifyPlayerUiConfig(cfg.source_id || targetSourceId, cfg);
+    if (typeof syncPlayerVolumePopover === 'function') {
+      syncPlayerVolumePopover(playerStatus);
+    }
     spotifyAuthLinked = !!cfg.has_oauth_token;
     if (spotifyLinkWizardOpenBtn) {
       spotifyLinkWizardOpenBtn.textContent = spotifyAuthLinked ? 'Sign out' : 'Sign in to Spotify';
@@ -2029,4 +2086,3 @@ function buildPlayerResumePayload() {
   if (trackUri) return { uris: [trackUri] };
   return null;
 }
-

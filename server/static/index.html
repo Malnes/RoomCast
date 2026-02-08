@@ -119,7 +119,18 @@
         <div class="player-volume-inline" id="player-volume-inline">
           <button class="player-volume-toggle player-icon-btn" id="player-volume-toggle" type="button" aria-label="Adjust master volume" aria-expanded="false"></button>
           <div class="player-volume-slider" aria-hidden="true">
-            <input type="range" id="master-volume" class="range-vertical" min="0" max="100" value="75" aria-label="Master volume">
+            <div class="player-volume-controls">
+              <label class="player-volume-control" id="player-spotify-volume-control" hidden>
+                <span class="player-volume-control-title">Spotify</span>
+                <input type="range" id="spotify-source-volume" class="range-vertical" min="0" max="100" value="75" aria-label="Spotify source volume">
+                <span class="player-volume-control-value" id="spotify-source-volume-value">75%</span>
+              </label>
+              <label class="player-volume-control" id="player-master-volume-control">
+                <span class="player-volume-control-title">RoomCast</span>
+                <input type="range" id="master-volume" class="range-vertical" min="0" max="100" value="75" aria-label="RoomCast output volume">
+                <span class="player-volume-control-value" id="master-volume-value">75%</span>
+              </label>
+            </div>
           </div>
         </div>
       </div>
@@ -470,6 +481,10 @@
               <div style="display:flex; align-items:center; gap:6px;">
                 <label style="margin:0;">Volume normalisation</label>
                 <input id="sp-normalise" type="checkbox" style="width:auto;">
+              </div>
+              <div style="display:flex; align-items:center; gap:6px;">
+                <label style="margin:0;">Show RoomCast output slider in player</label>
+                <input id="sp-show-output-volume" type="checkbox" style="width:auto;" checked>
               </div>
             </div>
             <div class="spotify-actions">

@@ -30,6 +30,7 @@ class SpotifyConfig(BaseModel):
     bitrate: int = Field(default=320, ge=96, le=320)
     initial_volume: int = Field(default=75, ge=0, le=100)
     normalisation: bool = Field(default=True)
+    show_output_volume_slider: bool = Field(default=True)
 
 
 class SpotifyBrokerCallback(BaseModel):

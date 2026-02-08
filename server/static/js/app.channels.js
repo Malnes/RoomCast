@@ -511,8 +511,14 @@ function setVolumeSliderOpen(open) {
   playerVolumeToggle.setAttribute('aria-expanded', next ? 'true' : 'false');
   const slider = playerVolumeInline.querySelector('.player-volume-slider');
   if (slider) slider.setAttribute('aria-hidden', next ? 'false' : 'true');
-  if (next && masterVolume) {
-    setTimeout(() => masterVolume.focus({ preventScroll: true }), 0);
+  if (next) {
+    const visibleControlInput = playerVolumeInline.querySelector(
+      '.player-volume-control:not([hidden]) input[type="range"]',
+    );
+    const focusTarget = visibleControlInput || masterVolume;
+    if (focusTarget) {
+      setTimeout(() => focusTarget.focus({ preventScroll: true }), 0);
+    }
   }
 }
 
@@ -580,4 +586,3 @@ function ensurePlaylistsLoaded(options = {}) {
   }
   fetchPlaylists();
 }
-
