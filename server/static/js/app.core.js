@@ -366,12 +366,23 @@ const userStatusEl = document.getElementById('user-status');
 const currentUserNameEl = document.getElementById('current-user-name');
 const currentUserRoleEl = document.getElementById('current-user-role');
 const logoutButton = document.getElementById('logout-button');
+const usersToolbarEl = document.getElementById('users-toolbar');
+const usersAddBtn = document.getElementById('users-add-btn');
+const usersPanelLockEl = document.getElementById('users-panel-lock');
 const usersListEl = document.getElementById('users-list');
-const addUserForm = document.getElementById('add-user-form');
-const newUserUsername = document.getElementById('new-user-username');
-const newUserPassword = document.getElementById('new-user-password');
-const newUserRole = document.getElementById('new-user-role');
-const usersPanelNote = document.getElementById('users-panel-note');
+const userModalOverlay = document.getElementById('user-modal-overlay');
+const userModalTitle = document.getElementById('user-modal-title');
+const userModalCloseBtn = document.getElementById('user-modal-close');
+const userModalForm = document.getElementById('user-modal-form');
+const userModalUsernameInput = document.getElementById('user-modal-username');
+const userModalRoleInput = document.getElementById('user-modal-role');
+const userModalPasswordLabel = document.getElementById('user-modal-password-label');
+const userModalPasswordInput = document.getElementById('user-modal-password');
+const userModalPasswordHelp = document.getElementById('user-modal-password-help');
+const userModalDeleteNote = document.getElementById('user-modal-delete-note');
+const userModalDeleteBtn = document.getElementById('user-modal-delete');
+const userModalCancelBtn = document.getElementById('user-modal-cancel');
+const userModalSaveBtn = document.getElementById('user-modal-save');
 let authState = { initialized: false, authenticated: false, server_name: 'RoomCast', user: null };
 let appBootstrapped = false;
 let nodePollTimer = null;
@@ -604,6 +615,13 @@ async function startPrivateBrowserNodeSession({ silent = false } = {}) {
       const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
       privateBrowserNodeState.pc = pc;
       pc.ontrack = (event) => {
+        try {
+          if (event.receiver && typeof event.receiver.playoutDelayHint === 'number') {
+            event.receiver.playoutDelayHint = 0.2;
+          }
+        } catch (_) {
+          /* no-op */
+        }
         const [stream] = event.streams;
         if (stream) {
           audio.srcObject = stream;
@@ -2695,4 +2713,3 @@ async function handleChannelsCountChange() {
     channelsCountSelect.disabled = !isAdminUser();
   }
 }
-

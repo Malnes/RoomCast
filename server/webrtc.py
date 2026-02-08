@@ -14,7 +14,7 @@ from aiortc.mediastreams import MediaStreamTrack
 
 log = logging.getLogger("roomcast.webrtc")
 
-AudioChunk = Optional[tuple[bytes, int]]
+AudioChunk = Optional[bytes]
 
 BYTES_PER_SAMPLE = 2
 CHANNELS = 2
@@ -116,7 +116,6 @@ class AudioBroadcaster:
         self._lock = asyncio.Lock()
         self._stats = BroadcastStats()
         self._last_channel_log = 0.0
-        self._sample_cursor = 0
 
     async def subscribe(self) -> asyncio.Queue[AudioChunk]:
         queue: asyncio.Queue[AudioChunk] = asyncio.Queue(maxsize=50)
@@ -133,10 +132,6 @@ class AudioBroadcaster:
     async def publish(self, chunk: bytes) -> None:
         if not chunk:
             return
-        sample_count = len(chunk) // SAMPLE_WIDTH
-        pts = self._sample_cursor
-        self._sample_cursor += sample_count
-        payload = (chunk, pts)
         self._stats.total_chunks += 1
         self._stats.total_bytes += len(chunk)
         self._stats.last_chunk_at = time.time()
@@ -157,12 +152,20 @@ class AudioBroadcaster:
         latest_depth = 0
         for queue in list(self._subscribers):
             try:
-                queue.put_nowait(payload)
+                queue.put_nowait(chunk)
                 latest_depth = max(latest_depth, queue.qsize())
             except asyncio.QueueFull:
                 self._stats.queue_overflows += 1
-                # Preserve continuity by dropping the newest chunk instead of skipping ahead.
-                continue
+                # Keep playback close to real-time: drop one stale frame and enqueue the latest.
+                try:
+                    queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    queue.put_nowait(chunk)
+                    latest_depth = max(latest_depth, queue.qsize())
+                except asyncio.QueueFull:
+                    continue
         if latest_depth:
             self._stats.last_queue_depth = latest_depth
             self._stats.max_queue_depth = max(self._stats.max_queue_depth, latest_depth)
@@ -426,7 +429,6 @@ class WebAudioTrack(MediaStreamTrack):
         self._sample_rate = max(8000, min(192000, int(sample_rate)))
         self._channel_id = channel_id
         self._silence_frame_bytes = _frame_bytes(self._sample_rate)
-        self._silence_samples = _frame_samples(self._sample_rate)
         self._silence_chunk = bytes(self._silence_frame_bytes)
         self.set_stereo_mode(stereo_mode)
 
@@ -469,30 +471,22 @@ class WebAudioTrack(MediaStreamTrack):
             except RuntimeError:
                 await asyncio.sleep(FRAME_DURATION_MS / 1000.0)
                 continue
-            try:
-                chunk = await asyncio.wait_for(
-                    queue.get(),
-                    timeout=FRAME_DURATION_MS / 1000.0,
-                )
-            except asyncio.TimeoutError:
-                return self._build_frame(self._silence_chunk)
+            chunk = await queue.get()
             if chunk is None:
                 # Channel switched; resubscribe to the new source.
                 self._queue = None
                 continue
-            payload, pts = chunk
-            payload = self._apply_stereo_mode(payload)
-            payload = self._apply_pan(payload)
-            return self._build_frame(payload, pts)
+            chunk = self._apply_stereo_mode(chunk)
+            chunk = self._apply_pan(chunk)
+            return self._build_frame(chunk)
 
-    def _build_frame(self, chunk: bytes, pts: Optional[int] = None) -> av.AudioFrame:
+    def _build_frame(self, chunk: bytes) -> av.AudioFrame:
         samples = len(chunk) // SAMPLE_WIDTH
         frame = av.AudioFrame(format="s16", layout="stereo", samples=samples)
         frame.planes[0].update(chunk)
         frame.sample_rate = self._sample_rate
         frame.time_base = Fraction(1, self._sample_rate)
-        if pts is None:
-            pts = self._samples_sent
+        pts = self._samples_sent
         frame.pts = pts
         self._samples_sent = pts + samples
         return frame

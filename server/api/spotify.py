@@ -134,6 +134,64 @@ def create_spotify_router(
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
         return {"ok": True}
 
+    def _error_detail_text(detail: Any) -> str:
+        if detail is None:
+            return ""
+        if isinstance(detail, str):
+            return detail
+        if isinstance(detail, (dict, list)):
+            try:
+                return json.dumps(detail)
+            except Exception:
+                return str(detail)
+        return str(detail)
+
+    def _is_recoverable_player_error(exc: HTTPException) -> bool:
+        if exc.status_code not in {403, 404}:
+            return False
+        detail = _error_detail_text(exc.detail).lower()
+        if exc.status_code == 404:
+            return "no active device" in detail
+        if "restricted" in detail or "restriction" in detail:
+            return True
+        return '"reason"' in detail and '"unknown"' in detail
+
+    async def _transfer_playback_to_roomcast(resolved_channel_id: str) -> str:
+        token = ensure_spotify_token(resolved_channel_id)
+        device = await find_roomcast_device(token, resolved_channel_id)
+        if not device or not device.get("id"):
+            raise HTTPException(status_code=404, detail="RoomCast device is not available")
+        transfer_body = {"device_ids": [device["id"]], "play": False}
+        resp = await spotify_request("PUT", "/me/player", token, resolved_channel_id, json=transfer_body)
+        if resp.status_code >= 400:
+            raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        return str(device["id"])
+
+    async def _spotify_player_control_with_recovery(
+        path: str,
+        method: str,
+        *,
+        channel_id: str,
+        body: Optional[dict] = None,
+        params: Optional[dict] = None,
+        settle_delay: float = 0.6,
+    ) -> dict:
+        try:
+            return await _spotify_control(path, method, body=body, params=params, channel_id=channel_id)
+        except HTTPException as exc:
+            if not _is_recoverable_player_error(exc):
+                raise
+        roomcast_device_id = await _transfer_playback_to_roomcast(channel_id)
+        retry_params = dict(params or {})
+        retry_params["device_id"] = roomcast_device_id
+        try:
+            return await _spotify_control(path, method, body=body, params=retry_params, channel_id=channel_id)
+        except HTTPException as exc:
+            if settle_delay <= 0 or not _is_recoverable_player_error(exc):
+                raise
+        await asyncio.sleep(settle_delay)
+        return await _spotify_control(path, method, body=body, params=retry_params, channel_id=channel_id)
+
     @router.get("/api/librespot/status")
     async def librespot_status(
         channel_id: Optional[str] = Query(default=None),
@@ -532,31 +590,13 @@ def create_spotify_router(
         resolved = resolve_channel_id(channel_id)
         params = {"device_id": device_id} if device_id else None
         body = payload or None
-        try:
-            return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
-        except HTTPException as exc:
-            detail = str(exc.detail or "")
-            if exc.status_code not in {403, 404}:
-                raise
-            if "restricted" not in detail.lower() and "no active device" not in detail.lower():
-                raise
-            token = ensure_spotify_token(resolved)
-            device = await find_roomcast_device(token, resolved)
-            if not device or not device.get("id"):
-                raise HTTPException(status_code=404, detail="RoomCast device is not available")
-            transfer_body = {"device_ids": [device["id"]], "play": False}
-            resp = await spotify_request("PUT", "/me/player", token, resolved, json=transfer_body)
-            if resp.status_code >= 400:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            params = {"device_id": device["id"]}
-            try:
-                return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
-            except HTTPException as exc2:
-                detail2 = str(exc2.detail or "")
-                if exc2.status_code != 403 or "restricted" not in detail2.lower():
-                    raise
-            await asyncio.sleep(0.6)
-            return await _spotify_control("/me/player/play", "PUT", body=body, params=params, channel_id=resolved)
+        return await _spotify_player_control_with_recovery(
+            "/me/player/play",
+            "PUT",
+            body=body,
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.post("/api/spotify/player/pause")
     async def spotify_pause(
@@ -565,7 +605,13 @@ def create_spotify_router(
         _: None = Depends(require_spotify_provider_dep),
     ) -> dict:
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_control("/me/player/pause", "PUT", params={"device_id": device_id}, channel_id=resolved)
+        params = {"device_id": device_id} if device_id else None
+        return await _spotify_player_control_with_recovery(
+            "/me/player/pause",
+            "PUT",
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.post("/api/spotify/player/next")
     async def spotify_next(
@@ -574,7 +620,13 @@ def create_spotify_router(
         _: None = Depends(require_spotify_provider_dep),
     ) -> dict:
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_control("/me/player/next", "POST", params={"device_id": device_id}, channel_id=resolved)
+        params = {"device_id": device_id} if device_id else None
+        return await _spotify_player_control_with_recovery(
+            "/me/player/next",
+            "POST",
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.post("/api/spotify/player/previous")
     async def spotify_prev(
@@ -583,7 +635,13 @@ def create_spotify_router(
         _: None = Depends(require_spotify_provider_dep),
     ) -> dict:
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_control("/me/player/previous", "POST", params={"device_id": device_id}, channel_id=resolved)
+        params = {"device_id": device_id} if device_id else None
+        return await _spotify_player_control_with_recovery(
+            "/me/player/previous",
+            "POST",
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.post("/api/spotify/player/seek")
     async def spotify_seek(
@@ -597,7 +655,12 @@ def create_spotify_router(
             raise HTTPException(status_code=400, detail="position_ms required")
         params = {"position_ms": int(pos), "device_id": device_id}
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_control("/me/player/seek", "PUT", params=params, channel_id=resolved)
+        return await _spotify_player_control_with_recovery(
+            "/me/player/seek",
+            "PUT",
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.post("/api/spotify/player/volume")
     async def spotify_volume(
@@ -608,7 +671,12 @@ def create_spotify_router(
     ) -> dict:
         params = {"volume_percent": payload.percent, "device_id": device_id}
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_control("/me/player/volume", "PUT", params=params, channel_id=resolved)
+        return await _spotify_player_control_with_recovery(
+            "/me/player/volume",
+            "PUT",
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.post("/api/spotify/player/shuffle")
     async def spotify_shuffle(
@@ -619,7 +687,12 @@ def create_spotify_router(
         state = "true" if payload.state else "false"
         params = {"state": state, "device_id": payload.device_id}
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_control("/me/player/shuffle", "PUT", params=params, channel_id=resolved)
+        return await _spotify_player_control_with_recovery(
+            "/me/player/shuffle",
+            "PUT",
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.post("/api/spotify/player/repeat")
     async def spotify_repeat(
@@ -630,7 +703,12 @@ def create_spotify_router(
         mode = payload.mode.lower()
         params = {"state": mode, "device_id": payload.device_id}
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_control("/me/player/repeat", "PUT", params=params, channel_id=resolved)
+        return await _spotify_player_control_with_recovery(
+            "/me/player/repeat",
+            "PUT",
+            params=params,
+            channel_id=resolved,
+        )
 
     @router.api_route("/stream/spotify", methods=["GET"])
     async def proxy_spotify_stream(

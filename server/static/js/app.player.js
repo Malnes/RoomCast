@@ -374,6 +374,35 @@ const PLAYER_SEEK_TOLERANCE_MS = 750;
 let playerPlayHoldTimer = null;
 let playerPlayHoldTriggered = false;
 let optimisticSeekState = null;
+let spotifyPlayToggleInFlight = false;
+let spotifyPlayToggleQueued = false;
+let localBrowserPauseState = null;
+
+function privateBrowserAudioElement() {
+  if (typeof privateBrowserNodeState === 'undefined') return null;
+  const audio = privateBrowserNodeState?.audio;
+  if (!audio || typeof audio.pause !== 'function') return null;
+  return audio;
+}
+
+function applyLocalBrowserPause(paused) {
+  const audio = privateBrowserAudioElement();
+  if (!audio) return;
+  if (paused) {
+    if (!localBrowserPauseState) {
+      localBrowserPauseState = { wasMuted: !!audio.muted };
+    }
+    audio.muted = true;
+    try { audio.pause(); } catch (_) {}
+    return;
+  }
+  const state = localBrowserPauseState;
+  localBrowserPauseState = null;
+  if (state) {
+    audio.muted = !!state.wasMuted;
+  }
+  audio.play().catch(() => {});
+}
 
 function cancelPlayerHoldToStop(options = {}) {
   if (playerPlayHoldTimer) {
@@ -866,7 +895,7 @@ async function playerAction(path, body, options = {}) {
   const channelId = getActiveChannelId();
   if (!channelId) {
     showError('Select a channel before controlling playback.');
-    return;
+    return false;
   }
   const allowRoomcastFallback = options.roomcastFallback !== false;
   let attemptedRoomcastActivation = false;
@@ -880,7 +909,7 @@ async function playerAction(path, body, options = {}) {
       });
       if (res.ok) {
         setTimeout(fetchPlayerStatus, 500);
-        return;
+        return true;
       }
       const detail = await readResponseDetail(res);
       const normalizedDetail = (detail || '').toLowerCase();
@@ -902,8 +931,53 @@ async function playerAction(path, body, options = {}) {
     } catch (err) {
       showError(`Player action failed: ${err.message}`);
       reportSpotifyError(err);
-      return;
+      return false;
     }
+  }
+}
+
+async function handleSpotifyPlayToggle() {
+  if (spotifyPlayToggleInFlight) {
+    spotifyPlayToggleQueued = true;
+    return;
+  }
+  spotifyPlayToggleInFlight = true;
+  try {
+    do {
+      spotifyPlayToggleQueued = false;
+      const shouldPause = !!playerStatus?.is_playing;
+      let ok = false;
+      if (shouldPause) {
+        // Make pause feel instant on the local browser node while Spotify pause propagates.
+        applyLocalBrowserPause(true);
+        if (playerStatus && typeof playerStatus === 'object') {
+          playerStatus.is_playing = false;
+          renderPlayer(playerStatus);
+        }
+        ok = await playerAction('/api/spotify/player/pause');
+        if (!ok) {
+          applyLocalBrowserPause(false);
+          if (playerStatus && typeof playerStatus === 'object') {
+            playerStatus.is_playing = true;
+            renderPlayer(playerStatus);
+          }
+        }
+      } else {
+        const resumePayload = playerStatus?.allowResume ? buildPlayerResumePayload() : null;
+        await prepareRoomcastDeviceForResume(resumePayload);
+        applyLocalBrowserPause(false);
+        ok = await playerAction('/api/spotify/player/play', resumePayload || undefined);
+      }
+      if (!ok) {
+        spotifyPlayToggleQueued = false;
+        break;
+      }
+      if (playerStatus && typeof playerStatus === 'object') {
+        playerStatus.is_playing = !shouldPause;
+      }
+    } while (spotifyPlayToggleQueued);
+  } finally {
+    spotifyPlayToggleInFlight = false;
   }
 }
 
@@ -1091,153 +1165,393 @@ async function fetchUsersList(force = false) {
   }
 }
 
+let userModalMode = 'add';
+let userModalUserId = null;
+let userModalBusy = false;
+
+function getCachedUserById(userId) {
+  if (!userId) return null;
+  return usersCache.find(user => user?.id === userId) || null;
+}
+
+function adminUserCount() {
+  return usersCache.filter(user => (user?.role || 'member') === 'admin').length;
+}
+
+function isLastAdminUser(user) {
+  if (!user || (user.role || 'member') !== 'admin') return false;
+  return adminUserCount() <= 1;
+}
+
+function setUserModalBusy(busy) {
+  userModalBusy = !!busy;
+  if (userModalUsernameInput) userModalUsernameInput.disabled = userModalBusy;
+  if (userModalRoleInput) userModalRoleInput.disabled = userModalBusy;
+  if (userModalPasswordInput) userModalPasswordInput.disabled = userModalBusy;
+  if (userModalSaveBtn) userModalSaveBtn.disabled = userModalBusy;
+  if (userModalCancelBtn) userModalCancelBtn.disabled = userModalBusy;
+  if (userModalCloseBtn) userModalCloseBtn.disabled = userModalBusy;
+  const current = getCachedUserById(userModalUserId);
+  if (userModalDeleteBtn) {
+    userModalDeleteBtn.disabled = userModalBusy || (userModalMode === 'edit' ? isLastAdminUser(current) : true);
+  }
+}
+
+function setUserModalOpen(open) {
+  if (!userModalOverlay) return;
+  const visible = !!open;
+  userModalOverlay.style.display = visible ? 'flex' : 'none';
+  userModalOverlay.hidden = !visible;
+  userModalOverlay.setAttribute('aria-hidden', visible ? 'false' : 'true');
+}
+
+function syncUserModalDeleteState(user) {
+  if (!userModalDeleteBtn) return;
+  if (userModalMode !== 'edit' || !user) {
+    userModalDeleteBtn.hidden = true;
+    userModalDeleteBtn.disabled = true;
+    if (userModalDeleteNote) {
+      userModalDeleteNote.hidden = true;
+      userModalDeleteNote.textContent = '';
+    }
+    return;
+  }
+  const blocked = isLastAdminUser(user);
+  userModalDeleteBtn.hidden = false;
+  userModalDeleteBtn.disabled = userModalBusy || blocked;
+  if (userModalDeleteNote) {
+    userModalDeleteNote.hidden = !blocked;
+    userModalDeleteNote.textContent = blocked ? 'Last admin cannot be deleted.' : '';
+  }
+}
+
+function closeUserModal(options = {}) {
+  const force = options.force === true;
+  if (!force && userModalBusy) return;
+  userModalMode = 'add';
+  userModalUserId = null;
+  setUserModalBusy(false);
+  if (userModalForm) userModalForm.reset();
+  if (userModalDeleteBtn) {
+    userModalDeleteBtn.hidden = true;
+    userModalDeleteBtn.disabled = true;
+  }
+  if (userModalDeleteNote) {
+    userModalDeleteNote.hidden = true;
+    userModalDeleteNote.textContent = '';
+  }
+  setUserModalOpen(false);
+  document.removeEventListener('keydown', handleUserModalKeydown, true);
+}
+
+function openUserModal(mode, userId = null) {
+  if (!isAdminUser()) {
+    showError('Only admins can manage users.');
+    return;
+  }
+  userModalMode = mode === 'edit' ? 'edit' : 'add';
+  userModalUserId = userModalMode === 'edit' ? userId : null;
+  const user = userModalMode === 'edit' ? getCachedUserById(userId) : null;
+  if (userModalMode === 'edit' && !user) {
+    showError('User no longer exists.');
+    return;
+  }
+  setUserModalBusy(false);
+
+  if (userModalRoleInput) {
+    Array.from(userModalRoleInput.options || []).forEach(option => {
+      option.disabled = false;
+    });
+  }
+
+  if (userModalMode === 'add') {
+    if (userModalTitle) userModalTitle.textContent = 'Add user';
+    if (userModalSaveBtn) userModalSaveBtn.textContent = 'Create user';
+    if (userModalUsernameInput) userModalUsernameInput.value = '';
+    if (userModalRoleInput) userModalRoleInput.value = 'member';
+    if (userModalPasswordLabel) userModalPasswordLabel.textContent = 'Password';
+    if (userModalPasswordInput) {
+      userModalPasswordInput.value = '';
+      userModalPasswordInput.required = true;
+      userModalPasswordInput.placeholder = 'Enter a password';
+    }
+    if (userModalPasswordHelp) {
+      userModalPasswordHelp.textContent = 'Required. Minimum 4 characters.';
+    }
+    syncUserModalDeleteState(null);
+  } else if (user) {
+    if (userModalTitle) userModalTitle.textContent = `Edit user: ${user.username || 'User'}`;
+    if (userModalSaveBtn) userModalSaveBtn.textContent = 'Save changes';
+    if (userModalUsernameInput) userModalUsernameInput.value = user.username || '';
+    if (userModalRoleInput) userModalRoleInput.value = user.role || 'member';
+    if (userModalPasswordLabel) userModalPasswordLabel.textContent = 'New password';
+    if (userModalPasswordInput) {
+      userModalPasswordInput.value = '';
+      userModalPasswordInput.required = false;
+      userModalPasswordInput.placeholder = 'Leave blank to keep current';
+    }
+    if (userModalPasswordHelp) {
+      userModalPasswordHelp.textContent = 'Leave blank to keep the current password.';
+    }
+    if (userModalRoleInput && isLastAdminUser(user)) {
+      const memberOption = Array.from(userModalRoleInput.options || [])
+        .find(option => option?.value === 'member');
+      if (memberOption) memberOption.disabled = true;
+      userModalRoleInput.value = 'admin';
+    }
+    syncUserModalDeleteState(user);
+  }
+
+  setUserModalOpen(true);
+  setTimeout(() => userModalUsernameInput?.focus({ preventScroll: true }), 40);
+  document.addEventListener('keydown', handleUserModalKeydown, true);
+}
+
+function handleUserModalKeydown(event) {
+  if (event.key !== 'Escape') return;
+  if (!userModalOverlay || userModalOverlay.hidden) return;
+  event.preventDefault();
+  closeUserModal();
+}
+
+async function handleUserModalSubmit(event) {
+  event.preventDefault();
+  if (userModalBusy) return;
+  if (!isAdminUser()) {
+    showError('Only admins can manage users.');
+    return;
+  }
+  const username = (userModalUsernameInput?.value || '').trim();
+  const role = userModalRoleInput?.value || 'member';
+  const password = userModalPasswordInput?.value || '';
+  if (!username) {
+    showError('Username is required.');
+    return;
+  }
+
+  if (userModalMode === 'add') {
+    if (!password) {
+      showError('Password is required for new users.');
+      return;
+    }
+    try {
+      setUserModalBusy(true);
+      const res = await fetch('/api/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password, role }),
+      });
+      await ensureOk(res);
+      usersLoaded = false;
+      closeUserModal({ force: true });
+      showSuccess('User created.');
+      await fetchUsersList(true);
+    } catch (err) {
+      showError(`Failed to create user: ${err.message}`);
+    } finally {
+      setUserModalBusy(false);
+    }
+    return;
+  }
+
+  const existing = getCachedUserById(userModalUserId);
+  if (!existing) {
+    showError('User no longer exists.');
+    closeUserModal();
+    return;
+  }
+  const payload = {};
+  if (username !== (existing.username || '')) payload.username = username;
+  if (role !== (existing.role || 'member')) payload.role = role;
+  if (password) payload.password = password;
+
+  if (!Object.keys(payload).length) {
+    showSuccess('Nothing to update.');
+    closeUserModal();
+    return;
+  }
+
+  try {
+    setUserModalBusy(true);
+    const res = await fetch(`/api/users/${encodeURIComponent(existing.id)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    await ensureOk(res);
+    const data = await res.json();
+    const updated = data?.user;
+    if (updated) {
+      usersCache = usersCache.map(user => (user.id === updated.id ? updated : user));
+      if (authState?.user?.id === updated.id) {
+        authState.user = updated;
+        updateUserStatusUI();
+      }
+    }
+    usersLoaded = false;
+    closeUserModal({ force: true });
+    showSuccess('User updated.');
+    await fetchUsersList(true);
+  } catch (err) {
+    showError(`Failed to update user: ${err.message}`);
+  } finally {
+    setUserModalBusy(false);
+  }
+}
+
+async function handleUserModalDelete() {
+  if (userModalBusy || userModalMode !== 'edit') return;
+  const existing = getCachedUserById(userModalUserId);
+  if (!existing) {
+    showError('User no longer exists.');
+    closeUserModal();
+    return;
+  }
+  if (isLastAdminUser(existing)) {
+    showError('Cannot remove the last admin.');
+    return;
+  }
+  const confirmed = await openConfirmDialog({
+    title: 'Delete user?',
+    message: `Remove "${existing.username}" from RoomCast?`,
+    confirmLabel: 'Delete user',
+    cancelLabel: 'Cancel',
+    tone: 'danger',
+  });
+  if (!confirmed) return;
+
+  try {
+    setUserModalBusy(true);
+    const res = await fetch(`/api/users/${encodeURIComponent(existing.id)}`, { method: 'DELETE' });
+    await ensureOk(res);
+    const data = await res.json();
+    usersLoaded = false;
+    closeUserModal({ force: true });
+    showSuccess('User removed.');
+    if (data?.self_removed) {
+      stopDataPolling();
+      await refreshAuthState();
+      return;
+    }
+    await fetchUsersList(true);
+  } catch (err) {
+    showError(`Failed to delete user: ${err.message}`);
+  } finally {
+    setUserModalBusy(false);
+  }
+}
+
 function renderUsersList() {
   if (!usersListEl) return;
   const canManage = isAdminUser();
-  if (usersPanelNote) {
-    usersPanelNote.textContent = canManage
-      ? 'Admins can add members or other admins. Password changes are immediate.'
-      : 'Only admins can manage accounts.';
+  if (usersToolbarEl) usersToolbarEl.hidden = !canManage;
+  if (usersAddBtn) usersAddBtn.disabled = !canManage;
+  if (usersPanelLockEl) {
+    usersPanelLockEl.hidden = canManage;
   }
-  if (addUserForm) addUserForm.hidden = !canManage;
+
   if (!canManage) {
     usersListEl.innerHTML = '';
-    usersListEl.hidden = true;
+    usersListEl.hidden = false;
     return;
   }
+
   usersListEl.hidden = false;
   if (!usersCache.length) {
-    usersListEl.innerHTML = '<div class="muted">No additional users yet.</div>';
+    usersListEl.innerHTML = '<div class="muted">No users yet.</div>';
     return;
   }
+
   usersListEl.innerHTML = '';
-  usersCache.forEach(user => {
-    const form = document.createElement('form');
-    form.className = 'user-row';
-    form.dataset.userId = user.id;
+  usersCache
+    .slice()
+    .sort((a, b) => (a?.username || '').localeCompare(b?.username || '', undefined, { sensitivity: 'base' }))
+    .forEach(user => {
+      const row = document.createElement('div');
+      row.className = 'user-list-row';
+      row.dataset.userId = user.id;
 
-    const usernameWrap = document.createElement('div');
-    const usernameLabel = document.createElement('label');
-    usernameLabel.textContent = authState?.user?.id === user.id ? 'Username (you)' : 'Username';
-    const usernameInput = document.createElement('input');
-    usernameInput.value = user.username || '';
-    usernameInput.required = true;
-    usernameWrap.appendChild(usernameLabel);
-    usernameWrap.appendChild(usernameInput);
+      const meta = document.createElement('div');
+      meta.className = 'user-list-meta';
 
-    const roleWrap = document.createElement('div');
-    const roleLabel = document.createElement('label');
-    roleLabel.textContent = 'Role';
-    const roleSelect = document.createElement('select');
-    ['admin', 'member'].forEach(value => {
-      const option = document.createElement('option');
-      option.value = value;
-      option.textContent = value === 'admin' ? 'Admin' : 'Member';
-      roleSelect.appendChild(option);
-    });
-    roleSelect.value = user.role || 'member';
-    roleWrap.appendChild(roleLabel);
-    roleWrap.appendChild(roleSelect);
+      const name = document.createElement('div');
+      name.className = 'user-list-name';
+      name.textContent = user.username || 'User';
 
-    const passwordWrap = document.createElement('div');
-    const passwordLabel = document.createElement('label');
-    passwordLabel.textContent = 'New password';
-    const passwordInput = document.createElement('input');
-    passwordInput.type = 'password';
-    passwordInput.placeholder = 'Leave blank to keep current';
-    passwordInput.autocomplete = 'new-password';
-    passwordWrap.appendChild(passwordLabel);
-    passwordWrap.appendChild(passwordInput);
+      const sub = document.createElement('div');
+      sub.className = 'user-list-sub';
 
-    const actions = document.createElement('div');
-    actions.className = 'user-row-actions';
-    const saveBtn = document.createElement('button');
-    saveBtn.type = 'submit';
-    saveBtn.textContent = 'Save';
-    const deleteBtn = document.createElement('button');
-    deleteBtn.type = 'button';
-    deleteBtn.className = 'small-btn';
-    deleteBtn.textContent = 'Delete';
-    actions.appendChild(saveBtn);
-    actions.appendChild(deleteBtn);
+      const role = document.createElement('span');
+      role.className = 'role-pill';
+      role.textContent = (user.role || 'member') === 'admin' ? 'Admin' : 'Member';
+      sub.appendChild(role);
 
-    form.appendChild(usernameWrap);
-    form.appendChild(roleWrap);
-    form.appendChild(passwordWrap);
-    form.appendChild(actions);
-
-    form.addEventListener('submit', async evt => {
-      evt.preventDefault();
-      const payload = {};
-      const nextName = usernameInput.value.trim();
-      if (nextName && nextName !== user.username) payload.username = nextName;
-      if (roleSelect.value !== user.role) payload.role = roleSelect.value;
-      if (passwordInput.value) payload.password = passwordInput.value;
-      if (!Object.keys(payload).length) {
-        showSuccess('Nothing to update.');
-        passwordInput.value = '';
-        return;
+      if (authState?.user?.id === user.id) {
+        const me = document.createElement('span');
+        me.textContent = 'You';
+        sub.appendChild(me);
       }
-      try {
-        saveBtn.disabled = true;
-        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}`, {
-          method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(payload),
-        });
-        await ensureOk(res);
-        const data = await res.json();
-        const updated = data?.user;
-        if (updated) {
-          usersCache = usersCache.map(u => (u.id === updated.id ? updated : u));
-          if (authState?.user?.id === updated.id) {
-            authState.user = updated;
-            updateUserStatusUI();
-          }
-        }
-        showSuccess('User updated.');
-        fetchUsersList(true);
-      } catch (err) {
-        showError(`Failed to update user: ${err.message}`);
-      } finally {
-        saveBtn.disabled = false;
-        passwordInput.value = '';
-      }
-    });
 
-    deleteBtn.addEventListener('click', async () => {
-      const confirmed = window.confirm(`Remove user "${user.username}"?`);
-      if (!confirmed) return;
-      try {
-        deleteBtn.disabled = true;
-        const res = await fetch(`/api/users/${encodeURIComponent(user.id)}`, { method: 'DELETE' });
-        await ensureOk(res);
-        const data = await res.json();
-        usersCache = usersCache.filter(u => u.id !== user.id);
-        usersLoaded = false;
-        showSuccess('User removed.');
-        if (data?.self_removed) {
-          stopDataPolling();
-          await refreshAuthState();
-          return;
-        }
-        fetchUsersList(true);
-      } catch (err) {
-        showError(`Failed to delete user: ${err.message}`);
-      } finally {
-        deleteBtn.disabled = false;
+      if (isLastAdminUser(user)) {
+        const badge = document.createElement('span');
+        badge.textContent = 'Last admin';
+        sub.appendChild(badge);
       }
-    });
 
-    usersListEl.appendChild(form);
-  });
+      meta.appendChild(name);
+      meta.appendChild(sub);
+
+      const actions = document.createElement('div');
+      actions.className = 'user-list-actions';
+      const editBtn = document.createElement('button');
+      editBtn.type = 'button';
+      editBtn.className = 'small-btn';
+      editBtn.textContent = 'Edit';
+      editBtn.addEventListener('click', () => openUserModal('edit', user.id));
+      actions.appendChild(editBtn);
+
+      row.appendChild(meta);
+      row.appendChild(actions);
+      usersListEl.appendChild(row);
+    });
+}
+
+function bindUsersUiEvents() {
+  if (usersAddBtn) {
+    usersAddBtn.addEventListener('click', () => openUserModal('add'));
+  }
+  if (userModalCloseBtn) {
+    userModalCloseBtn.addEventListener('click', () => closeUserModal());
+  }
+  if (userModalCancelBtn) {
+    userModalCancelBtn.addEventListener('click', () => closeUserModal());
+  }
+  if (userModalOverlay) {
+    userModalOverlay.addEventListener('click', event => {
+      if (event.target === userModalOverlay) closeUserModal();
+    });
+  }
+  if (userModalForm) {
+    userModalForm.addEventListener('submit', handleUserModalSubmit);
+  }
+  if (userModalDeleteBtn) {
+    userModalDeleteBtn.addEventListener('click', handleUserModalDelete);
+  }
 }
 
 function resetUsersState() {
   usersCache = [];
   usersLoaded = false;
+  closeUserModal({ force: true });
   if (usersListEl) {
     usersListEl.innerHTML = '';
+    usersListEl.hidden = true;
+  }
+  if (usersToolbarEl) {
+    usersToolbarEl.hidden = true;
+  }
+  if (usersPanelLockEl) {
+    usersPanelLockEl.hidden = true;
   }
 }
 
@@ -2232,7 +2546,10 @@ async function openSettings() {
   fetchStatus();
   fetchUsersList();
 }
-function closeSettings() { settingsOverlay.style.display = 'none'; }
+function closeSettings() {
+  settingsOverlay.style.display = 'none';
+  closeUserModal({ force: true });
+}
 
 function isAddNodeOverlayOpen() {
   return !!addNodeOverlay && !addNodeOverlay.hidden && addNodeOverlay.style.display !== 'none';
@@ -2629,42 +2946,7 @@ if (onboardingForm) {
     }
   });
 }
-if (addUserForm) {
-  const submitBtn = addUserForm.querySelector('button[type="submit"]');
-  addUserForm.addEventListener('submit', async evt => {
-    evt.preventDefault();
-    if (!isAdminUser()) {
-      showError('Only admins can add users.');
-      return;
-    }
-    const username = newUserUsername?.value.trim();
-    const password = newUserPassword?.value || '';
-    const role = newUserRole?.value || 'member';
-    if (!username || !password) {
-      showError('Enter username and password for the new user.');
-      return;
-    }
-    try {
-      if (submitBtn) submitBtn.disabled = true;
-      const res = await fetch('/api/users', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password, role }),
-      });
-      await ensureOk(res);
-      newUserUsername.value = '';
-      newUserPassword.value = '';
-      newUserRole.value = 'member';
-      usersLoaded = false;
-      showSuccess('User created.');
-      fetchUsersList(true);
-    } catch (err) {
-      showError(`Failed to create user: ${err.message}`);
-    } finally {
-      if (submitBtn) submitBtn.disabled = false;
-    }
-  });
-}
+bindUsersUiEvents();
 if (playerVolumeInline) {
   playerVolumeInline.addEventListener('click', evt => evt.stopPropagation());
 }
@@ -2922,12 +3204,7 @@ playerPlay.addEventListener('click', async () => {
     handleAudiobookshelfPlayToggle(channel);
     return;
   }
-  if (playerStatus?.is_playing) playerAction('/api/spotify/player/pause');
-  else {
-    const resumePayload = playerStatus?.allowResume ? buildPlayerResumePayload() : null;
-    await prepareRoomcastDeviceForResume(resumePayload);
-    playerAction('/api/spotify/player/play', resumePayload || undefined);
-  }
+  await handleSpotifyPlayToggle();
 });
 playerNext.addEventListener('click', () => {
   if (playerNext.disabled) return;

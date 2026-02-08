@@ -553,16 +553,10 @@
         </button>
         <div class="collapsible-content" aria-hidden="true">
           <div id="users-panel">
-            <div class="muted" id="users-panel-note">Only admins can manage accounts.</div>
-            <form id="add-user-form" class="user-inline-form" autocomplete="off">
-              <input id="new-user-username" placeholder="Username" required>
-              <input id="new-user-password" type="password" placeholder="Password" required autocomplete="new-password">
-              <select id="new-user-role">
-                <option value="admin">Admin</option>
-                <option value="member">Member</option>
-              </select>
-              <button type="submit">Add user</button>
-            </form>
+            <div id="users-toolbar" class="users-toolbar">
+              <button id="users-add-btn" class="small-btn" type="button">Add user</button>
+            </div>
+            <div id="users-panel-lock" class="muted" hidden>Admin access required to manage users.</div>
             <div id="users-list" class="users-list"></div>
           </div>
         </div>
@@ -615,6 +609,41 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <div id="user-modal-overlay" class="settings-overlay" aria-hidden="true" hidden>
+    <div class="settings-card user-modal-card" role="dialog" aria-modal="true" aria-labelledby="user-modal-title">
+      <div class="settings-header">
+        <div class="section-title" id="user-modal-title" style="margin:0;">User</div>
+        <button id="user-modal-close" class="icon-btn" type="button" aria-label="Close user modal">✕</button>
+      </div>
+      <form id="user-modal-form" class="node-settings-content user-modal-form" autocomplete="off">
+        <div>
+          <label for="user-modal-username">Username</label>
+          <input id="user-modal-username" required autocomplete="off">
+        </div>
+        <div>
+          <label for="user-modal-role">Role</label>
+          <select id="user-modal-role">
+            <option value="admin">Admin</option>
+            <option value="member">Member</option>
+          </select>
+        </div>
+        <div>
+          <label id="user-modal-password-label" for="user-modal-password">Password</label>
+          <input id="user-modal-password" type="password" autocomplete="new-password">
+          <div id="user-modal-password-help" class="muted" style="font-size:12px; margin-top:6px;"></div>
+        </div>
+        <div id="user-modal-delete-note" class="muted" style="font-size:12px;" hidden></div>
+        <div class="user-modal-actions">
+          <button id="user-modal-delete" class="small-btn danger-btn" type="button">Delete user</button>
+          <div class="user-modal-actions-right">
+            <button id="user-modal-cancel" class="small-btn ghost-btn" type="button">Cancel</button>
+            <button id="user-modal-save" class="small-btn" type="submit">Save</button>
+          </div>
+        </div>
+      </form>
     </div>
   </div>
 
