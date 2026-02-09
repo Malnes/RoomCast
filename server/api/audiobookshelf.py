@@ -109,8 +109,18 @@ def create_audiobookshelf_router(
 
     async def _abs_list_libraries(base_url: str, token: str) -> list[dict]:
         data = await _abs_request("GET", f"{base_url}/api/libraries", token=token)
+        raw_items: list[Any] = []
+        if isinstance(data, list):
+            raw_items = data
+        elif isinstance(data, dict):
+            libraries = data.get("libraries")
+            results = data.get("results")
+            if isinstance(libraries, list):
+                raw_items = libraries
+            elif isinstance(results, list):
+                raw_items = results
         libs = []
-        for item in (data or []):
+        for item in raw_items:
             if not isinstance(item, dict):
                 continue
             libs.append(item)
@@ -137,6 +147,16 @@ def create_audiobookshelf_router(
                 return obj.get(key)
         return None
 
+    def _abs_join_url(base_url: str, raw: str) -> str:
+        value = (raw or "").strip()
+        if not value:
+            return ""
+        if value.startswith("http://") or value.startswith("https://"):
+            return value
+        if value.startswith("/"):
+            return f"{base_url}{value}"
+        return f"{base_url}/{value}"
+
     async def _abs_list_podcast_items(base_url: str, token: str, library_id: str) -> list[dict]:
         data = await _abs_request("GET", f"{base_url}/api/libraries/{library_id}/items", token=token)
         if isinstance(data, dict):
@@ -153,9 +173,38 @@ def create_audiobookshelf_router(
             if not library_item_id:
                 continue
             media = item.get("media") if isinstance(item.get("media"), dict) else {}
-            title = ((item.get("title") or item.get("name") or _abs_pick(media, "title") or "").strip())
-            author = (item.get("author") or _abs_pick(media, "author") or "").strip() or None
-            image = item.get("imagePath") or item.get("image") or item.get("cover") or None
+            metadata = media.get("metadata") if isinstance(media.get("metadata"), dict) else {}
+            title = (
+                (
+                    item.get("title")
+                    or item.get("name")
+                    or _abs_pick(media, "title", "name")
+                    or _abs_pick(metadata, "title", "name")
+                    or ""
+                ).strip()
+            )
+            author = (
+                (
+                    item.get("author")
+                    or _abs_pick(media, "author", "authorName")
+                    or _abs_pick(metadata, "author", "authorName", "publisher")
+                    or ""
+                ).strip()
+                or None
+            )
+            raw_image = (
+                item.get("imagePath")
+                or item.get("image")
+                or item.get("cover")
+                or _abs_pick(media, "imagePath", "coverPath", "image", "cover")
+                or _abs_pick(metadata, "imagePath", "coverPath", "image", "cover")
+                or None
+            )
+            image = None
+            if isinstance(raw_image, str) and raw_image.strip():
+                # Some ABS payloads return storage-relative paths (e.g. /podcasts/...),
+                # but the stable browser URL is /api/items/{id}/cover.
+                image = _abs_join_url(base_url, f"/api/items/{library_item_id}/cover?width=300")
             normalized.append({
                 "id": str(library_item_id),
                 "title": title or str(library_item_id),

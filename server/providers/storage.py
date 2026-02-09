@@ -27,7 +27,11 @@ def _normalize_provider_id(value: Any) -> Optional[str]:
     if not isinstance(value, str):
         return None
     raw = value.strip().lower()
-    return raw or None
+    if not raw:
+        return None
+    # Older builds sometimes persisted instance-style ids (e.g. "radio:1").
+    # Providers are now single logical entries keyed by base id.
+    return raw.split(":", 1)[0] or None
 
 
 def load_providers(path: Path) -> Dict[str, ProviderState]:
@@ -74,8 +78,8 @@ def infer_providers(
     """Infer providers for backwards compatibility.
 
     New installs (no channels/sources files) will infer none.
-    Existing installs will infer Spotify if sources exist, and Radio if any
-    channel is set to source=radio.
+    Existing installs will infer Spotify if sources exist, and infer Radio/
+    Audiobookshelf if any channel is set to those sources.
     """
 
     inferred: Dict[str, ProviderState] = {}
@@ -95,5 +99,9 @@ def infer_providers(
             data = []
         if isinstance(data, list) and any(isinstance(item, dict) and str(item.get("source") or "").lower() == "radio" for item in data):
             inferred["radio"] = ProviderState(id="radio", enabled=True, settings={})
+        if isinstance(data, list) and any(
+            isinstance(item, dict) and str(item.get("source") or "").lower() == "audiobookshelf" for item in data
+        ):
+            inferred["audiobookshelf"] = ProviderState(id="audiobookshelf", enabled=True, settings={})
 
     return inferred

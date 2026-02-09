@@ -927,6 +927,7 @@ let absPodcastsCache = [];
 let absEpisodesCache = [];
 let absSelectedPodcast = null;
 let absShowPlayed = false;
+let absEpisodeSortOrder = 'oldest';
 
 let playlistOverlayBase = null;
 
@@ -949,22 +950,19 @@ function setPlaylistOverlayMode(mode) {
   const titleEl = document.getElementById('playlist-modal-title');
 
   if (next === 'audiobookshelf') {
+    if (playlistSummaryEl) {
+      playlistSummaryEl.hidden = true;
+      playlistSummaryEl.textContent = '';
+    }
     if (titleEl) titleEl.textContent = 'Podcasts';
     if (playlistSearchInput) {
       playlistSearchInput.value = '';
       playlistSearchInput.setAttribute('placeholder', 'Search podcasts');
     }
-    if (playlistSortSelect) {
-      playlistSortSelect.innerHTML = '';
-      const optHide = document.createElement('option');
-      optHide.value = 'hide_played';
-      optHide.textContent = 'Hide played';
-      const optShow = document.createElement('option');
-      optShow.value = 'show_played';
-      optShow.textContent = 'Show played';
-      playlistSortSelect.appendChild(optHide);
-      playlistSortSelect.appendChild(optShow);
-      playlistSortSelect.value = absShowPlayed ? 'show_played' : 'hide_played';
+    if (playlistSortGroup) {
+      playlistSortGroup.hidden = true;
+      playlistSortGroup.setAttribute('aria-hidden', 'true');
+      playlistSortGroup.style.display = 'none';
     }
     if (playlistBackBtn) playlistBackBtn.textContent = '← All podcasts';
     if (playlistTrackFilterInput) {
@@ -974,6 +972,9 @@ function setPlaylistOverlayMode(mode) {
     if (playlistTrackProgress) playlistTrackProgress.textContent = '';
     if (playlistLoadMoreBtn) playlistLoadMoreBtn.hidden = true;
   } else {
+    if (playlistSummaryEl) {
+      playlistSummaryEl.hidden = false;
+    }
     if (titleEl) titleEl.textContent = playlistOverlayBase?.title || 'Playlists';
     if (playlistSearchInput) {
       playlistSearchInput.setAttribute('placeholder', playlistOverlayBase?.searchPlaceholder || 'Search playlists');
@@ -982,10 +983,32 @@ function setPlaylistOverlayMode(mode) {
       playlistSortSelect.innerHTML = playlistOverlayBase?.sortOptionsHtml || '';
       playlistSortSelect.value = playlistOverlayBase?.sortValue || 'recent';
     }
+    if (playlistSortGroup) {
+      playlistSortGroup.hidden = false;
+      playlistSortGroup.setAttribute('aria-hidden', 'false');
+      playlistSortGroup.style.display = '';
+    }
     if (playlistBackBtn) playlistBackBtn.textContent = playlistOverlayBase?.backLabel || '← All playlists';
     if (playlistTrackFilterInput) {
       playlistTrackFilterInput.setAttribute('placeholder', playlistOverlayBase?.trackFilterPlaceholder || 'Filter songs in this playlist');
     }
+  }
+  updateAudiobookshelfEpisodeControlsVisibility();
+}
+
+function updateAudiobookshelfEpisodeSummary() {
+  if (!playlistSummaryEl || playlistOverlayMode !== 'audiobookshelf') return;
+  playlistSummaryEl.textContent = '';
+}
+
+function updateAudiobookshelfEpisodeControlsVisibility() {
+  if (!absEpisodeControls) return;
+  const visible = playlistOverlayMode === 'audiobookshelf' && !!absSelectedPodcast?.id;
+  absEpisodeControls.hidden = !visible;
+  absEpisodeControls.setAttribute('aria-hidden', visible ? 'false' : 'true');
+  if (absHidePlayedToggle) absHidePlayedToggle.checked = !absShowPlayed;
+  if (absEpisodeOrderSelect) {
+    absEpisodeOrderSelect.value = absEpisodeSortOrder === 'newest' ? 'newest' : 'oldest';
   }
 }
 
@@ -1093,6 +1116,18 @@ function renderAudiobookshelfEpisodes(items) {
       const haystack = `${ep?.title || ''}`.toLowerCase();
       return haystack.includes(playlistTrackSearchTerm);
     });
+  const sortedFiltered = [...filtered].sort((a, b) => {
+    const aRaw = Number(a?.published_at);
+    const bRaw = Number(b?.published_at);
+    const aPub = Number.isFinite(aRaw) ? aRaw : null;
+    const bPub = Number.isFinite(bRaw) ? bRaw : null;
+    if (aPub === null && bPub !== null) return 1;
+    if (aPub !== null && bPub === null) return -1;
+    if (aPub !== null && bPub !== null && aPub !== bPub) {
+      return absEpisodeSortOrder === 'newest' ? bPub - aPub : aPub - bPub;
+    }
+    return playlistNameCollator.compare(a?.title || '', b?.title || '');
+  });
   playlistTracklist.innerHTML = '';
   if (!list.length) {
     const empty = document.createElement('div');
@@ -1108,7 +1143,7 @@ function renderAudiobookshelfEpisodes(items) {
     playlistTracklist.appendChild(empty);
     return;
   }
-  filtered.forEach(ep => {
+  sortedFiltered.forEach(ep => {
     if (!ep?.id) return;
     const row = document.createElement('button');
     row.type = 'button';
@@ -1191,7 +1226,9 @@ async function playAudiobookshelfEpisode(episode) {
 
 function showAudiobookshelfPodcastsGrid() {
   playlistAutoSelectId = null;
+  absSelectedPodcast = null;
   setPlaylistView('playlists');
+  updateAudiobookshelfEpisodeControlsVisibility();
   if (playlistSubtitle) playlistSubtitle.textContent = '';
   if (playlistTracklist) playlistTracklist.innerHTML = '';
   setPlaylistErrorMessage('');
@@ -1219,9 +1256,8 @@ function selectAudiobookshelfPodcast(podcast) {
     playlistSelectedOwner.textContent = podcast?.author || '';
     playlistSelectedOwner.hidden = !podcast?.author;
   }
-  if (playlistSummaryEl) {
-    playlistSummaryEl.textContent = absShowPlayed ? 'Showing played episodes' : 'Hiding played episodes';
-  }
+  updateAudiobookshelfEpisodeSummary();
+  updateAudiobookshelfEpisodeControlsVisibility();
   fetchAudiobookshelfEpisodes(podcast.id);
 }
 
@@ -1260,7 +1296,8 @@ function openPlaylistOverlay(options = {}) {
     absEpisodesCache = [];
     absSelectedPodcast = null;
     absShowPlayed = false;
-    if (playlistSortSelect) playlistSortSelect.value = 'hide_played';
+    absEpisodeSortOrder = 'oldest';
+    updateAudiobookshelfEpisodeControlsVisibility();
     showAudiobookshelfPodcastsGrid();
     return;
   }
@@ -1289,7 +1326,9 @@ function closePlaylistOverlay() {
   absPodcastsCache = [];
   absLibraryId = null;
   absShowPlayed = false;
+  absEpisodeSortOrder = 'oldest';
   setPlaylistOverlayMode('spotify');
+  updateAudiobookshelfEpisodeControlsVisibility();
 
   playlistPickerMode = false;
   playlistPickerOnSelect = null;
@@ -1304,6 +1343,7 @@ function handlePlaylistBack() {
   if (playlistOverlayMode === 'audiobookshelf') {
     absSelectedPodcast = null;
     absEpisodesCache = [];
+    updateAudiobookshelfEpisodeControlsVisibility();
     if (playlistSubtitle) playlistSubtitle.textContent = '';
     setPlaylistErrorMessage('');
     playlistAutoSelectId = null;

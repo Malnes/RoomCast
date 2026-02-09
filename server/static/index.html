@@ -194,6 +194,19 @@
               </div>
               <div id="playlist-summary" class="playlist-summary muted">Select a playlist to see details.</div>
             </div>
+            <div id="abs-episode-controls" class="abs-episode-controls" hidden>
+              <label class="abs-episode-toggle" for="abs-hide-played-toggle">
+                <input type="checkbox" id="abs-hide-played-toggle" checked>
+                <span>Hide played</span>
+              </label>
+              <label class="abs-episode-order" for="abs-episode-order">
+                <span class="sr-only">Episode order</span>
+                <select id="abs-episode-order">
+                  <option value="oldest">Oldest first</option>
+                  <option value="newest">Newest first</option>
+                </select>
+              </label>
+            </div>
           </div>
           <div class="playlist-track-filter">
             <label for="playlist-track-filter" class="sr-only">Filter songs</label>
@@ -502,21 +515,11 @@
             <div class="provider-display-row" style="margin-bottom:12px;">
               <div class="provider-display-name">
                 <label>Display name</label>
-                <input id="radio-provider-name" placeholder="Radio 1">
+                <input id="radio-provider-name" placeholder="Radio">
               </div>
               <div class="provider-display-color">
                 <input id="radio-provider-color" type="color" value="#f97316" aria-label="Display color">
               </div>
-            </div>
-            <div class="muted" id="radio-slot-count" style="font-size:12px;">Radio slots: —</div>
-            <div class="grid" style="margin-top:10px;">
-              <div>
-                <label>Max radio slots</label>
-                <input id="radio-max-slots" type="number" min="1" max="2" step="1" value="2">
-              </div>
-            </div>
-            <div style="margin-top:12px; display:flex; justify-content:flex-end;">
-              <button id="radio-slots-save" class="small-btn" type="button" style="min-width:90px;">Save</button>
             </div>
           </div>
 
@@ -548,6 +551,7 @@
             <div style="margin-top:12px; display:flex; justify-content:flex-end;">
               <button id="abs-provider-save" class="small-btn" type="button" style="min-width:90px;">Save</button>
             </div>
+            <div id="abs-provider-save-status" class="muted" style="font-size:12px; margin-top:8px;" aria-live="polite"></div>
             <div class="muted" style="font-size:12px; margin-top:8px;">Used for browsing podcasts and starting episode playback.</div>
           </div>
         </div>

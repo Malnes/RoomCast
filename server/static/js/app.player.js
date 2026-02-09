@@ -1667,14 +1667,12 @@ const radioProviderNameInput = document.getElementById('radio-provider-name');
 const radioProviderColorInput = document.getElementById('radio-provider-color');
 const absProviderNameInput = document.getElementById('abs-provider-name');
 const absProviderColorInput = document.getElementById('abs-provider-color');
-const radioSlotCountEl = document.getElementById('radio-slot-count');
-const radioMaxSlotsInput = document.getElementById('radio-max-slots');
-const radioSlotsSaveBtn = document.getElementById('radio-slots-save');
 
 const absBaseUrlInput = document.getElementById('abs-base-url');
 const absTokenInput = document.getElementById('abs-token');
 const absLibraryIdInput = document.getElementById('abs-library-id');
 const absProviderSaveBtn = document.getElementById('abs-provider-save');
+const absProviderSaveStatusEl = document.getElementById('abs-provider-save-status');
 
 let providersAvailableCache = [];
 let providersInstalledCache = [];
@@ -1690,12 +1688,11 @@ let providerAddModal = null;
 let providerAddModalList = null;
 let providerAddModalLimit = null;
 
-let radioSlotsCache = null;
-
 let providerRemoveOverlay = null;
 let providerRemoveMessage = null;
 let providerRemoveSpinner = null;
 let providerRemoveTimer = null;
+let providerInstallInFlight = false;
 
 const PROVIDER_INSTANCE_LIMIT = 5;
 
@@ -1796,10 +1793,7 @@ function spotifyInstancesInstalled() {
 
 function radioInstancesInstalled() {
   const installed = getInstalledProvider('radio');
-  if (!installed) return 0;
-  const maxSlots = Number(radioSlotsCache?.maxSlots);
-  if (Number.isFinite(maxSlots) && maxSlots > 0) return Math.min(maxSlots, 2);
-  return 1;
+  return installed ? 1 : 0;
 }
 
 function absInstancesInstalled() {
@@ -1824,7 +1818,7 @@ function totalInstalledProviderInstances() {
 
 function providerInstanceLabel(baseId, index) {
   if (baseId === 'spotify') return spotifyInstanceLabel(index);
-  if (baseId === 'radio') return `Radio ${index}`;
+  if (baseId === 'radio') return 'Radio';
   if (baseId === 'audiobookshelf') return `Audiobookshelf ${index}`;
   return baseId;
 }
@@ -1850,13 +1844,46 @@ async function saveProviderDisplaySettings(providerId, nameInput, colorInput) {
   const payload = {};
   if (name) payload.name = name;
   if (color) payload.color = color;
-  const res = await fetch(`/api/channels/${encodeURIComponent(providerId)}`, {
-    method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  await ensureOk(res);
-  await refreshChannels({ force: true });
+
+  const resolveTargetChannelId = (candidateId) => {
+    const raw = String(candidateId || '').trim().toLowerCase();
+    if (!raw) return '';
+    const direct = getChannelById(raw);
+    if (direct?.id) return direct.id;
+    const baseId = normalizeProviderBaseId(raw);
+    if (!baseId) return '';
+    const list = Array.isArray(channelsCache) ? channelsCache : [];
+    const match = list.find(ch => {
+      const channelBaseId = normalizeProviderBaseId(ch?.id);
+      if (channelBaseId === baseId) return true;
+      const source = String(ch?.source || '').trim().toLowerCase();
+      return source === baseId;
+    });
+    return match?.id || '';
+  };
+
+  const patchChannelMetadata = async (targetId) => {
+    if (!targetId) return false;
+    const res = await fetch(`/api/channels/${encodeURIComponent(targetId)}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (res.status === 404) return false;
+    await ensureOk(res);
+    return true;
+  };
+
+  let targetId = resolveTargetChannelId(providerId);
+  let saved = await patchChannelMetadata(targetId);
+  if (!saved) {
+    await refreshChannels({ force: true });
+    targetId = resolveTargetChannelId(providerId);
+    saved = await patchChannelMetadata(targetId);
+  }
+  if (saved) {
+    await refreshChannels({ force: true });
+  }
 }
 
 function createProviderIconEl(provider) {
@@ -1878,72 +1905,77 @@ function createProviderIconEl(provider) {
   return img;
 }
 
-async function fetchRadioSlots() {
-  try {
-    const res = await fetch('/api/radio/slots');
-    await ensureOk(res);
-    const data = await res.json();
-    const maxSlots = Number(data?.max_slots);
-    const supportedMaxSlots = Number(data?.supported_max_slots);
-    if (Number.isFinite(maxSlots) && maxSlots > 0) {
-      radioSlotsCache = { maxSlots };
-      if (radioSlotCountEl) radioSlotCountEl.textContent = `Radio slots: ${maxSlots}`;
-      if (radioMaxSlotsInput) {
-        if (Number.isFinite(supportedMaxSlots) && supportedMaxSlots > 0) {
-          radioMaxSlotsInput.max = String(supportedMaxSlots);
-        }
-        radioMaxSlotsInput.value = String(maxSlots);
+function resolveProviderChannel(provider) {
+  const direct = getProviderChannel(provider?.id);
+  if (direct) return direct;
+  const baseId = normalizeProviderBaseId(provider?.id);
+  if (!baseId) return null;
+  const list = Array.isArray(channelsCache) ? channelsCache : [];
+  return (
+    list.find(ch => {
+      const source = String(ch?.source || '').trim().toLowerCase();
+      if (source === baseId) return true;
+      const channelBaseId = normalizeProviderBaseId(ch?.id);
+      if (channelBaseId === baseId) return true;
+      if (baseId === 'spotify') {
+        const sourceRef = String(ch?.source_ref || '').trim().toLowerCase();
+        return source === 'spotify' && sourceRef.startsWith('spotify:');
       }
-      return;
-    }
-  } catch (_) {
-    // ignore
-  }
-  if (radioSlotCountEl) radioSlotCountEl.textContent = 'Radio slots: —';
-  if (radioMaxSlotsInput) radioMaxSlotsInput.value = '';
+      return false;
+    }) || null
+  );
 }
 
-async function saveRadioSlots() {
-  if (!radioMaxSlotsInput) return;
-  const raw = String(radioMaxSlotsInput.value || '').trim();
-  const desired = Number(raw);
-  if (!Number.isFinite(desired) || desired < 1) {
-    showError('Max radio slots must be a positive number');
-    return;
-  }
-  try {
-    const res = await fetch('/api/radio/slots', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ max_slots: Math.floor(desired) }),
-    });
-    await ensureOk(res);
-    const data = await res.json();
-    const maxSlots = Number(data?.max_slots);
-    const supportedMaxSlots = Number(data?.supported_max_slots);
-    if (Number.isFinite(maxSlots) && maxSlots > 0) {
-      radioSlotsCache = { maxSlots };
-      if (radioSlotCountEl) radioSlotCountEl.textContent = `Radio slots: ${maxSlots}`;
-      if (radioMaxSlotsInput) {
-        if (Number.isFinite(supportedMaxSlots) && supportedMaxSlots > 0) {
-          radioMaxSlotsInput.max = String(supportedMaxSlots);
-        }
-        radioMaxSlotsInput.value = String(maxSlots);
-      }
-      showSuccess('Radio slots saved');
-    }
-    if (providerSettingsModalProviderId?.startsWith('radio:')) {
-      await saveProviderDisplaySettings(providerSettingsModalProviderId, radioProviderNameInput, radioProviderColorInput);
-    }
-  } catch (err) {
-    showError(`Failed to save radio slots: ${err.message}`);
-  }
-}
+function getProviderStatus(provider) {
+  const baseId = normalizeProviderBaseId(provider?.id);
+  const channel = resolveProviderChannel(provider);
 
-if (radioSlotsSaveBtn) {
-  radioSlotsSaveBtn.addEventListener('click', () => {
-    saveRadioSlots();
-  });
+  if (baseId === 'audiobookshelf') {
+    const installed = getInstalledProvider('audiobookshelf');
+    const settings = installed?.settings && typeof installed.settings === 'object' ? installed.settings : {};
+    const hasBaseUrl = typeof settings.base_url === 'string' && !!settings.base_url.trim();
+    const hasToken = typeof settings.token === 'string' && !!settings.token.trim();
+    if (!hasBaseUrl || !hasToken) {
+      return { state: 'not-configured', label: 'Not configured: add base URL and API token' };
+    }
+    if (channel && channel.enabled === false) {
+      return { state: 'not-configured', label: 'Not configured: provider channel is disabled' };
+    }
+    return { state: 'working', label: 'Configured and working' };
+  }
+
+  if (baseId === 'radio') {
+    if (!channel) return { state: 'working', label: 'Ready' };
+    if (channel.enabled === false) {
+      return { state: 'not-configured', label: 'Not configured: provider channel is disabled' };
+    }
+    return { state: 'working', label: 'Ready' };
+  }
+
+  if (!channel) {
+    return { state: 'error', label: 'Error: provider channel missing' };
+  }
+  if (channel.enabled === false) {
+    return { state: 'not-configured', label: 'Not configured: provider channel is disabled' };
+  }
+
+  if (baseId === 'spotify') {
+    const spotifyCfg = channel.spotify && typeof channel.spotify === 'object' ? channel.spotify : {};
+    if (!spotifyCfg.has_oauth_token) {
+      return { state: 'not-configured', label: 'Not configured: sign in to Spotify' };
+    }
+    const runtime = channel.librespot_status && typeof channel.librespot_status === 'object'
+      ? channel.librespot_status
+      : {};
+    const runtimeState = String(runtime.state || '').trim().toLowerCase();
+    if (runtimeState === 'error' || runtimeState === 'failed') {
+      const msg = (runtime.message || 'Spotify runtime error').toString();
+      return { state: 'error', label: `Error: ${msg}` };
+    }
+    return { state: 'working', label: 'Configured and working' };
+  }
+
+  return { state: 'working', label: 'Configured' };
 }
 
 function handleProviderSettingsModalKey(evt) {
@@ -2073,12 +2105,9 @@ function renderProviderAddModal() {
           addCount = 1;
         }
       } else if (baseId === 'radio') {
-        const installedCount = radioInstancesInstalled();
-        if (installedCount >= 2) {
-          btn.disabled = true;
-        } else {
-          addCount = 1;
-        }
+        meta.textContent = installed ? 'Installed' : '';
+        if (installed) btn.disabled = true;
+        addCount = installed ? 0 : 1;
       } else {
         meta.textContent = installed ? 'Installed' : '';
         if (installed) btn.disabled = true;
@@ -2188,10 +2217,6 @@ function openProviderSettingsModal(providerId) {
     if (absProviderColorInput && currentChannel?.color) absProviderColorInput.value = currentChannel.color;
   }
 
-  if (baseId === 'radio') {
-    fetchRadioSlots();
-  }
-
   const footer = document.createElement('div');
   footer.style.marginTop = '10px';
   footer.style.display = 'flex';
@@ -2275,18 +2300,15 @@ function renderInstalledProviders() {
         });
       }
     } else if (pid === 'radio') {
-      const count = Math.max(1, radioInstancesInstalled());
-      for (let i = 1; i <= count; i += 1) {
-        const instanceId = providerInstanceId('radio', i);
-        const channel = getProviderChannel(instanceId);
-        expanded.push({
-          ...provider,
-          id: instanceId,
-          name: channel?.name || providerInstanceLabel('radio', i),
-          base_id: 'radio',
-          instance_index: i,
-        });
-      }
+      const instanceId = providerInstanceId('radio', 1);
+      const channel = getProviderChannel(instanceId);
+      expanded.push({
+        ...provider,
+        id: instanceId,
+        name: channel?.name || providerInstanceLabel('radio', 1),
+        base_id: 'radio',
+        instance_index: 1,
+      });
     } else if (pid === 'audiobookshelf') {
       const count = Math.max(1, absInstancesInstalled());
       for (let i = 1; i <= count; i += 1) {
@@ -2318,9 +2340,13 @@ function renderInstalledProviders() {
     .sort((a, b) => (a?.name || a?.id || '').localeCompare(b?.name || b?.id || ''))
     .forEach(provider => {
       if (!provider?.id) return;
+      const providerId = provider.id.toLowerCase();
       const row = document.createElement('div');
-      row.className = 'panel';
+      row.className = 'panel provider-list-item';
       row.style.marginBottom = '10px';
+      row.tabIndex = 0;
+      row.setAttribute('role', 'button');
+      row.setAttribute('aria-label', `Open settings for ${provider.name || provider.id}`);
 
       const top = document.createElement('div');
       top.className = 'provider-row';
@@ -2335,11 +2361,6 @@ function renderInstalledProviders() {
       const strong = document.createElement('strong');
       strong.textContent = provider.name || provider.id;
       titleWrap.appendChild(strong);
-      const desc = document.createElement('div');
-      desc.className = 'muted';
-      desc.style.fontSize = '12px';
-      desc.textContent = provider.description || '';
-      if (provider.description) titleWrap.appendChild(desc);
       left.appendChild(titleWrap);
 
       const right = document.createElement('div');
@@ -2347,20 +2368,25 @@ function renderInstalledProviders() {
       right.style.gap = '8px';
       right.style.alignItems = 'center';
       right.style.alignSelf = 'center';
-      const settingsBtn = document.createElement('button');
-      settingsBtn.type = 'button';
-      settingsBtn.className = 'provider-gear-btn';
-      settingsBtn.setAttribute('aria-label', 'Provider settings');
-      settingsBtn.textContent = '⚙︎';
-      settingsBtn.addEventListener('click', () => {
-        const pid = provider.id.toLowerCase();
-        openProviderSettingsModal(pid);
-      });
-      right.appendChild(settingsBtn);
+      const status = getProviderStatus(provider);
+      const statusIcon = document.createElement('span');
+      statusIcon.className = `provider-status-icon provider-status-${status.state}`;
+      statusIcon.textContent = status.state === 'working' ? '✓' : status.state === 'error' ? '!' : '•';
+      statusIcon.title = status.label;
+      statusIcon.setAttribute('aria-label', status.label);
+      right.appendChild(statusIcon);
 
       top.appendChild(left);
       top.appendChild(right);
       row.appendChild(top);
+      row.addEventListener('click', () => {
+        openProviderSettingsModal(providerId);
+      });
+      row.addEventListener('keydown', evt => {
+        if (evt.key !== 'Enter' && evt.key !== ' ') return;
+        evt.preventDefault();
+        openProviderSettingsModal(providerId);
+      });
       providersInstalledList.appendChild(row);
     });
 
@@ -2384,20 +2410,8 @@ async function refreshProvidersState() {
     providersInstalledCache = [];
     showError(`Failed to load providers: ${err.message}`);
   }
-  if (getInstalledProvider('radio')) {
-    await fetchRadioSlots();
-  }
+  await refreshChannels({ force: true }).catch(() => {});
   renderInstalledProviders();
-  if (radioSlotCountEl) {
-    if (radioSlotsCache?.maxSlots) {
-      radioSlotCountEl.textContent = `Radio slots: ${radioSlotsCache.maxSlots}`;
-    } else if (getInstalledProvider('radio')) {
-      radioSlotCountEl.textContent = 'Radio slots: —';
-    } else {
-      radioSlotCountEl.textContent = 'Radio slots: —';
-      if (radioMaxSlotsInput) radioMaxSlotsInput.value = '';
-    }
-  }
 
   // Channels source dropdown depends on providersInstalledCache.
   // Keep it in sync whenever providers change.
@@ -2411,6 +2425,7 @@ async function refreshProvidersState() {
 }
 
 async function installProviderById(providerIdRaw) {
+  if (providerInstallInFlight) return;
   const providerId = (providerIdRaw || '').trim().toLowerCase();
   if (!providerId) {
     showError('Choose a provider to install.');
@@ -2423,6 +2438,7 @@ async function installProviderById(providerIdRaw) {
     return;
   }
   try {
+    providerInstallInFlight = true;
     if (providerAddOpenBtn) providerAddOpenBtn.disabled = true;
     let res;
     if (baseId === 'spotify') {
@@ -2451,22 +2467,15 @@ async function installProviderById(providerIdRaw) {
         showError(`Provider limit reached (max ${PROVIDER_INSTANCE_LIMIT}).`);
         return;
       }
-      if (installedCount <= 0) {
-        res = await fetch('/api/providers/install', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ id: baseId }),
-        });
-      } else if (installedCount < 2) {
-        res = await fetch('/api/radio/slots', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ max_slots: installedCount + 1 }),
-        });
-      } else {
-        showError('Radio already has 2 providers.');
+      if (installedCount > 0) {
+        showError('Radio is already installed.');
         return;
       }
+      res = await fetch('/api/providers/install', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: baseId }),
+      });
     } else {
       const addCount = 1;
       if (totalInstances + addCount > PROVIDER_INSTANCE_LIMIT) {
@@ -2493,13 +2502,13 @@ async function installProviderById(providerIdRaw) {
       fetchLibrespotStatus(spotifySettingsSourceId);
     }
     if (baseId === 'radio') {
-      await fetchRadioSlots();
       providerSettingsOpenId = null;
       syncProviderSettingsPanels();
     }
   } catch (err) {
     showError(`Failed to install provider: ${err.message}`);
   } finally {
+    providerInstallInFlight = false;
     if (providerAddOpenBtn) providerAddOpenBtn.disabled = false;
   }
 }
@@ -2532,17 +2541,6 @@ async function removeProviderById(providerIdRaw, btn) {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ settings: { instances: 1 } }),
-        });
-      } else {
-        res = await fetch(`/api/providers/${encodeURIComponent(baseId)}`, { method: 'DELETE' });
-      }
-    } else if (baseId === 'radio' && providerId.startsWith('radio:')) {
-      const installedCount = radioInstancesInstalled();
-      if (installedCount >= 2 && providerId.endsWith(':2')) {
-        res = await fetch('/api/radio/slots', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ max_slots: 1 }),
         });
       } else {
         res = await fetch(`/api/providers/${encodeURIComponent(baseId)}`, { method: 'DELETE' });
@@ -2584,23 +2582,43 @@ async function saveAudiobookshelfProviderSettings() {
     showError('Audiobookshelf API token is required.');
     return;
   }
+  const defaultLabel = absProviderSaveBtn.dataset.defaultLabel || absProviderSaveBtn.textContent || 'Save';
+  absProviderSaveBtn.dataset.defaultLabel = defaultLabel;
+  const setSaveStatus = (message, tone = 'muted') => {
+    if (!absProviderSaveStatusEl) return;
+    absProviderSaveStatusEl.textContent = message || '';
+    if (tone === 'success') {
+      absProviderSaveStatusEl.style.color = '#22c55e';
+    } else if (tone === 'error') {
+      absProviderSaveStatusEl.style.color = '#f87171';
+    } else if (tone === 'loading') {
+      absProviderSaveStatusEl.style.color = '#93c5fd';
+    } else {
+      absProviderSaveStatusEl.style.color = '';
+    }
+  };
   try {
     absProviderSaveBtn.disabled = true;
+    absProviderSaveBtn.textContent = 'Testing...';
+    setSaveStatus('Testing connection to Audiobookshelf...', 'loading');
     const res = await fetch('/api/providers/audiobookshelf', {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ settings: { base_url, token, library_id: library_id || null } }),
     });
     await ensureOk(res);
-    showSuccess('Audiobookshelf provider updated.');
+    setSaveStatus('Connection verified. Settings saved.', 'success');
+    showSuccess('Audiobookshelf provider updated. Connection verified.');
     if (providerSettingsModalProviderId?.startsWith('audiobookshelf:')) {
       await saveProviderDisplaySettings(providerSettingsModalProviderId, absProviderNameInput, absProviderColorInput);
     }
     await refreshProvidersState();
   } catch (err) {
+    setSaveStatus(`Connection test failed: ${err.message}`, 'error');
     showError(`Failed to update Audiobookshelf provider: ${err.message}`);
   } finally {
     absProviderSaveBtn.disabled = false;
+    absProviderSaveBtn.textContent = defaultLabel;
   }
 }
 
@@ -3201,21 +3219,35 @@ if (playlistSearchInput) {
 if (playlistSortSelect) {
   playlistSortSelect.addEventListener('change', evt => {
     const value = (evt.target.value || '').toLowerCase();
-    if (typeof playlistOverlayMode !== 'undefined' && playlistOverlayMode === 'audiobookshelf') {
-      absShowPlayed = value === 'show_played';
-      if (typeof absSelectedPodcast !== 'undefined' && absSelectedPodcast?.id) {
-        fetchAudiobookshelfEpisodes(absSelectedPodcast.id);
-      }
-      if (playlistSummaryEl) {
-        playlistSummaryEl.textContent = absShowPlayed ? 'Showing played episodes' : 'Hiding played episodes';
-      }
-    } else {
-      playlistSortOrder = value === 'name'
-        ? 'name'
-        : value === 'recent_played'
-          ? 'recent_played'
-          : 'recent';
-      renderPlaylistGrid(playlistsCache);
+    if (typeof playlistOverlayMode !== 'undefined' && playlistOverlayMode === 'audiobookshelf') return;
+    playlistSortOrder = value === 'name'
+      ? 'name'
+      : value === 'recent_played'
+        ? 'recent_played'
+        : 'recent';
+    renderPlaylistGrid(playlistsCache);
+  });
+}
+if (absHidePlayedToggle) {
+  absHidePlayedToggle.addEventListener('change', () => {
+    if (typeof playlistOverlayMode !== 'undefined' && playlistOverlayMode !== 'audiobookshelf') return;
+    absShowPlayed = !absHidePlayedToggle.checked;
+    if (typeof absSelectedPodcast !== 'undefined' && absSelectedPodcast?.id) {
+      fetchAudiobookshelfEpisodes(absSelectedPodcast.id);
+    }
+    if (typeof updateAudiobookshelfEpisodeSummary === 'function') {
+      updateAudiobookshelfEpisodeSummary();
+    }
+  });
+}
+if (absEpisodeOrderSelect) {
+  absEpisodeOrderSelect.addEventListener('change', evt => {
+    if (typeof playlistOverlayMode !== 'undefined' && playlistOverlayMode !== 'audiobookshelf') return;
+    const next = (evt.target?.value || '').toLowerCase();
+    absEpisodeSortOrder = next === 'newest' ? 'newest' : 'oldest';
+    renderAudiobookshelfEpisodes(typeof absEpisodesCache !== 'undefined' ? absEpisodesCache : []);
+    if (typeof updateAudiobookshelfEpisodeSummary === 'function') {
+      updateAudiobookshelfEpisodeSummary();
     }
   });
 }

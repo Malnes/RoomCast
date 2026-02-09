@@ -121,6 +121,10 @@ const playlistModalTitle = document.getElementById('playlist-modal-title');
 const playlistSubtitle = document.getElementById('playlist-modal-subtitle');
 const playlistSearchInput = document.getElementById('playlist-search');
 const playlistSortSelect = document.getElementById('playlist-sort');
+const playlistSortGroup = document.querySelector('.playlist-sort-group');
+const absEpisodeControls = document.getElementById('abs-episode-controls');
+const absHidePlayedToggle = document.getElementById('abs-hide-played-toggle');
+const absEpisodeOrderSelect = document.getElementById('abs-episode-order');
 const channelsPanel = document.getElementById('channels-panel');
 const spotifyChannelSelect = document.getElementById('spotify-channel-select');
 const spotifyAccountInfo = document.getElementById('spotify-account-info');
@@ -586,12 +590,20 @@ function privateBrowserWsUrl(nodeId) {
   return `${proto}${window.location.host}/ws/web-node?node_id=${encodeURIComponent(nodeId)}`;
 }
 
+function browserNodeGainFromPercent(percent) {
+  const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
+  if (normalized <= 0) return 0;
+  const minDb = -60;
+  const db = minDb + ((0 - minDb) * (normalized / 100));
+  return Math.pow(10, db / 20);
+}
+
 function handlePrivateBrowserControlMessage(msg) {
   const audio = privateBrowserNodeState.audio;
   if (!audio || !msg) return;
   if (msg.type === 'volume') {
     const percent = Math.max(0, Math.min(100, Number(msg.percent ?? 0)));
-    audio.volume = percent / 100;
+    audio.volume = browserNodeGainFromPercent(percent);
   } else if (msg.type === 'mute') {
     audio.muted = !!msg.muted;
   } else if (msg.type === 'session' && msg.state === 'ended') {
@@ -2405,8 +2417,6 @@ function renderChannelsPanel() {
     channelsPanel.innerHTML = '<div class="muted">No channels configured yet.</div>';
     return;
   }
-
-  syncChannelsCountSelect();
 
   const installedProviders = (typeof providersInstalledCache === 'undefined' || !Array.isArray(providersInstalledCache))
     ? []

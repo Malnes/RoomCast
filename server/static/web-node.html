@@ -274,6 +274,14 @@
       return Math.min(max, Math.max(min, value));
     }
 
+    function gainFromPercent(percent) {
+      const normalized = Math.max(0, Math.min(100, Number(percent) || 0));
+      if (normalized <= 0) return 0;
+      const minDb = -60;
+      const db = minDb + ((0 - minDb) * (normalized / 100));
+      return Math.pow(10, db / 20);
+    }
+
     async function connectControlSocket() {
       if (!nodeId) return;
       ws = new WebSocket(wsUrl(nodeId));
@@ -296,7 +304,7 @@
     function handleControlMessage(msg) {
       if (msg.type === 'volume') {
         const percent = Math.max(0, Math.min(100, msg.percent ?? 0));
-        audio.volume = percent / 100;
+        audio.volume = gainFromPercent(percent);
         nodeVol.value = percent;
         setStatus(`Volume ${percent}%`);
       } else if (msg.type === 'mute') {
@@ -633,7 +641,7 @@
 
     registerBtn.addEventListener('click', startWebNode);
     disconnectBtn.addEventListener('click', () => disconnect(true));
-    nodeVol.addEventListener('input', () => { audio.volume = nodeVol.value / 100; });
+    nodeVol.addEventListener('input', () => { audio.volume = gainFromPercent(nodeVol.value); });
     setDefaultMetadata();
     updateChannelBadge();
   </script>

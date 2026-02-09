@@ -230,6 +230,52 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
   text-overflow: ellipsis;
 }
 
+.provider-list-item {
+  cursor: pointer;
+  user-select: none;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease, background 0.15s ease;
+}
+
+.provider-list-item:hover {
+  border-color: rgba(var(--accent-rgb),0.42);
+  background: rgba(255,255,255,0.055);
+}
+
+.provider-list-item:focus-visible {
+  outline: 2px solid rgba(var(--accent-rgb),0.55);
+  outline-offset: 2px;
+}
+
+.provider-status-icon {
+  width: 22px;
+  height: 22px;
+  border-radius: 999px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 800;
+  border: 1px solid transparent;
+}
+
+.provider-status-working {
+  color: #22c55e;
+  background: rgba(34,197,94,0.15);
+  border-color: rgba(34,197,94,0.55);
+}
+
+.provider-status-not-configured {
+  color: #f59e0b;
+  background: rgba(245,158,11,0.16);
+  border-color: rgba(245,158,11,0.5);
+}
+
+.provider-status-error {
+  color: #f87171;
+  background: rgba(248,113,113,0.14);
+  border-color: rgba(248,113,113,0.52);
+}
+
 .provider-option-btn {
   width: 100%;
   display: inline-flex;
@@ -754,6 +800,11 @@ button.status-pill:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.6
 .playlist-tracks-view { display: flex; flex-direction: column; gap: 12px; }
 .playlist-tracks-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .playlist-back-btn { background: rgba(255,255,255,0.08); border-radius: 999px; padding: 8px 14px; border: 1px solid rgba(255,255,255,0.15); color: #e2e8f0; font-weight: 600; width: auto; }
+.abs-episode-controls { display: inline-flex; align-items: center; gap: 10px; margin-left: auto; }
+.abs-episode-controls[hidden] { display: none !important; }
+.abs-episode-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: #e2e8f0; font-weight: 600; white-space: nowrap; }
+.abs-episode-toggle input { width: 16px; height: 16px; margin: 0; accent-color: rgba(var(--accent-rgb), 1); }
+.abs-episode-order select { min-width: 130px; height: 36px; }
 .playlist-selected-name { font-size: 18px; font-weight: 600; color: #f8fafc; }
 .playlist-selected-meta { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 0; }
 .playlist-selected-top { display: flex; flex-direction: column; gap: 4px; }
@@ -773,6 +824,8 @@ button.status-pill:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.6
 .playlist-load-more { width: auto; }
 @media (max-width: 600px) {
   .playlist-tracks-header { flex-direction: column; align-items: flex-start; }
+  .abs-episode-controls { margin-left: 0; width: 100%; justify-content: space-between; }
+  .abs-episode-order { flex: 0 0 auto; }
   .playlist-tracklist { padding: 0; }
 }
 @media (max-width: 640px) {

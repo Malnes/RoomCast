@@ -40,72 +40,22 @@ def create_channels_router(
     primary_channel_id: Callable[[], str],
     save_channels: Callable[[], None],
     save_nodes: Callable[[], None],
+    refresh_channels: Callable[[], None],
     channel_id_prefix: str,
 ) -> APIRouter:
     router = APIRouter()
 
     @router.get("/api/channels")
     async def list_channels_api() -> dict:
+        refresh_channels()
         return {"channels": all_channel_details()}
 
     @router.post("/api/channels/count")
     async def set_channels_count_api(payload: ChannelCountPayload, _: dict = Depends(require_admin)) -> dict:
-        desired = int(payload.count)
-        desired = max(1, min(10, desired))
-
-        channels_by_id = get_channels_by_id()
-        keep_ids = [f"{channel_id_prefix}{idx}" for idx in range(1, desired + 1)]
-        keep_set = set(keep_ids)
-        removed_ids = [cid for cid in list(channels_by_id.keys()) if cid not in keep_set]
-
-        # Ensure target channels exist, preserve existing entries when possible.
-        for idx, cid in enumerate(keep_ids, start=1):
-            existing = channels_by_id.get(cid)
-            if existing:
-                existing["order"] = idx
-                continue
-            defaults = {
-                "id": cid,
-                "name": f"Channel {idx}",
-                "order": idx,
-                "snap_stream": f"Spotify_CH{idx}",
-                "fifo_path": f"/tmp/snapfifo-{cid}",
-                "enabled": True,
-                "source": "none",
-                "source_ref": None,
-            }
-            channels_by_id[cid] = normalize_channel_entry(defaults, idx)
-
-        # Remove channels outside the desired range.
-        for cid in removed_ids:
-            channels_by_id.pop(cid, None)
-
-        # Re-sequence and persist channels.
-        resequence_channel_order()
-        save_channels()
-
-        # Reassign nodes that were pointing at removed channels.
-        primary = keep_ids[0] if keep_ids else primary_channel_id()
-        moved = 0
-        nodes = get_nodes()
-        for node in list(nodes.values()):
-            raw_channel = (node.get("channel_id") or "").strip().lower()
-            if raw_channel and raw_channel not in channels_by_id:
-                try:
-                    await set_node_channel(node, primary)
-                    moved += 1
-                except Exception as exc:
-                    log.warning(
-                        "Failed to move node %s to %s after channel resize: %s",
-                        node.get("id"),
-                        primary,
-                        exc,
-                    )
-        if moved:
-            save_nodes()
-            await broadcast_nodes()
-
-        return {"ok": True, "count": len(get_channel_order()), "channels": all_channel_details()}
+        raise HTTPException(
+            status_code=400,
+            detail="Manual channel count is deprecated. Providers are now the channel units.",
+        )
 
     @router.get("/api/sources")
     async def list_sources_api() -> dict:

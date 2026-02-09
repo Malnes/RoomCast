@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
 from typing import Any, Callable, Dict, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
@@ -34,6 +36,7 @@ def create_providers_router(
     disable_radio_provider: Callable[[], None],
     apply_audiobookshelf_provider: Callable[[], None],
     disable_audiobookshelf_provider: Callable[[], None],
+    refresh_channels: Callable[[], None],
 ) -> APIRouter:
     router = APIRouter(prefix="/api/providers")
 
@@ -49,12 +52,7 @@ def create_providers_router(
                 desired = 1
             return max(1, min(2, desired))
         if pid == "radio":
-            raw = settings.get("max_slots")
-            try:
-                desired = int(raw)
-            except (TypeError, ValueError):
-                desired = 1
-            return max(1, min(2, desired))
+            return 1
         if pid == "audiobookshelf":
             return 1
         return 1
@@ -70,8 +68,81 @@ def create_providers_router(
             "has_settings": bool(spec.has_settings) if spec else True,
         }
 
+    def _extract_http_error_detail(resp: httpx.Response) -> str:
+        try:
+            payload = resp.json()
+            if isinstance(payload, dict):
+                for key in ("message", "error", "detail"):
+                    value = payload.get(key)
+                    if isinstance(value, str) and value.strip():
+                        return value.strip()
+        except Exception:
+            pass
+        text = (resp.text or "").strip()
+        if text:
+            return text[:220]
+        return "Request rejected"
+
+    async def _validate_audiobookshelf_connection(settings: Dict[str, Any]) -> None:
+        base_url = str(settings.get("base_url") or "").strip().rstrip("/")
+        token = str(settings.get("token") or "").strip()
+        library_id = str(settings.get("library_id") or "").strip()
+
+        if not base_url:
+            raise HTTPException(status_code=400, detail="Audiobookshelf base URL is required")
+        if not token:
+            raise HTTPException(status_code=400, detail="Audiobookshelf API token is required")
+        if not (base_url.startswith("http://") or base_url.startswith("https://")):
+            raise HTTPException(status_code=400, detail="Audiobookshelf base URL must start with http:// or https://")
+
+        timeout = float(os.getenv("AUDIOBOOKSHELF_HTTP_TIMEOUT", "12"))
+        timeout = max(3.0, min(timeout, 60.0))
+        endpoint = f"{base_url}/api/libraries"
+        headers = {"Authorization": f"Bearer {token}"}
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                resp = await client.get(endpoint, headers=headers)
+        except httpx.RequestError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Audiobookshelf connection test failed: {exc}",
+            ) from exc
+
+        if resp.status_code >= 400:
+            detail = _extract_http_error_detail(resp)
+            raise HTTPException(
+                status_code=502,
+                detail=f"Audiobookshelf connection test failed ({resp.status_code}): {detail}",
+            )
+
+        try:
+            payload = resp.json()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Audiobookshelf connection test failed: invalid JSON response",
+            ) from exc
+
+        libraries: list[dict] = []
+        if isinstance(payload, list):
+            libraries = [item for item in payload if isinstance(item, dict)]
+        elif isinstance(payload, dict):
+            raw = payload.get("libraries") if isinstance(payload.get("libraries"), list) else payload.get("results")
+            if isinstance(raw, list):
+                libraries = [item for item in raw if isinstance(item, dict)]
+
+        if library_id:
+            found = any(str(item.get("id") or "").strip() == library_id for item in libraries)
+            if not found:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Audiobookshelf connection test failed: podcast library ID not found",
+                )
+
     @router.get("/available")
     async def list_available_providers_api() -> dict:
+        refresh_channels()
         items = []
         current = providers()
         for pid, spec in sorted(available_providers.items()):
@@ -91,6 +162,7 @@ def create_providers_router(
 
     @router.get("/installed")
     async def list_installed_providers_api() -> dict:
+        refresh_channels()
         return {"providers": [_public_provider_state(state) for state in providers().values()]}
 
     @router.post("/install")
@@ -115,8 +187,6 @@ def create_providers_router(
             defaults = {}
             if pid == "spotify":
                 defaults = {"instances": 1}
-            if pid == "radio":
-                defaults = {"max_slots": 1}
             state = provider_state_cls(id=pid, enabled=True, settings=defaults)
             current[pid] = state
         desired_count = _provider_instance_count_for(pid, state)
@@ -148,6 +218,7 @@ def create_providers_router(
             raise
 
         save_providers_state()
+        refresh_channels()
         return {"ok": True, "provider": _public_provider_state(state)}
 
     @router.patch("/{provider_id}")
@@ -198,6 +269,8 @@ def create_providers_router(
                     disable_radio_provider()
             elif pid == "audiobookshelf":
                 if state.enabled:
+                    if "settings" in updates and isinstance(updates["settings"], dict):
+                        await _validate_audiobookshelf_connection(state.settings or {})
                     apply_audiobookshelf_provider()
                 else:
                     disable_audiobookshelf_provider()
@@ -208,6 +281,7 @@ def create_providers_router(
             raise
 
         save_providers_state()
+        refresh_channels()
         return {"ok": True, "provider": _public_provider_state(state)}
 
     @router.delete("/{provider_id}")
@@ -237,6 +311,7 @@ def create_providers_router(
 
         current.pop(pid, None)
         save_providers_state()
+        refresh_channels()
         return {"ok": True}
 
     return router

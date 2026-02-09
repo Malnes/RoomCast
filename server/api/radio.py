@@ -480,8 +480,8 @@ def create_radio_router(
     @router.get("/api/radio/slots")
     async def get_radio_slots(_: None = Depends(require_radio_provider_dep)) -> dict:
         return {
-            "max_slots": radio_max_slots_configured(),
-            "supported_max_slots": radio_max_slots_supported(),
+            "max_slots": 1,
+            "supported_max_slots": 1,
         }
 
     @router.put("/api/radio/slots")
@@ -490,44 +490,14 @@ def create_radio_router(
         _: dict = Depends(require_admin),
         __: None = Depends(require_radio_provider_dep),
     ) -> dict:
-        supported = radio_max_slots_supported()
         desired = int(payload.max_slots)
-        if desired < 1 or desired > supported:
-            raise HTTPException(status_code=400, detail=f"max_slots must be between 1 and {supported}")
-
-        previous_total = provider_instance_count()
-        current_radio = radio_max_slots_configured()
-        if previous_total - current_radio + desired > provider_instance_limit():
-            raise HTTPException(status_code=409, detail=f"Provider limit reached (max {provider_instance_limit()})")
-
-        providers_by_id = get_providers_by_id()
-        state = providers_by_id.get("radio")
-        if not state:
-            raise HTTPException(status_code=503, detail="Radio provider is not installed")
-        if not isinstance(state.settings, dict):
-            state.settings = {}
-        state.settings["max_slots"] = desired
-        save_providers_state()
-
-        active_streams = {(slot.get("snap_stream") or "").strip() for slot in radio_channel_slots_active()}
-        channels_by_id = get_channels_by_id()
-        for channel in channels_by_id.values():
-            if (channel.get("source") or "").strip().lower() != "radio":
-                continue
-            stream = (channel.get("snap_stream") or "").strip()
-            if not stream or stream in active_streams:
-                continue
-            channel["source"] = "none"
-            channel["source_ref"] = None
-            channel["enabled"] = False
-            channel.pop("radio_state", None)
-        save_channels()
-        mark_radio_assignments_dirty()
+        if desired != 1:
+            raise HTTPException(status_code=400, detail="Radio max slots is deprecated and fixed at 1")
 
         return {
             "ok": True,
-            "max_slots": radio_max_slots_configured(),
-            "supported_max_slots": radio_max_slots_supported(),
+            "max_slots": 1,
+            "supported_max_slots": 1,
         }
 
     @router.get("/api/radio/status/{channel_id}")

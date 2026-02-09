@@ -214,18 +214,11 @@ RADIO_CHANNEL_SLOTS = [
 
 
 def radio_max_slots_supported() -> int:
-    return len(RADIO_CHANNEL_SLOTS)
+    return 1
 
 
 def radio_max_slots_configured() -> int:
-    settings = get_provider_settings("radio")
-    raw = settings.get("max_slots")
-    try:
-        desired = int(raw)
-    except (TypeError, ValueError):
-        desired = 1
-    desired = max(1, min(desired, radio_max_slots_supported()))
-    return desired
+    return 1
 
 
 def radio_channel_slots_active() -> list[dict]:
@@ -1933,6 +1926,7 @@ app.include_router(
         disable_radio_provider=provider_runtime_service.disable_radio_provider,
         apply_audiobookshelf_provider=provider_runtime_service.apply_audiobookshelf_provider,
         disable_audiobookshelf_provider=provider_runtime_service.disable_audiobookshelf_provider,
+        refresh_channels=load_channels,
     )
 )
 
@@ -2070,6 +2064,7 @@ app.include_router(
         primary_channel_id=lambda: _primary_channel_id(),
         save_channels=lambda: save_channels(),
         save_nodes=lambda: save_nodes(),
+        refresh_channels=lambda: load_channels(),
         channel_id_prefix=CHANNEL_ID_PREFIX,
     )
 )
