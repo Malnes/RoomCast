@@ -1804,7 +1804,7 @@ function radioInstancesInstalled() {
 
 function absInstancesInstalled() {
   const installed = getInstalledProvider('audiobookshelf');
-  return installed ? 2 : 0;
+  return installed ? 1 : 0;
 }
 
 function totalInstalledProviderInstances() {
@@ -2082,7 +2082,7 @@ function renderProviderAddModal() {
       } else {
         meta.textContent = installed ? 'Installed' : '';
         if (installed) btn.disabled = true;
-        addCount = installed ? 0 : (baseId === 'audiobookshelf' ? 2 : 1);
+        addCount = installed ? 0 : 1;
       }
       if (!btn.disabled && addCount > 0 && totalInstances + addCount > PROVIDER_INSTANCE_LIMIT) {
         btn.disabled = true;
@@ -2468,7 +2468,7 @@ async function installProviderById(providerIdRaw) {
         return;
       }
     } else {
-      const addCount = baseId === 'audiobookshelf' ? 2 : 1;
+      const addCount = 1;
       if (totalInstances + addCount > PROVIDER_INSTANCE_LIMIT) {
         showError(`Provider limit reached (max ${PROVIDER_INSTANCE_LIMIT}).`);
         return;
@@ -2513,11 +2513,14 @@ async function removeProviderById(providerIdRaw, btn) {
     return;
   }
   const targetBtn = btn;
-  const showSpinner = baseId === 'spotify';
+  const providerNameById = {
+    spotify: 'Spotify',
+    radio: 'Radio',
+    audiobookshelf: 'Audiobookshelf',
+  };
+  const providerName = providerNameById[baseId] || 'Provider';
   try {
-    if (showSpinner) {
-      showProviderRemoveOverlay('Removing Spotify provider. Please wait');
-    }
+    showProviderRemoveOverlay(`Removing ${providerName} provider. Please wait`);
     if (targetBtn) targetBtn.disabled = true;
 
     let res;
@@ -2554,13 +2557,11 @@ async function removeProviderById(providerIdRaw, btn) {
     await refreshChannels({ force: true });
     await refreshProvidersState();
     await refreshSpotifySources();
-    if (showSpinner) {
-      showProviderRemoveOverlay('Successfully removed', false);
-      hideProviderRemoveOverlay(2000);
-    }
+    showProviderRemoveOverlay('Successfully removed', false);
+    hideProviderRemoveOverlay(2000);
   } catch (err) {
     showError(`Failed to remove provider: ${err.message}`);
-    if (showSpinner) hideProviderRemoveOverlay();
+    hideProviderRemoveOverlay();
   } finally {
     if (targetBtn) targetBtn.disabled = false;
   }

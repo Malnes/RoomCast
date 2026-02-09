@@ -249,11 +249,6 @@ ABS_CHANNEL_SLOTS = [
         "snap_stream": "Audiobookshelf_CH1",
         "fifo_path": "/tmp/snapfifo-abs1",
     },
-    {
-        "label": "Audiobookshelf 2",
-        "snap_stream": "Audiobookshelf_CH2",
-        "fifo_path": "/tmp/snapfifo-abs2",
-    },
 ]
 CHANNEL_IDLE_TIMEOUT = float(os.getenv("CHANNEL_IDLE_TIMEOUT", "600"))
 CHANNEL_IDLE_TIMEOUT = max(30.0, CHANNEL_IDLE_TIMEOUT)

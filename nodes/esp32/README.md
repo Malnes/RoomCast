@@ -16,6 +16,15 @@ idf.py menuconfig
 idf.py build
 ```
 
+For ESP32-S3 N16R8 boards (16MB flash + 8MB PSRAM), defaults are provided in
+`sdkconfig.defaults`. If your existing `sdkconfig` was created for a different board,
+regenerate once:
+
+```bash
+rm -f sdkconfig
+idf.py reconfigure
+```
+
 ## Flash
 ```bash
 idf.py -p /dev/ttyUSB0 flash monitor

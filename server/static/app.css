@@ -178,14 +178,14 @@ button:active { transform: translateY(1px) scale(0.99); filter: brightness(0.95)
 
 .provider-row {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
 
 .provider-row-left {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: 10px;
   min-width: 0;
 }

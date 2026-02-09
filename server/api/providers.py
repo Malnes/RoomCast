@@ -56,7 +56,7 @@ def create_providers_router(
                 desired = 1
             return max(1, min(2, desired))
         if pid == "audiobookshelf":
-            return 2
+            return 1
         return 1
 
     def _public_provider_state(state: Any) -> dict:

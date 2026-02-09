@@ -7,4 +7,5 @@ newFeatures.md
 nodes/esp32/build/
 nodes/esp32/sdkconfig
 nodes/esp32/sdkconfig.*
+!nodes/esp32/sdkconfig.defaults
 nodes/esp32/idf_component.yml

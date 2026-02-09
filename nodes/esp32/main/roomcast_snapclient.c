@@ -9,6 +9,7 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_mac.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
@@ -58,6 +59,18 @@ typedef struct {
     uint32_t size;
     uint8_t *data;
 } roomcast_audio_chunk_t;
+
+static uint8_t *audio_buffer_alloc(size_t size) {
+    if (size == 0) return NULL;
+    uint8_t *ptr = NULL;
+#if defined(CONFIG_SPIRAM) && CONFIG_SPIRAM
+    ptr = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+#endif
+    if (!ptr) {
+        ptr = (uint8_t *)heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    }
+    return ptr;
+}
 
 typedef struct {
     uint16_t type;
@@ -307,7 +320,7 @@ static void enqueue_audio_chunk(const uint8_t *data, uint32_t size, int64_t time
     roomcast_audio_chunk_t chunk = {0};
     chunk.size = size;
     chunk.target_time_us = timestamp_us;
-    chunk.data = (uint8_t *)malloc(size);
+    chunk.data = audio_buffer_alloc(size);
     if (!chunk.data) return;
     memcpy(chunk.data, data, size);
     if (xQueueSend(g_audio_queue, &chunk, 0) != pdTRUE) {
