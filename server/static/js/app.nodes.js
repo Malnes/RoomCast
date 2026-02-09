@@ -120,10 +120,14 @@ async function fetchSpotifyConfig(targetSourceId = getSettingsChannelId()) {
     }
     await ensureOk(res);
     const cfg = await res.json();
+    const spotifyVolume = normalizePercent(cfg.roomcast_last_volume ?? cfg.initial_volume, 75);
     spName.value = cfg.device_name || 'RoomCast';
     spBitrate.value = cfg.bitrate || 320;
-    spInitVol.value = cfg.initial_volume ?? 75;
+    spInitVol.value = spotifyVolume;
     setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100);
+    if (spInitVolValue) {
+      spInitVolValue.textContent = `${spotifyVolume}%`;
+    }
     spNormalise.checked = cfg.normalisation ?? true;
     if (spShowOutputVolume) {
       spShowOutputVolume.checked = cfg.show_output_volume_slider !== false;

@@ -737,6 +737,17 @@ function resetPlaylistTrackFilter() {
   if (playlistTrackFilterInput) playlistTrackFilterInput.value = '';
 }
 
+async function fetchRecentlyPlayedSpotifyPlaylists(channelId, signal) {
+  const params = new URLSearchParams({ limit: '24', history_limit: '50' });
+  const res = await fetch(withChannel(`/api/spotify/playlists/recently-played?${params.toString()}`, channelId), { signal });
+  await ensureOk(res);
+  const data = await res.json();
+  return {
+    items: Array.isArray(data?.items) ? data.items : [],
+    scopeGranted: data?.scope_granted !== false,
+  };
+}
+
 async function fetchPlaylists() {
   if (!playlistOverlay) return;
   playlistAbortController?.abort();
@@ -752,6 +763,11 @@ async function fetchPlaylists() {
     return;
   }
   try {
+    const recentPromise = fetchRecentlyPlayedSpotifyPlaylists(channelId, playlistAbortController.signal).catch(err => {
+      if (err?.name === 'AbortError') return { items: [], scopeGranted: true };
+      console.warn('Failed to load recently played playlists:', err);
+      return { items: [], scopeGranted: true };
+    });
     const collected = [];
     let offset = 0;
     let hasNext = true;
@@ -779,16 +795,25 @@ async function fetchPlaylists() {
       hasNext = serverHasNext && (typeof reportedTotal === 'number' ? fetchedCount < reportedTotal : true);
       if (!hasNext) break;
     }
+    const recentlyPlayedResult = await recentPromise;
+    const recentlyPlayed = Array.isArray(recentlyPlayedResult?.items) ? recentlyPlayedResult.items : [];
+    playlistsRecentlyPlayedScopeMissing = recentlyPlayedResult?.scopeGranted === false;
     const timestamp = Date.now();
     playlistsCache = collected.map((item, idx) => {
       rememberPlaylistMetadata(item, timestamp);
       return { ...item, _order: idx };
     });
+    playlistsRecentlyPlayedCache = recentlyPlayed.map((item, idx) => {
+      rememberPlaylistMetadata(item, timestamp);
+      return { ...item, _order: idx };
+    });
     playlistsCacheFetchedAt = timestamp;
+    playlistsRecentlyPlayedFetchedAt = timestamp;
     renderPlaylistGrid(playlistsCache);
     maybeAutoSelectPlaylist();
   } catch (err) {
     if (err.name === 'AbortError') return;
+    playlistsRecentlyPlayedScopeMissing = false;
     if (!playlistsCache.length && playlistGrid) playlistGrid.innerHTML = '';
     if (playlistEmpty && !playlistsCache.length) {
       playlistEmpty.hidden = false;
@@ -3648,4 +3673,3 @@ async function fetchStatus() {
     showError(`Failed to fetch snapcast status: ${err.message}`);
   }
 }
-

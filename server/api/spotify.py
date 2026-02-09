@@ -1,5 +1,7 @@
 import asyncio
 import json
+import logging
+import re
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -9,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from api.nodes import VolumePayload
+
+log = logging.getLogger("roomcast")
 
 
 class ShufflePayload(BaseModel):
@@ -29,6 +33,7 @@ class SpotifyConfig(BaseModel):
     device_name: str = Field(default="RoomCast")
     bitrate: int = Field(default=320, ge=96, le=320)
     initial_volume: int = Field(default=75, ge=0, le=100)
+    roomcast_last_volume: int = Field(default=75, ge=0, le=100)
     normalisation: bool = Field(default=True)
     show_output_volume_slider: bool = Field(default=True)
 
@@ -51,6 +56,8 @@ def create_spotify_router(
     resolve_channel_id: Callable[[Optional[str]], str],
     resolve_spotify_source_id: Callable[[Optional[str]], Optional[str]],
     read_spotify_config: Callable[[str], dict],
+    roomcast_last_volume: Callable[[Optional[str]], int],
+    set_roomcast_last_volume: Callable[[int, Optional[str]], int],
     get_spotify_source: Callable[[str], dict],
     spotify_auth_broker_url: str,
     public_base_url: str,
@@ -76,6 +83,7 @@ def create_spotify_router(
     read_librespot_status: Callable[[str], dict],
 ) -> APIRouter:
     router = APIRouter()
+    playlist_id_pattern = re.compile(r"^[A-Za-z0-9]+$")
 
     def _broker_callback_url() -> str:
         if not public_base_url:
@@ -118,6 +126,22 @@ def create_spotify_router(
         from urllib.parse import urlencode
 
         return f"{path}{separator}{urlencode(clean)}"
+
+    def _extract_playlist_id(value: Any) -> Optional[str]:
+        if not isinstance(value, str):
+            return None
+        raw = value.strip()
+        if not raw:
+            return None
+        if raw.startswith("spotify:playlist:"):
+            candidate = raw.split("spotify:playlist:", 1)[1].strip()
+            return candidate if playlist_id_pattern.fullmatch(candidate) else None
+        marker = "/playlists/"
+        if marker in raw:
+            tail = raw.split(marker, 1)[1]
+            candidate = tail.split("?", 1)[0].split("/", 1)[0].strip()
+            return candidate if playlist_id_pattern.fullmatch(candidate) else None
+        return raw if playlist_id_pattern.fullmatch(raw) else None
 
     async def _spotify_control(
         path: str,
@@ -230,9 +254,13 @@ def create_spotify_router(
             raise HTTPException(status_code=400, detail="Spotify source not configured")
         source = get_spotify_source(spotify_source_id)
         cfg_path = Path(source["config_path"])
-        payload = cfg.model_dump()
+        payload = cfg.model_dump(exclude={"roomcast_last_volume"})
         cfg_path.parent.mkdir(parents=True, exist_ok=True)
         cfg_path.write_text(json.dumps(payload, indent=2))
+        if "roomcast_last_volume" in cfg.model_fields_set:
+            set_roomcast_last_volume(cfg.roomcast_last_volume, spotify_source_id)
+        else:
+            set_roomcast_last_volume(cfg.initial_volume, spotify_source_id)
         return {"ok": True, "config": read_spotify_config(target)}
 
     @router.get("/api/spotify/auth-url")
@@ -386,10 +414,20 @@ def create_spotify_router(
         resp = await spotify_request("PUT", "/me/player", token, resolved, json=body)
         if resp.status_code >= 400:
             raise HTTPException(status_code=resp.status_code, detail=resp.text)
+        remembered_volume = roomcast_last_volume(resolved)
+        try:
+            params = {"volume_percent": remembered_volume, "device_id": str(device["id"])}
+            volume_path = _with_query("/me/player/volume", params)
+            volume_resp = await spotify_request("PUT", volume_path, token, resolved)
+            if volume_resp.status_code < 400:
+                device["volume_percent"] = remembered_volume
+        except Exception as exc:
+            log.debug("Unable to restore RoomCast remembered Spotify volume: %s", exc)
         return {
             "device_id": device.get("id"),
             "device_name": device.get("name"),
             "volume_percent": device.get("volume_percent"),
+            "roomcast_last_volume": remembered_volume,
             "is_active": True,
         }
 
@@ -451,6 +489,79 @@ def create_spotify_router(
             "next": bool(data.get("next")),
             "previous": bool(data.get("previous")),
         }
+
+    @router.get("/api/spotify/playlists/recently-played")
+    async def spotify_recently_played_playlists(
+        limit: int = Query(default=12, ge=1, le=50),
+        history_limit: int = Query(default=50, ge=1, le=50),
+        channel_id: Optional[str] = Query(default=None),
+        _: None = Depends(require_spotify_provider_dep),
+    ) -> dict:
+        resolved = resolve_channel_id(channel_id)
+        token = ensure_spotify_token(resolved)
+        required_scope = "user-read-recently-played"
+        scope_text = str(token.get("scope") or "")
+        token_scopes = {part.strip() for part in scope_text.split() if part.strip()}
+        if required_scope not in token_scopes:
+            return {
+                "items": [],
+                "limit": limit,
+                "scope_granted": False,
+                "required_scope": required_scope,
+            }
+
+        history_params = {"limit": min(50, max(history_limit, limit))}
+        history_path = _with_query("/me/player/recently-played", history_params)
+        history_resp = await spotify_request("GET", history_path, token, resolved)
+        if history_resp.status_code == 403:
+            return {
+                "items": [],
+                "limit": limit,
+                "scope_granted": False,
+                "required_scope": required_scope,
+            }
+        if history_resp.status_code >= 400:
+            raise HTTPException(status_code=history_resp.status_code, detail=history_resp.text)
+        history = history_resp.json()
+        entries = history.get("items") if isinstance(history, dict) else []
+        if not isinstance(entries, list) or not entries:
+            return {"items": [], "limit": limit, "scope_granted": True}
+
+        ordered: list[tuple[str, Optional[str]]] = []
+        seen_ids: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            context = entry.get("context")
+            if not isinstance(context, dict):
+                continue
+            context_type = (context.get("type") or "").strip().lower()
+            if context_type != "playlist":
+                continue
+            playlist_id = _extract_playlist_id(context.get("uri") or context.get("href"))
+            if not playlist_id or playlist_id in seen_ids:
+                continue
+            seen_ids.add(playlist_id)
+            ordered.append((playlist_id, entry.get("played_at")))
+            if len(ordered) >= limit:
+                break
+
+        items: list[dict] = []
+        for playlist_id, played_at in ordered:
+            fields = "id,name,description,uri,images,owner(display_name),tracks(total)"
+            detail_path = _with_query(f"/playlists/{playlist_id}", {"fields": fields})
+            detail_resp = await spotify_request("GET", detail_path, token, resolved)
+            if detail_resp.status_code >= 400:
+                continue
+            detail = detail_resp.json()
+            playlist = map_spotify_playlist(detail) if isinstance(detail, dict) else None
+            if not playlist:
+                continue
+            if played_at:
+                playlist["recent_played_at"] = played_at
+            items.append(playlist)
+
+        return {"items": items, "limit": limit, "scope_granted": True}
 
     @router.get("/api/spotify/playlists/{playlist_id}")
     async def spotify_playlist_detail(
@@ -672,12 +783,29 @@ def create_spotify_router(
     ) -> dict:
         params = {"volume_percent": payload.percent, "device_id": device_id}
         resolved = resolve_channel_id(channel_id)
-        return await _spotify_player_control_with_recovery(
+        result = await _spotify_player_control_with_recovery(
             "/me/player/volume",
             "PUT",
             params=params,
             channel_id=resolved,
         )
+        remembered = set_roomcast_last_volume(payload.percent, resolved)
+        result["roomcast_last_volume"] = remembered
+        return result
+
+    @router.post("/api/spotify/volume/preference")
+    async def spotify_volume_preference(
+        payload: VolumePayload,
+        channel_id: Optional[str] = Query(default=None),
+        source_id: Optional[str] = Query(default=None),
+        _: None = Depends(require_spotify_provider_dep),
+    ) -> dict:
+        target = source_id if source_id else resolve_channel_id(channel_id)
+        spotify_source_id = resolve_spotify_source_id(target)
+        if spotify_source_id is None:
+            raise HTTPException(status_code=400, detail="Spotify source not configured")
+        remembered = set_roomcast_last_volume(payload.percent, spotify_source_id)
+        return {"ok": True, "roomcast_last_volume": remembered}
 
     @router.post("/api/spotify/player/shuffle")
     async def spotify_shuffle(

@@ -29,6 +29,65 @@ class SpotifyConfigService:
         self._spotify_client_secret_default = spotify_client_secret_default
         self._spotify_redirect_uri_default = spotify_redirect_uri_default
 
+    @staticmethod
+    def _normalize_volume_value(value: object, fallback: int = 75) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return fallback
+        return max(0, min(100, parsed))
+
+    def _state_path(self, spotify_source_id: str) -> Path:
+        source = self._get_spotify_source(spotify_source_id)
+        config_path = Path(source["config_path"])
+        suffix = config_path.suffix or ".json"
+        stem = config_path.stem if config_path.suffix else config_path.name
+        return config_path.with_name(f"{stem}-state{suffix}")
+
+    def _read_state(self, spotify_source_id: str) -> dict:
+        path = self._state_path(spotify_source_id)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _write_state(self, spotify_source_id: str, state: dict) -> None:
+        path = self._state_path(spotify_source_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2))
+
+    def roomcast_last_volume(self, identifier: Optional[str] = None) -> int:
+        spotify_source_id = self._resolve_spotify_source_id(identifier)
+        if spotify_source_id is None:
+            return 75
+        state = self._read_state(spotify_source_id)
+        if "roomcast_last_volume" in state:
+            return self._normalize_volume_value(state.get("roomcast_last_volume"), 75)
+        source = self._get_spotify_source(spotify_source_id)
+        cfg_path = Path(source["config_path"])
+        if not cfg_path.exists():
+            return 75
+        try:
+            data = json.loads(cfg_path.read_text())
+        except json.JSONDecodeError:
+            return 75
+        if not isinstance(data, dict):
+            return 75
+        return self._normalize_volume_value(data.get("initial_volume"), 75)
+
+    def set_roomcast_last_volume(self, percent: int, identifier: Optional[str] = None) -> int:
+        spotify_source_id = self._resolve_spotify_source_id(identifier)
+        if spotify_source_id is None:
+            raise HTTPException(status_code=400, detail="Spotify source not configured")
+        value = self._normalize_volume_value(percent, 75)
+        state = self._read_state(spotify_source_id)
+        state["roomcast_last_volume"] = value
+        self._write_state(spotify_source_id, state)
+        return value
+
     def read_spotify_config(self, identifier: Optional[str] = None, include_secret: bool = False) -> dict:
         resolved_channel_id = None
         spotify_source_id = self._resolve_spotify_source_id(identifier)
@@ -42,6 +101,7 @@ class SpotifyConfigService:
                 "device_name": "RoomCast",
                 "bitrate": 320,
                 "initial_volume": 75,
+                "roomcast_last_volume": 75,
                 "normalisation": True,
                 "show_output_volume_slider": True,
                 "has_password": False,
@@ -92,6 +152,7 @@ class SpotifyConfigService:
             "device_name": data.get("device_name", "RoomCast"),
             "bitrate": data.get("bitrate", 320),
             "initial_volume": data.get("initial_volume", 75),
+            "roomcast_last_volume": self.roomcast_last_volume(spotify_source_id),
             "normalisation": data.get("normalisation", True),
             "show_output_volume_slider": data.get("show_output_volume_slider", True),
             "has_password": bool(data.get("password")),

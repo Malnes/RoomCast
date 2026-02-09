@@ -412,6 +412,29 @@ function setVolumePercentLabel(labelEl, value) {
   labelEl.textContent = `${normalizePercent(value, 0)}%`;
 }
 
+function setSpotifySettingsVolumeLabel(value) {
+  if (!spInitVolValue) return;
+  spInitVolValue.textContent = `${normalizePercent(value, 75)}%`;
+}
+
+function normalizeSpotifySourceForUi(sourceId) {
+  const value = String(sourceId || '').trim().toLowerCase();
+  return value.startsWith('spotify:') ? value : '';
+}
+
+async function saveSpotifyVolumePreference(sourceId, value) {
+  const normalizedSourceId = normalizeSpotifySourceForUi(sourceId);
+  if (!normalizedSourceId) return false;
+  const percent = normalizePercent(value, 75);
+  const res = await fetch(`/api/spotify/volume/preference?source_id=${encodeURIComponent(normalizedSourceId)}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ percent }),
+  });
+  await ensureOk(res);
+  return true;
+}
+
 function getActiveSpotifySourceId() {
   const channel = getActiveChannel();
   if (!isSpotifyChannel(channel)) return null;
@@ -1154,6 +1177,7 @@ async function saveSpotify() {
       device_name: spName.value || 'RoomCast',
       bitrate: Number(spBitrate.value) || 320,
       initial_volume: Number(spInitVol.value) || 75,
+      roomcast_last_volume: Number(spInitVol.value) || 75,
       normalisation: spNormalise.checked,
       show_output_volume_slider: spShowOutputVolume ? spShowOutputVolume.checked : true,
     };
@@ -2828,7 +2852,46 @@ if (providerAddOpenBtn) providerAddOpenBtn.addEventListener('click', async () =>
 });
 if (absProviderSaveBtn) absProviderSaveBtn.addEventListener('click', saveAudiobookshelfProviderSettings);
 if (spInitVol) {
-  spInitVol.addEventListener('input', () => setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100));
+  let spotifySettingsVolumeTimer = null;
+  const commitSpotifySettingsVolume = async () => {
+    if (spotifySettingsVolumeTimer) {
+      clearTimeout(spotifySettingsVolumeTimer);
+      spotifySettingsVolumeTimer = null;
+    }
+    const sourceId = getSettingsChannelId();
+    if (!sourceId) return;
+    const value = normalizePercent(spInitVol.value, 75);
+    setSpotifySettingsVolumeLabel(value);
+    const activeSourceId = normalizeSpotifySourceForUi(getActiveSpotifySourceId());
+    const settingsSourceId = normalizeSpotifySourceForUi(sourceId);
+    if (activeSourceId && activeSourceId === settingsSourceId) {
+      const ok = await playerAction('/api/spotify/player/volume', { percent: value });
+      if (!ok) return;
+      if (playerStatus?.device) {
+        playerStatus.device.volume_percent = value;
+      }
+      if (spotifySourceVolume) {
+        spotifySourceVolume.value = value;
+        setRangeProgress(spotifySourceVolume, value, spotifySourceVolume.max || 100);
+      }
+      setVolumePercentLabel(spotifySourceVolumeValue, value);
+      syncPlayerVolumePopover(playerStatus);
+      return;
+    }
+    try {
+      await saveSpotifyVolumePreference(settingsSourceId, value);
+    } catch (err) {
+      showError(`Failed to save Spotify volume: ${err.message}`);
+    }
+  };
+  spInitVol.addEventListener('input', () => {
+    setRangeProgress(spInitVol, spInitVol.value, spInitVol.max || 100);
+    setSpotifySettingsVolumeLabel(spInitVol.value);
+    if (spotifySettingsVolumeTimer) clearTimeout(spotifySettingsVolumeTimer);
+    spotifySettingsVolumeTimer = setTimeout(commitSpotifySettingsVolume, 250);
+  });
+  spInitVol.addEventListener('change', commitSpotifySettingsVolume);
+  setSpotifySettingsVolumeLabel(spInitVol.value);
 }
 
 function handleAddNodeOverlayClick(event) {
@@ -3146,7 +3209,11 @@ if (playlistSortSelect) {
         playlistSummaryEl.textContent = absShowPlayed ? 'Showing played episodes' : 'Hiding played episodes';
       }
     } else {
-      playlistSortOrder = value === 'name' ? 'name' : 'recent';
+      playlistSortOrder = value === 'name'
+        ? 'name'
+        : value === 'recent_played'
+          ? 'recent_played'
+          : 'recent';
       renderPlaylistGrid(playlistsCache);
     }
   });

@@ -170,6 +170,7 @@
             <label for="playlist-sort" class="sr-only">Sort playlists</label>
             <select id="playlist-sort">
               <option value="recent">Recently added</option>
+              <option value="recent_played">Recently played</option>
               <option value="name">Name (A–Z)</option>
             </select>
           </div>
@@ -475,8 +476,9 @@
                 </select>
               </div>
               <div>
-                <label>Initial volume</label>
+                <label>Spotify volume</label>
                 <input id="sp-initvol" type="range" min="0" max="100" value="75">
+                <div class="muted" id="sp-initvol-value" style="font-size:12px; margin-top:4px;">75%</div>
               </div>
               <div style="display:flex; align-items:center; gap:6px;">
                 <label style="margin:0;">Volume normalisation</label>

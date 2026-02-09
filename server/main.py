@@ -2162,6 +2162,8 @@ app.include_router(
         resolve_channel_id=lambda channel_id: resolve_channel_id(channel_id),
         resolve_spotify_source_id=lambda identifier: _resolve_spotify_source_id(identifier),
         read_spotify_config=lambda identifier: spotify_config.read_spotify_config(identifier),
+        roomcast_last_volume=lambda identifier=None: spotify_config.roomcast_last_volume(identifier),
+        set_roomcast_last_volume=lambda percent, identifier=None: spotify_config.set_roomcast_last_volume(percent, identifier),
         get_spotify_source=lambda source_id: get_spotify_source(source_id),
         spotify_auth_broker_url=SPOTIFY_AUTH_BROKER_URL,
         public_base_url=ROOMCAST_PUBLIC_BASE_URL,
@@ -3021,4 +3023,3 @@ async def _set_node_channel(node: dict, channel_id: Optional[str]) -> None:
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-

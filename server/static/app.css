@@ -680,8 +680,8 @@ button.status-pill:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.6
 .player-icon-btn.play svg { width: 36px; height: 36px; }
 .player-icon-btn:disabled { opacity: 0.35; cursor: default; box-shadow: none; }
 .player-icon-btn.repeat-track::after { content: '1'; position: absolute; top: 6px; right: 8px; font-size: 10px; font-weight: 700; color: currentColor; }
-.player-volume-slider { position: absolute; right: 50%; bottom: calc(100% + 16px); transform: translateX(50%) translateY(8px); opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.18s ease; display: flex; justify-content: center; z-index: 60; padding: 10px 8px; border-radius: 16px; background: rgba(15,23,42,0.9); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 10px 24px rgba(0,0,0,0.45); }
-.player-volume-inline.is-open .player-volume-slider { opacity: 1; pointer-events: auto; transform: translateX(50%) translateY(0); }
+.player-volume-slider { position: absolute; right: 0; bottom: calc(100% + 16px); transform: translateX(-8px) translateY(8px); opacity: 0; pointer-events: none; transition: opacity 0.18s ease, transform 0.18s ease; display: flex; justify-content: center; z-index: 60; padding: 10px 8px; border-radius: 16px; background: rgba(6,10,22,0.7); border: 1px solid rgba(255,255,255,0.08); box-shadow: 0 10px 24px rgba(0,0,0,0.45); backdrop-filter: blur(18px); }
+.player-volume-inline.is-open .player-volume-slider { opacity: 1; pointer-events: auto; transform: translateX(-8px) translateY(0); }
 .player-volume-controls { display: flex; align-items: flex-end; gap: 12px; }
 .player-volume-control { display: flex; flex-direction: column; align-items: center; gap: 6px; min-width: 52px; color: #cbd5e1; }
 .player-volume-control-title { font-size: 10px; letter-spacing: 0.6px; text-transform: uppercase; color: #94a3b8; }
@@ -740,6 +740,9 @@ button.status-pill:focus-visible { outline: 2px solid rgba(var(--accent-rgb),0.6
 .playlist-search-group input { width: 100%; height: 100%; }
 .playlist-sort-group select { width: 100%; height: 100%; }
 .playlist-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; }
+.playlist-section { grid-column: 1 / -1; display: flex; flex-direction: column; gap: 10px; }
+.playlist-section-title { margin: 2px 2px 0; font-size: 13px; letter-spacing: 0.4px; text-transform: uppercase; color: #94a3b8; font-weight: 700; }
+.playlist-grid-section { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 14px; }
 .playlist-loading[hidden],
 .playlist-error[hidden],
 .playlist-empty[hidden] { display: none !important; }

@@ -84,65 +84,136 @@ function handlePlaylistOverlayKey(evt) {
   }
 }
 
-function renderPlaylistGrid(items) {
+function playlistIdentity(item) {
+  const playlistId = item?.id || extractSpotifyPlaylistId(item?.uri);
+  return playlistId || `${item?.uri || ''}:${item?.name || ''}`;
+}
+
+function createPlaylistCard(item) {
+  const card = document.createElement('button');
+  card.type = 'button';
+  card.className = 'playlist-card';
+  card.setAttribute('role', 'listitem');
+  const playlistId = item?.id || extractSpotifyPlaylistId(item?.uri);
+  if (playlistId) card.dataset.playlistId = playlistId;
+  const cover = document.createElement('img');
+  cover.className = 'playlist-cover';
+  cover.alt = item?.name || 'Playlist cover';
+  const fallbackCover = PLAYLIST_FALLBACK_COVER;
+  cover.src = item?.image?.url || fallbackCover;
+  cover.loading = 'lazy';
+  const title = document.createElement('div');
+  title.className = 'playlist-card-title';
+  title.textContent = item?.name || 'Untitled playlist';
+  const ownerText = item?.owner ? `by ${item.owner}` : '';
+  const tracksText = typeof item?.tracks_total === 'number' ? `${item.tracks_total} tracks` : '';
+  card.appendChild(cover);
+  card.appendChild(title);
+  if (ownerText) {
+    const owner = document.createElement('div');
+    owner.className = 'playlist-card-owner';
+    owner.textContent = ownerText;
+    card.appendChild(owner);
+  }
+  if (tracksText) {
+    const counts = document.createElement('div');
+    counts.className = 'playlist-card-owner';
+    counts.textContent = tracksText;
+    card.appendChild(counts);
+  }
+  card.addEventListener('click', () => {
+    if (playlistPickerMode && typeof playlistPickerOnSelect === 'function') {
+      playlistPickerOnSelect(item);
+      return;
+    }
+    selectPlaylist(item);
+  });
+  syncPlaylistHighlightForElement(card);
+  return card;
+}
+
+function renderPlaylistSection(title, items) {
+  if (!playlistGrid || !Array.isArray(items) || !items.length) return;
+  const section = document.createElement('section');
+  section.className = 'playlist-section';
+  section.setAttribute('aria-label', title);
+
+  const heading = document.createElement('h3');
+  heading.className = 'playlist-section-title';
+  heading.textContent = title;
+
+  const sectionGrid = document.createElement('div');
+  sectionGrid.className = 'playlist-grid-section';
+  sectionGrid.setAttribute('role', 'list');
+
+  items.forEach(item => {
+    sectionGrid.appendChild(createPlaylistCard(item));
+  });
+
+  section.appendChild(heading);
+  section.appendChild(sectionGrid);
+  playlistGrid.appendChild(section);
+}
+
+function renderPlaylistGrid(items = playlistsCache) {
   if (!playlistGrid) return;
   playlistGrid.innerHTML = '';
-  const list = Array.isArray(items) ? items : [];
-  const filtered = list.filter(item => {
+  const addedList = Array.isArray(items) ? items : [];
+  const recentlyPlayedList = Array.isArray(playlistsRecentlyPlayedCache) ? playlistsRecentlyPlayedCache : [];
+  const filterMatches = item => {
     if (!playlistSearchTerm) return true;
     const haystack = `${item?.name || ''} ${item?.owner || ''} ${item?.description || ''}`.toLowerCase();
     return haystack.includes(playlistSearchTerm);
-  });
-  const sorted = sortPlaylists(filtered);
-  sorted.forEach(item => {
-    const card = document.createElement('button');
-    card.type = 'button';
-    card.className = 'playlist-card';
-    card.setAttribute('role', 'listitem');
-    const playlistId = item?.id || extractSpotifyPlaylistId(item?.uri);
-    if (playlistId) card.dataset.playlistId = playlistId;
-    const cover = document.createElement('img');
-    cover.className = 'playlist-cover';
-    cover.alt = item?.name || 'Playlist cover';
-    const fallbackCover = PLAYLIST_FALLBACK_COVER;
-    cover.src = item?.image?.url || fallbackCover;
-    cover.loading = 'lazy';
-    const title = document.createElement('div');
-    title.className = 'playlist-card-title';
-    title.textContent = item?.name || 'Untitled playlist';
-    const ownerText = item?.owner ? `by ${item.owner}` : '';
-    const tracksText = typeof item?.tracks_total === 'number' ? `${item.tracks_total} tracks` : '';
-    card.appendChild(cover);
-    card.appendChild(title);
-    if (ownerText) {
-      const owner = document.createElement('div');
-      owner.className = 'playlist-card-owner';
-      owner.textContent = ownerText;
-      card.appendChild(owner);
-    }
-    if (tracksText) {
-      const counts = document.createElement('div');
-      counts.className = 'playlist-card-owner';
-      counts.textContent = tracksText;
-      card.appendChild(counts);
-    }
+  };
 
-    card.addEventListener('click', () => {
-      if (playlistPickerMode && typeof playlistPickerOnSelect === 'function') {
-        playlistPickerOnSelect(item);
-        return;
-      }
-      selectPlaylist(item);
+  let totalVisible = 0;
+  let totalSourceCount = 0;
+  if (playlistSortOrder === 'recent_played') {
+    const recentFiltered = sortPlaylists(recentlyPlayedList.filter(filterMatches));
+    renderPlaylistSection('Recently played', recentFiltered);
+    totalVisible = recentFiltered.length;
+    totalSourceCount = recentlyPlayedList.length;
+    if (playlistSubtitle) {
+      playlistSubtitle.textContent = playlistsRecentlyPlayedScopeMissing
+        ? 'Requires Spotify permission: recently played history'
+        : 'Recently played playlists';
+    }
+  } else if (playlistSortOrder === 'name') {
+    const merged = [];
+    const seen = new Set();
+    [...recentlyPlayedList, ...addedList].forEach(item => {
+      const key = playlistIdentity(item);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      merged.push(item);
     });
-    syncPlaylistHighlightForElement(card);
-    playlistGrid.appendChild(card);
-  });
+    const allFiltered = sortPlaylists(merged.filter(filterMatches));
+    renderPlaylistSection('All playlists', allFiltered);
+    totalVisible = allFiltered.length;
+    totalSourceCount = merged.length;
+    if (playlistSubtitle) playlistSubtitle.textContent = 'All playlists';
+  } else {
+    const recentFiltered = sortPlaylists(recentlyPlayedList.filter(filterMatches));
+    const recentIds = new Set(recentFiltered.map(playlistIdentity));
+    const addedFiltered = sortPlaylists(addedList.filter(item => !recentIds.has(playlistIdentity(item)) && filterMatches(item)));
+    renderPlaylistSection('Recently played', recentFiltered);
+    renderPlaylistSection('Recently added', addedFiltered);
+    totalVisible = recentFiltered.length + addedFiltered.length;
+    totalSourceCount = addedList.length + recentlyPlayedList.length;
+    if (playlistSubtitle) playlistSubtitle.textContent = 'Recently played and recently added playlists';
+  }
   updatePlaylistCardHighlights();
   if (playlistEmpty) {
-    if (!list.length) {
+    if (!totalSourceCount) {
       playlistEmpty.hidden = false;
-      playlistEmpty.textContent = 'No playlists available.';
-    } else if (!sorted.length) {
+      if (playlistSortOrder === 'recent_played' && playlistsRecentlyPlayedScopeMissing) {
+        playlistEmpty.textContent = 'Spotify permission missing for recently played. Sign out and sign in to Spotify again.';
+      } else {
+        playlistEmpty.textContent = playlistSortOrder === 'recent_played'
+          ? 'No recently played playlists yet.'
+          : 'No playlists available yet.';
+      }
+    } else if (!totalVisible) {
       playlistEmpty.hidden = false;
       playlistEmpty.textContent = 'No playlists match your search.';
     } else {
@@ -163,7 +234,17 @@ function sortPlaylists(items) {
     });
     return sorted;
   }
+  if (playlistSortOrder === 'recent_played') {
+    sorted.sort((a, b) => {
+      const aTs = Date.parse(a?.recent_played_at || '');
+      const bTs = Date.parse(b?.recent_played_at || '');
+      const safeA = Number.isFinite(aTs) ? aTs : -1;
+      const safeB = Number.isFinite(bTs) ? bTs : -1;
+      if (safeA !== safeB) return safeB - safeA;
+      return (a?._order ?? 0) - (b?._order ?? 0);
+    });
+    return sorted;
+  }
   sorted.sort((a, b) => (a?._order ?? 0) - (b?._order ?? 0));
   return sorted;
 }
-

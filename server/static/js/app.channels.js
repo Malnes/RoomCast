@@ -90,6 +90,9 @@ function resetChannelScopedState() {
   playlistSummaryAbortController = null;
   playlistsCache = [];
   playlistsCacheFetchedAt = 0;
+  playlistsRecentlyPlayedCache = [];
+  playlistsRecentlyPlayedFetchedAt = 0;
+  playlistsRecentlyPlayedScopeMissing = false;
   playlistMetadataCache.clear();
   playlistTrackCache.clear();
   playlistSelected = null;
@@ -575,9 +578,14 @@ function getCachedPlaylistMetadata(playlistId) {
 
 function ensurePlaylistsLoaded(options = {}) {
   const forceRefresh = !!options.forceRefresh;
+  const hasPlaylistData = playlistsCache.length || playlistsRecentlyPlayedCache.length;
+  const latestPlaylistFetchAt = Math.max(
+    Number(playlistsCacheFetchedAt) || 0,
+    Number(playlistsRecentlyPlayedFetchedAt) || 0,
+  );
   const hasFreshCache = !forceRefresh
-    && playlistsCache.length
-    && isCacheFresh(playlistsCacheFetchedAt, PLAYLIST_CACHE_TTL_MS);
+    && hasPlaylistData
+    && isCacheFresh(latestPlaylistFetchAt, PLAYLIST_CACHE_TTL_MS);
   if (hasFreshCache) {
     setPlaylistLoadingState(false);
     renderPlaylistGrid(playlistsCache);

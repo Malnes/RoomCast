@@ -156,7 +156,10 @@ async def authorize(payload: AuthorizeRequest) -> Dict[str, str]:
     if payload.device_id:
         state_payload["device_id"] = payload.device_id
     state = _sign_state(state_payload)
-    scope = "user-read-playback-state user-modify-playback-state streaming user-read-email user-read-private"
+    scope = (
+        "user-read-playback-state user-modify-playback-state "
+        "user-read-recently-played streaming user-read-email user-read-private"
+    )
     params = {
         "client_id": SPOTIFY_CLIENT_ID,
         "response_type": "code",
